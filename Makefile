@@ -13,9 +13,34 @@ install:
 test:
 	@swift test --no-parallel
 
-test-ios:
-	@set -o pipefail; xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' \
-		-quiet 2>&1 | tail -20
+test-ios ci-ios:
+	@log=$$(mktemp "$${TMPDIR:-/tmp}/spl-swift-ci-ios.XXXXXX"); \
+	report_ci_ios_failure() { \
+		echo "$$1"; \
+		grep -E '✘|error:|Failing tests:|Test run with|\*\* TEST (FAILED|SUCCEEDED) \*\*' "$$log" | tail -60; \
+		echo "ci-ios: full log: $$log"; \
+	}; \
+	xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' > "$$log" 2>&1; \
+	xcode_status=$$?; \
+	if [ "$$xcode_status" -ne 0 ]; then \
+		report_ci_ios_failure "ci-ios: xcodebuild failed with status $$xcode_status"; \
+		exit "$$xcode_status"; \
+	fi; \
+	summary=$$(grep -E '[✔✘][[:space:]]+Test run with [0-9]+ tests? in [0-9]+ suites?' "$$log" | tail -n 1); \
+	if [ -z "$$summary" ]; then \
+		report_ci_ios_failure "ci-ios: Swift Testing summary not found"; \
+		exit 1; \
+	fi; \
+	counts=$$(printf '%s\n' "$$summary" | sed -nE 's/.*Test run with ([0-9]+) tests? in ([0-9]+) suites?.*/\1 \2/p'); \
+	test_count=$${counts%% *}; \
+	suite_count=$${counts##* }; \
+	if [ "$$test_count" -eq 0 ]; then \
+		report_ci_ios_failure "ci-ios: Swift Testing reported zero tests"; \
+		exit 1; \
+	fi; \
+	suite_skips=$$(grep -cE '➜ Suite .* skipped' "$$log"); \
+	test_skips=$$(grep -cE '➜ Test .* skipped' "$$log"); \
+	echo "ci-ios: Swift Testing executed tests=$$test_count suites=$$suite_count skipped_suites=$$suite_skips skipped_tests=$$test_skips"
 
 ci: hygiene ci-macos ci-ios
 	@echo "ci: all gates green"
@@ -23,10 +48,6 @@ ci: hygiene ci-macos ci-ios
 ci-macos:
 	@swift build -Xswiftc -warnings-as-errors
 	@swift test --no-parallel
-
-ci-ios:
-	@set -o pipefail; xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' \
-		-quiet 2>&1 | tail -20
 
 # Hygiene gates: forbidden constructs and internal-infrastructure strings must
 # never appear in package sources. Each grep FAILS the build when it matches.
