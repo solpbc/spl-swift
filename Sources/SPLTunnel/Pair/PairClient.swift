@@ -55,6 +55,10 @@ public struct PairClient: Sendable {
         relayEndpoint: URL,
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
     ) async throws -> StoredPairing {
+        guard pairURL.candidates.allSatisfy({ TunnelAddressClassifier.isLocalNetworkAddressLiteral($0.address) }) else {
+            pairLog.notice("direct pair candidates rejected reason=\("non_local_candidate", privacy: .public) count=\(pairURL.candidates.count, privacy: .public)")
+            throw PairError.directAddressNotLocal
+        }
         let ordered = orderCandidates(pairURL.candidates)
         var sawCAFingerprintMismatch = false
         var lastError: PairError?
@@ -636,6 +640,7 @@ public enum PairError: Error, Equatable, Sendable {
     case relayResponseInvalid(status: Int?)
     case relayInstanceMismatch
     case attestationRejected(status: Int)
+    case directAddressNotLocal
 
     var statusCode: Int? {
         switch self {
@@ -657,7 +662,8 @@ public enum PairError: Error, Equatable, Sendable {
              (.nonceExpired, .nonceExpired),
              (.pairingWindowClosed, .pairingWindowClosed),
              (.relayRequestFailed, .relayRequestFailed),
-             (.relayInstanceMismatch, .relayInstanceMismatch):
+             (.relayInstanceMismatch, .relayInstanceMismatch),
+             (.directAddressNotLocal, .directAddressNotLocal):
             return true
         case (.lanCandidatesExhausted(let lhsSawCA), .lanCandidatesExhausted(let rhsSawCA)):
             return lhsSawCA == rhsSawCA

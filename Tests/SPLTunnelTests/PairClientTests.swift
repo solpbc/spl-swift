@@ -14,9 +14,9 @@ struct PairClientDirectTests {
     @Test func candidateExhaustionOrderRemembersCAFingerprintMismatch() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let pairURL = try Self.directPairURL(candidates: [
-            PairCandidate(address: "192.0.2.10", port: 7657),
-            PairCandidate(address: "192.0.2.20", port: 7657),
-            PairCandidate(address: "192.0.2.30", port: 7657),
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+            PairCandidate(address: "192.168.0.30", port: 7657),
         ])
         let transport = FakeLANPairTransport(outcomes: [
             .error(FakeLANPairError.unreachable),
@@ -39,13 +39,13 @@ struct PairClientDirectTests {
         }
 
         let requests = await transport.requests
-        #expect(requests.map(\.host) == ["192.0.2.30", "192.0.2.20", "192.0.2.10"])
+        #expect(requests.map(\.host) == ["192.168.0.30", "192.168.0.20", "192.168.0.10"])
     }
 
     @Test func singleCandidateExhaustionRethrowsRawError() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let pairURL = try Self.directPairURL(candidates: [
-            PairCandidate(address: "192.0.2.10", port: 7657),
+            PairCandidate(address: "192.168.0.10", port: 7657),
         ])
         let transport = FakeLANPairTransport(outcomes: [
             .error(InnerTLSError.caFingerprintMismatch),
@@ -68,8 +68,8 @@ struct PairClientDirectTests {
     @Test func nonceExpiredShortCircuitsCandidateLoop() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let pairURL = try Self.directPairURL(candidates: [
-            PairCandidate(address: "192.0.2.10", port: 7657),
-            PairCandidate(address: "192.0.2.20", port: 7657),
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
         ])
         let transport = FakeLANPairTransport(outcomes: [
             .response(status: 410, body: Data()),
@@ -95,8 +95,8 @@ struct PairClientDirectTests {
     @Test func pairingWindowClosedShortCircuitsCandidateLoop() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let pairURL = try Self.directPairURL(candidates: [
-            PairCandidate(address: "192.0.2.10", port: 7657),
-            PairCandidate(address: "192.0.2.20", port: 7657),
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
         ])
         let transport = FakeLANPairTransport(outcomes: [
             .error(CertlessPairError.closedBeforeStatus),
@@ -126,7 +126,7 @@ struct PairClientDirectTests {
         let responseBody = try Self.pairResponseData(bundle: fixture)
         let nonce = Array(UInt8(0x00)...UInt8(0x0f))
         let pairURL = try Self.directPairURL(
-            candidates: [PairCandidate(address: "192.0.2.10", port: 7657)],
+            candidates: [PairCandidate(address: "192.168.0.10", port: 7657)],
             nonce: nonce
         )
         let transport = FakeLANPairTransport(outcomes: [
@@ -156,11 +156,11 @@ struct PairClientDirectTests {
     @Test func dialedEndpointPromotionPreservesScopeAndDedupes() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let fixture = try TestCA.make()
-        let dialed = LocalEndpoint(host: "192.0.2.10", port: 7657, scope: "wifi")
-        let other = LocalEndpoint(host: "192.0.2.20", port: 7657, scope: "ethernet")
+        let dialed = LocalEndpoint(host: "192.168.0.10", port: 7657, scope: "wifi")
+        let other = LocalEndpoint(host: "192.168.0.20", port: 7657, scope: "ethernet")
         let responseBody = try Self.pairResponseData(bundle: fixture, localEndpoints: [other, dialed])
         let pairURL = try Self.directPairURL(candidates: [
-            PairCandidate(address: "192.0.2.10", port: 7657),
+            PairCandidate(address: "192.168.0.10", port: 7657),
         ])
         let transport = FakeLANPairTransport(outcomes: [
             .response(status: 200, body: responseBody),
@@ -186,7 +186,7 @@ struct PairClientDirectTests {
         let fixture = try TestCA.make()
         let responseBody = try Self.pairResponseData(bundle: fixture)
         let pairURL = try Self.directPairURL(candidates: [
-            PairCandidate(address: "192.0.2.10", port: 7657),
+            PairCandidate(address: "192.168.0.10", port: 7657),
         ])
         let transport = FakeLANPairTransport(outcomes: [
             .response(status: 200, body: responseBody),
@@ -381,60 +381,6 @@ struct PairClientRelayTests {
     private static func caSPKI(bundle: TestCA.Bundle) throws -> [UInt8] {
         let certificate = try #require(try CertChain.certificates(fromPEM: bundle.caCertificatePEM).first)
         return try CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: certificate)
-    }
-}
-
-private enum FakeLANPairError: Error, Equatable, Sendable {
-    case unreachable
-    case missingOutcome
-}
-
-private enum FakeLANOutcome: Sendable {
-    case response(status: Int, body: Data)
-    case error(any Error & Sendable)
-}
-
-private struct FakeLANRequest: Sendable, Equatable {
-    let host: String
-    let port: Int
-    let caFingerprintBytes: [UInt8]
-    let requestBytes: Data
-}
-
-private actor FakeLANPairTransport: LANPairTransport {
-    private var outcomes: [FakeLANOutcome]
-    private(set) var requests: [FakeLANRequest] = []
-
-    init(outcomes: [FakeLANOutcome]) {
-        self.outcomes = outcomes
-    }
-
-    var requestCount: Int {
-        requests.count
-    }
-
-    func send(
-        host: String,
-        port: Int,
-        caFingerprintBytes: [UInt8],
-        requestBytes: Data
-    ) async throws -> (status: Int, body: Data) {
-        requests.append(FakeLANRequest(
-            host: host,
-            port: port,
-            caFingerprintBytes: caFingerprintBytes,
-            requestBytes: requestBytes
-        ))
-        guard !outcomes.isEmpty else {
-            throw FakeLANPairError.missingOutcome
-        }
-        let outcome = outcomes.removeFirst()
-        switch outcome {
-        case .response(let status, let body):
-            return (status: status, body: body)
-        case .error(let error):
-            throw error
-        }
     }
 }
 
