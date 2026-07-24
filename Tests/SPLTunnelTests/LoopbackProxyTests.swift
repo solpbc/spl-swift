@@ -278,6 +278,54 @@ struct LoopbackProxyTests {
         }
     }
 
+    @Test(.enabled(if: IdentityAssemblyCapability.isAvailable, "\(IdentityAssemblyCapability.reason)"))
+    func supervisorLoopbackPortStaysStableAcrossReconnectGenerations() async throws {
+        let fixture = try TestCA.make()
+        var server = TLSEchoServer(bundle: fixture, mode: .mux)
+        try await server.start()
+        let tunnelPort = await server.port
+        let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: tunnelPort, scope: "local")
+        let supervisor = TunnelSupervisor(
+            pairing: loopbackPairing(from: fixture, localEndpoints: [
+                LocalEndpoint(host: "127.0.0.1", port: tunnelPort, scope: "local"),
+            ]),
+            clientInfo: SPLClientInfo(userAgent: "spl-swift-loopback-tests/1"),
+            policy: fastKeepalivePolicy(runsOnRelayPath: false),
+            sleeper: { _ in }
+        )
+        let proxy = LoopbackProxy(opener: supervisor)
+        let states = await stateProbe(for: supervisor)
+
+        do {
+            let loopbackPort = try await proxy.start()
+            _ = try await supervisor.connect(endpoints: [endpoint])
+            var connectedCount = await states.count(.connected(via: endpoint.connectedVia))
+
+            for _ in 0..<3 {
+                await server.stop()
+                server = TLSEchoServer(bundle: fixture, mode: .mux)
+                try await server.start(port: tunnelPort)
+                connectedCount += 1
+                let expectedConnectedCount = connectedCount
+                #expect(await waitUntil("stable loopback supervisor reconnect", timeout: .seconds(3)) {
+                    await states.count(.connected(via: endpoint.connectedVia)) >= expectedConnectedCount
+                })
+                #expect(try await proxy.start() == loopbackPort)
+            }
+
+            await proxy.stop()
+            await supervisor.disconnect()
+            await states.stop()
+            await server.stop()
+        } catch {
+            await proxy.stop()
+            await supervisor.disconnect()
+            await states.stop()
+            await server.stop()
+            throw error
+        }
+    }
+
     private static func withLoopbackProxy<T: Sendable>(
         opener: any MuxStreamOpening,
         operation: (LoopbackProxy, UInt16) async throws -> T
@@ -330,6 +378,24 @@ struct LoopbackProxyTests {
 }
 
 private struct LoopbackTestError: Error, Sendable {}
+
+private func loopbackPairing(
+    from fixture: TestCA.Bundle,
+    localEndpoints: [LocalEndpoint] = []
+) -> StoredPairing {
+    StoredPairing(
+        instanceID: fixture.pairing.instanceID,
+        homeLabel: fixture.pairing.homeLabel,
+        relayEndpoint: fixture.pairing.relayEndpoint,
+        fingerprint: fixture.pairing.fingerprint,
+        clientCertPEM: fixture.pairing.clientCertPEM,
+        clientKeyPEM: fixture.pairing.clientKeyPEM,
+        caChainPEM: fixture.pairing.caChainPEM,
+        relayEnrollment: fixture.pairing.relayEnrollment,
+        localEndpoints: localEndpoints,
+        pairedAt: fixture.pairing.pairedAt
+    )
+}
 
 private actor FailingLoopbackOpener: MuxStreamOpening {
     private var attempts = 0

@@ -436,10 +436,10 @@ actor TLSEchoServer {
         capture.fingerprint
     }
 
-    func start() async throws {
+    func start(port: Int? = nil) async throws {
         let tlsOptions = try makeServerTLSOptions()
         let parameters = NWParameters(tls: tlsOptions, tcp: NWProtocolTCP.Options())
-        let listener = try NWListener(using: parameters, on: .any)
+        let listener = try NWListener(using: parameters, on: requestedListenerPort(port))
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
             Task {
@@ -761,4 +761,14 @@ private func startAndWaitForListenerReady(_ listener: NWListener) async throws {
     }
     listener.start(queue: serverQueue)
     try await waiter.wait()
+}
+
+private func requestedListenerPort(_ port: Int?) throws -> NWEndpoint.Port {
+    guard let port else {
+        return .any
+    }
+    guard let rawPort = UInt16(exactly: port), let requested = NWEndpoint.Port(rawValue: rawPort) else {
+        throw DialError.connectionFailed("invalid listener port")
+    }
+    return requested
 }

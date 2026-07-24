@@ -45,6 +45,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private var keepaliveWatchTask: Task<Void, Never>?
     private var innerTLS: (any TunnelTLSIO)?
     private var multiplexer: Multiplexer?
+    private var activeEndpoint: TransportEndpoint?
     private var isTerminated = false
 
     public init(
@@ -82,6 +83,14 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
 
     @discardableResult
     public func connect(endpoints: [TransportEndpoint]) async throws -> ConnectedVia {
+        try await connect(endpoints: endpoints, preferredEndpoint: nil)
+    }
+
+    @discardableResult
+    func connect(
+        endpoints: [TransportEndpoint],
+        preferredEndpoint: TransportEndpoint?
+    ) async throws -> ConnectedVia {
         guard !endpoints.isEmpty else {
             throw SessionError.unreachable
         }
@@ -96,7 +105,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
             throw SessionError.notConnected
         }
 
-        let connected = try await connectOnce(endpoints: endpoints)
+        let connected = try await connectOnce(endpoints: endpoints, preferredEndpoint: preferredEndpoint)
         await installConnected(connected)
         publishConnected(connected)
         return connected.via
@@ -132,7 +141,14 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         return await multiplexer.inboundActivitySnapshot()
     }
 
-    private func connectOnce(endpoints: [TransportEndpoint]) async throws -> ConnectedAttempt {
+    func connectedEndpoint() -> TransportEndpoint? {
+        activeEndpoint
+    }
+
+    private func connectOnce(
+        endpoints: [TransportEndpoint],
+        preferredEndpoint: TransportEndpoint?
+    ) async throws -> ConnectedAttempt {
         publish(.connecting(candidates: endpoints.map(\.connectedVia)))
 
         do {
@@ -144,7 +160,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
             ) { endpoint, progress in
                 try await self.connectEndpoint(endpoint, progress: progress)
             }
-            let result = try await coordinator.connect(endpoints: endpoints)
+            let result = try await coordinator.connect(endpoints: endpoints, preferredEndpoint: preferredEndpoint)
             return result.value
         } catch let error as SessionError {
             sessionLog.warning("connect failed error=\(Self.describe(error), privacy: .public)")
@@ -184,6 +200,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     }
 
     private func publishConnected(_ connected: ConnectedAttempt) {
+        activeEndpoint = connected.endpoint
         if connected.endpoint.isDirect {
             setConnectionMode(.plDirect)
         } else {
@@ -275,6 +292,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         let activeTLS = innerTLS
         multiplexer = nil
         innerTLS = nil
+        activeEndpoint = nil
         await activeMultiplexer?.tearDown(reason: reason)
         await activeTLS?.close()
         setConnectionMode(nil)

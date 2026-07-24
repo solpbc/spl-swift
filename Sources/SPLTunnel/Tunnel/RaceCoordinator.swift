@@ -69,12 +69,15 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
         self.dial = dial
     }
 
-    func connect(endpoints: [TransportEndpoint]) async throws -> RaceResult<Value> {
+    func connect(
+        endpoints: [TransportEndpoint],
+        preferredEndpoint: TransportEndpoint? = nil
+    ) async throws -> RaceResult<Value> {
         guard !endpoints.isEmpty else {
             throw SessionError.unreachable
         }
 
-        let sorted = Self.sorted(endpoints)
+        let sorted = Self.sorted(endpoints, preferredEndpoint: preferredEndpoint)
         raceLog.notice("dial candidates=\(Self.describe(sorted), privacy: .public)")
         guard sorted.count > 1 else {
             let endpoint = sorted[0]
@@ -257,9 +260,17 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
         }
     }
 
-    static func sorted(_ endpoints: [TransportEndpoint]) -> [TransportEndpoint] {
+    static func sorted(
+        _ endpoints: [TransportEndpoint],
+        preferredEndpoint: TransportEndpoint? = nil
+    ) -> [TransportEndpoint] {
         endpoints.enumerated()
             .sorted { lhs, rhs in
+                let leftPreferred = lhs.element == preferredEndpoint ? 0 : 1
+                let rightPreferred = rhs.element == preferredEndpoint ? 0 : 1
+                if leftPreferred != rightPreferred {
+                    return leftPreferred < rightPreferred
+                }
                 let leftRank = rank(lhs.element)
                 let rightRank = rank(rhs.element)
                 if leftRank == rightRank {

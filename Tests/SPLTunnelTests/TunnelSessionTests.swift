@@ -359,168 +359,10 @@ struct TunnelSessionTests {
     }
 }
 
-private actor ConnectorProbe {
-    private let behavior: @Sendable (
-        TransportEndpoint,
-        StoredPairing,
-        @Sendable (ConnectedVia) async -> Void
-    ) async throws -> any TunnelTLSIO
-    private var count = 0
-
-    init(
-        behavior: @escaping @Sendable (
-            TransportEndpoint,
-            StoredPairing,
-            @Sendable (ConnectedVia) async -> Void
-        ) async throws -> any TunnelTLSIO
-    ) {
-        self.behavior = behavior
-    }
-
-    var invocationCount: Int {
-        count
-    }
-
-    nonisolated var connector: TunnelTLSConnector {
-        { endpoint, pairing, onAwaitingBroker in
-            try await self.connect(endpoint: endpoint, pairing: pairing, onAwaitingBroker: onAwaitingBroker)
-        }
-    }
-
-    private func connect(
-        endpoint: TransportEndpoint,
-        pairing: StoredPairing,
-        onAwaitingBroker: @Sendable (ConnectedVia) async -> Void
-    ) async throws -> any TunnelTLSIO {
-        count += 1
-        return try await behavior(endpoint, pairing, onAwaitingBroker)
-    }
-}
-
-private actor FakeTunnelTLS: TunnelTLSIO {
-    nonisolated var inbound: AsyncThrowingStream<Data, Error> {
-        inboundStream
-    }
-
-    private let inboundStream: AsyncThrowingStream<Data, Error>
-    private let inboundContinuation: AsyncThrowingStream<Data, Error>.Continuation
-    private let sendError: MuxError?
-    private(set) var sendCount = 0
-    private(set) var closeCount = 0
-
-    init(sendError: MuxError? = nil) {
-        self.sendError = sendError
-        var continuation: AsyncThrowingStream<Data, Error>.Continuation!
-        self.inboundStream = AsyncThrowingStream<Data, Error> { continuation = $0 }
-        self.inboundContinuation = continuation
-    }
-
-    func send(_ data: Data) async throws {
-        sendCount += 1
-        if let sendError {
-            throw sendError
-        }
-    }
-
-    func close() async {
-        closeCount += 1
-        inboundContinuation.finish()
-    }
-
-    func finishInbound(throwing error: (any Error)? = nil) {
-        if let error {
-            inboundContinuation.finish(throwing: error)
-        } else {
-            inboundContinuation.finish()
-        }
-    }
-}
-
-private actor StateProbe {
-    private var states: [TunnelState] = []
-    private var task: Task<Void, Never>?
-
-    func start(stream: AsyncStream<TunnelState>) {
-        guard task == nil else {
-            return
-        }
-        task = Task { [weak self] in
-            for await state in stream {
-                await self?.record(state)
-            }
-        }
-    }
-
-    func stop() {
-        task?.cancel()
-        task = nil
-    }
-
-    func contains(_ expected: TunnelState) -> Bool {
-        states.contains(expected)
-    }
-
-    func connectingCandidates() -> [ConnectedVia]? {
-        states.compactMap { state in
-            if case .connecting(let candidates) = state {
-                return candidates
-            }
-            return nil
-        }.first
-    }
-
-    func containsFailure(_ matches: @Sendable (SessionError) -> Bool) -> Bool {
-        states.contains { state in
-            if case .failed(let error) = state {
-                return matches(error)
-            }
-            return false
-        }
-    }
-
-    private func record(_ state: TunnelState) {
-        states.append(state)
-    }
-}
-
-private func stateProbe(for session: TunnelSession) async -> StateProbe {
-    let probe = StateProbe()
-    await probe.start(stream: session.stateUpdates)
-    return probe
-}
-
 private func assertEchoRoundTrip(session: TunnelSession, payload: Data) async throws {
     let stream = try await session.openStream()
     try await stream.write(payload)
     #expect(try await readInboundPayload(from: stream, timeout: .seconds(2)) == payload)
-}
-
-private func waitForState(
-    _ expected: TunnelState,
-    in states: StateProbe,
-    timeout: Duration = .seconds(1)
-) async -> Bool {
-    await waitUntil("state \(expected)", timeout: timeout) {
-        await states.contains(expected)
-    }
-}
-
-private func waitForFailure(
-    _ expected: SessionError,
-    in states: StateProbe,
-    timeout: Duration = .seconds(1)
-) async -> Bool {
-    await waitForFailure(in: states, timeout: timeout) { $0 == expected }
-}
-
-private func waitForFailure(
-    in states: StateProbe,
-    timeout: Duration = .seconds(1),
-    matching: @escaping @Sendable (SessionError) -> Bool
-) async -> Bool {
-    await waitUntil("failure state", timeout: timeout) {
-        await states.containsFailure(matching)
-    }
 }
 
 private func awaitingConnectFails(
@@ -545,20 +387,6 @@ private func awaitingConnectFails(
     }
 }
 
-private func expectSessionError<T: Sendable>(
-    _ expected: SessionError,
-    operation: () async throws -> T
-) async {
-    do {
-        _ = try await operation()
-        Issue.record("Expected \(expected)")
-    } catch let error as SessionError {
-        #expect(error == expected)
-    } catch {
-        Issue.record("Expected \(expected), got \(error)")
-    }
-}
-
 private func withTunnelTestTimeout<T: Sendable>(
     _ timeout: Duration,
     operation: @escaping @Sendable () async throws -> T
@@ -575,39 +403,6 @@ private func withTunnelTestTimeout<T: Sendable>(
         group.cancelAll()
         return result
     }
-}
-
-private func fastKeepalivePolicy(runsOnRelayPath: Bool) -> SessionPolicy {
-    SessionPolicy(
-        keepalive: KeepalivePolicy(
-            interval: .milliseconds(20),
-            idleThreshold: .milliseconds(20),
-            missedLimit: 1,
-            runsOnRelayPath: runsOnRelayPath
-        )
-    )
-}
-
-private func relayEndpoint() -> TransportEndpoint {
-    .relay(
-        endpoint: URL(string: "wss://relay.example/session")!,
-        instanceID: "instance",
-        deviceToken: "token"
-    )
-}
-
-private func fakePairing() -> StoredPairing {
-    StoredPairing(
-        instanceID: "instance",
-        homeLabel: "home",
-        relayEndpoint: "wss://relay.example/session",
-        fingerprint: "fingerprint",
-        clientCertPEM: "cert",
-        clientKeyPEM: "key",
-        caChainPEM: "ca",
-        relayEnrollment: .enrolled(deviceToken: "token", expiresAt: nil),
-        pairedAt: Date(timeIntervalSince1970: 0)
-    )
 }
 
 private func pairing(

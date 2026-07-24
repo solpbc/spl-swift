@@ -138,21 +138,36 @@ struct MuxKeepaliveTests {
     }
 
     @Test func normalKeepaliveCancellationEmitsNoLost() async throws {
-        let recorder = MuxFrameRecorder()
-        let clock = ManualMuxClock()
-        let gate = KeepaliveTickGate()
-        let mux = Multiplexer(
-            sink: { bytes in try await recorder.record(bytes) },
-            sleeper: { duration in try await gate.sleep(duration) },
-            now: { clock.now() }
-        )
+        do {
+            let recorder = MuxFrameRecorder()
+            let clock = ManualMuxClock()
+            let gate = KeepaliveTickGate()
+            let mux = Multiplexer(
+                sink: { bytes in try await recorder.record(bytes) },
+                sleeper: { duration in try await gate.sleep(duration) },
+                now: { clock.now() }
+            )
 
-        await mux.startKeepalive(interval: .milliseconds(500), idleThreshold: .seconds(2), missedLimit: 3)
-        await gate.waitForObservedTick(count: 1)
-        await mux.tearDown(reason: .normalShutdown)
-        await gate.cancelAll()
+            await mux.startKeepalive(interval: .milliseconds(500), idleThreshold: .seconds(2), missedLimit: 3)
+            await gate.waitForObservedTick(count: 1)
+            await mux.tearDown(reason: .normalShutdown)
+            await gate.cancelAll()
 
-        #expect(await keepaliveLossObserved(from: mux.keepaliveLost) == false)
+            #expect(await keepaliveLossObserved(from: mux.keepaliveLost) == false)
+        }
+
+        do {
+            let recorder = MuxFrameRecorder()
+            let mux = Multiplexer(
+                sink: { bytes in try await recorder.record(bytes) },
+                sleeper: { _ in throw CancellationError() },
+                now: { ContinuousClock.now }
+            )
+
+            await mux.startKeepalive(interval: .milliseconds(500), idleThreshold: .seconds(2), missedLimit: 3)
+            #expect(await keepaliveLossObserved(from: mux.keepaliveLost) == false)
+            await mux.tearDown(reason: .normalShutdown)
+        }
     }
 
     @Test func tearDownIsIdempotentAfterKeepaliveLoss() async throws {
