@@ -213,7 +213,7 @@ struct IntegrationTests {
             let pairing = try await PairClient(clientInfo: integrationClientInfo).pair(
                 pairURL: pairURL,
                 deviceLabel: "Test Device",
-                relayEndpoint: relayEndpoint
+                relayEndpoint: RelayEndpoint.unchecked(relayEndpoint)
             )
             await pairingServer.stop()
             return PairedHome(

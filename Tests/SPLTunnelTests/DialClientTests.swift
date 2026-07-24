@@ -44,12 +44,11 @@ struct DialClientTests {
         let port = await server.port
 
         await expectDialError(.connectTimeout) {
-            _ = try await DialClient.dial(
-                .relay(
-                    endpoint: try relayEndpoint(port: port),
-                    instanceID: "instance-1",
-                    deviceToken: "device-token"
-                ),
+            _ = try await DialClient.dialRelay(
+                endpoint: try relayEndpoint(port: port),
+                instanceID: "instance-1",
+                authToken: "device-token",
+                path: "session/dial",
                 clientInfo: dialClientInfo,
                 timeout: .milliseconds(200)
             )
@@ -62,12 +61,11 @@ struct DialClientTests {
         try await server.start()
         let port = await server.port
 
-        let transport = try await DialClient.dial(
-            .relay(
-                endpoint: try relayEndpoint(port: port),
-                instanceID: "instance-1",
-                deviceToken: "device-token"
-            ),
+        let transport = try await DialClient.dialRelay(
+            endpoint: try relayEndpoint(port: port),
+            instanceID: "instance-1",
+            authToken: "device-token",
+            path: "session/dial",
             clientInfo: dialClientInfo
         )
         try await transport.send(Data([0x04, 0x05, 0x06]))
@@ -126,6 +124,35 @@ struct DialClientTests {
         #expect(pairURL.absoluteString == "wss://link.solstone.app/base/session/pair-dial")
     }
 
+    @Test func webSocketURLRejectsPlaintextRelaySchemes() throws {
+        for endpoint in [
+            URL(string: "http://link.solstone.app")!,
+            URL(string: "ws://link.solstone.app")!,
+        ] {
+            #expect(throws: DialError.invalidRelayURL(endpoint.absoluteString)) {
+                _ = try RelayWSTransport.webSocketURL(
+                    endpoint: endpoint,
+                    path: "session/dial",
+                    instanceID: "instance"
+                )
+            }
+        }
+
+        let https = try RelayWSTransport.webSocketURL(
+            endpoint: URL(string: "https://link.solstone.app")!,
+            path: "session/dial",
+            instanceID: nil
+        )
+        let wss = try RelayWSTransport.webSocketURL(
+            endpoint: URL(string: "wss://link.solstone.app")!,
+            path: "session/dial",
+            instanceID: nil
+        )
+
+        #expect(https.absoluteString == "wss://link.solstone.app/session/dial")
+        #expect(wss.absoluteString == "wss://link.solstone.app/session/dial")
+    }
+
     @Test func relay401MapsUnauthorized() async throws {
         try await expectRelayStatus(401, .relayUnauthorized)
     }
@@ -167,12 +194,11 @@ struct DialClientTests {
         try await server.start()
         let port = await server.port
 
-        let transport = try await DialClient.dial(
-            .relay(
-                endpoint: try relayEndpoint(port: port),
-                instanceID: "instance-1",
-                deviceToken: "device-token"
-            ),
+        let transport = try await DialClient.dialRelay(
+            endpoint: try relayEndpoint(port: port),
+            instanceID: "instance-1",
+            authToken: "device-token",
+            path: "session/dial",
             clientInfo: dialClientInfo
         )
         await expectDialError(.unexpectedTextFrame) {
@@ -188,12 +214,11 @@ struct DialClientTests {
         try await server.start()
         let port = await server.port
 
-        let transport = try await DialClient.dial(
-            .relay(
-                endpoint: try relayEndpoint(port: port),
-                instanceID: "instance-1",
-                deviceToken: "device-token"
-            ),
+        let transport = try await DialClient.dialRelay(
+            endpoint: try relayEndpoint(port: port),
+            instanceID: "instance-1",
+            authToken: "device-token",
+            path: "session/dial",
             clientInfo: dialClientInfo
         )
         await expectDialError(.relayCloseUnauthorized) {
@@ -209,12 +234,11 @@ struct DialClientTests {
         try await server.start()
         let port = await server.port
 
-        let transport = try await DialClient.dial(
-            .relay(
-                endpoint: try relayEndpoint(port: port),
-                instanceID: "instance-1",
-                deviceToken: "device-token"
-            ),
+        let transport = try await DialClient.dialRelay(
+            endpoint: try relayEndpoint(port: port),
+            instanceID: "instance-1",
+            authToken: "device-token",
+            path: "session/dial",
             clientInfo: dialClientInfo
         )
         await expectDialError(.relayCloseUnauthorized) {
@@ -248,8 +272,11 @@ struct DialClientTests {
         let port = await server.port
 
         await expectDialError(.wsHandshakeFailed(httpStatus: 503)) {
-            _ = try await DialClient.dial(
-                .relay(endpoint: try relayEndpoint(port: port), instanceID: "instance", deviceToken: "token"),
+            _ = try await DialClient.dialRelay(
+                endpoint: try relayEndpoint(port: port),
+                instanceID: "instance",
+                authToken: "token",
+                path: "session/dial",
                 clientInfo: dialClientInfo,
                 timeout: .seconds(2)
             )
@@ -264,8 +291,11 @@ struct DialClientTests {
 
         let thrown: DialError
         do {
-            _ = try await DialClient.dial(
-                .relay(endpoint: try relayEndpoint(port: port), instanceID: "instance", deviceToken: "token"),
+            _ = try await DialClient.dialRelay(
+                endpoint: try relayEndpoint(port: port),
+                instanceID: "instance",
+                authToken: "token",
+                path: "session/dial",
                 clientInfo: dialClientInfo,
                 timeout: .seconds(2)
             )
@@ -324,20 +354,19 @@ struct DialClientTests {
         let port = await server.port
 
         await expectDialError(expected) {
-            _ = try await DialClient.dial(
-                .relay(
-                    endpoint: try relayEndpoint(port: port),
-                    instanceID: "instance-1",
-                    deviceToken: "device-token"
-                ),
+            _ = try await DialClient.dialRelay(
+                endpoint: try relayEndpoint(port: port),
+                instanceID: "instance-1",
+                authToken: "device-token",
+                path: "session/dial",
                 clientInfo: dialClientInfo
             )
         }
         await server.stop()
     }
 
-    private func relayEndpoint(port: Int) throws -> URL {
-        try #require(URL(string: "ws://127.0.0.1:\(port)"))
+    private func relayEndpoint(port: Int) throws -> RelayEndpoint {
+        RelayEndpoint.unchecked(try #require(URL(string: "ws://127.0.0.1:\(port)")))
     }
 
     private func expectDialError(

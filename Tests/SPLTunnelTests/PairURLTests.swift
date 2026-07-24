@@ -153,6 +153,22 @@ struct PairURLTests {
         }
     }
 
+    @Test func rejectsPlaintextCustomRelayOrigin() throws {
+        for origin in ["http://relay.example", "ws://relay.example"] {
+            expectThrows(.invalidRelayOrigin) {
+                _ = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(Self.relayBytes(origin: origin))))
+            }
+        }
+
+        let https = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(Self.relayBytes(origin: "https://relay.example"))))
+        let wss = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(Self.relayBytes(origin: "wss://relay.example"))))
+        let wellKnown = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(Self.relayBytes())))
+
+        #expect(https.relayOrigin == .custom(URL(string: "https://relay.example")!))
+        #expect(wss.relayOrigin == .custom(URL(string: "wss://relay.example")!))
+        #expect(wellKnown.relayOrigin == .wellKnown)
+    }
+
     @Test func rejectsMultiAddressZeroCount() {
         var bytes = Self.multiAddressBytes
         bytes[2] = 0

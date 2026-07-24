@@ -40,11 +40,14 @@ public struct DeviceTokenRefresher: Sendable {
         guard let relayEndpoint = URL(string: pairing.relayEndpoint) else {
             return .transientFailure(pairing)
         }
+        guard let validatedRelayEndpoint = try? RelayEndpoint(relayEndpoint) else {
+            return .transientFailure(pairing)
+        }
 
         let request: URLRequest
         do {
             request = try Self.makeRefreshRequest(
-                relayEndpoint: relayEndpoint,
+                relayEndpoint: validatedRelayEndpoint,
                 deviceToken: deviceToken,
                 userAgent: clientInfo.userAgent
             )
@@ -91,6 +94,14 @@ public struct DeviceTokenRefresher: Sendable {
     }
 
     static func makeRefreshRequest(relayEndpoint: URL, deviceToken: String, userAgent: String) throws -> URLRequest {
+        try makeRefreshRequest(
+            relayEndpoint: RelayEndpoint(relayEndpoint),
+            deviceToken: deviceToken,
+            userAgent: userAgent
+        )
+    }
+
+    static func makeRefreshRequest(relayEndpoint: RelayEndpoint, deviceToken: String, userAgent: String) throws -> URLRequest {
         var request = URLRequest(url: try PairClient.controlURL(relayEndpoint, path: "token/refresh"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

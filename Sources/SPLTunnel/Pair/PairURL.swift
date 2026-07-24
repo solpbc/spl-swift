@@ -167,12 +167,10 @@ public struct PairURL: Sendable, Equatable, Hashable {
             let originBytes = bytes[27..<(27 + selectorLength)]
             guard let origin = String(bytes: originBytes, encoding: .utf8),
                   let url = URL(string: origin),
-                  let scheme = url.scheme?.lowercased(),
-                  scheme == "http" || scheme == "https" || scheme == "ws" || scheme == "wss",
-                  url.host != nil else {
+                  let relayEndpoint = try? RelayEndpoint(url) else {
                 throw PairURLError.invalidRelayOrigin
             }
-            parsedRelayOrigin = .custom(url)
+            parsedRelayOrigin = .custom(relayEndpoint.url)
         }
 
         version = bytes[0]

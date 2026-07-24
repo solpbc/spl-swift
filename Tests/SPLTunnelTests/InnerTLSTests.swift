@@ -89,12 +89,11 @@ struct InnerTLSTests {
         try await relay.start()
         let relayPort = await relay.port
 
-        let transport = try await DialClient.dial(
-            .relay(
-                endpoint: try #require(URL(string: "ws://127.0.0.1:\(relayPort)")),
-                instanceID: fixture.pairing.instanceID,
-                deviceToken: deviceToken(from: fixture.pairing)
-            ),
+        let transport = try await DialClient.dialRelay(
+            endpoint: RelayEndpoint.unchecked(try #require(URL(string: "ws://127.0.0.1:\(relayPort)"))),
+            instanceID: fixture.pairing.instanceID,
+            authToken: deviceToken(from: fixture.pairing),
+            path: "session/dial",
             clientInfo: innerTLSClientInfo
         )
         let tls = try await InnerTLS.connectViaTransport(transport: transport, pairing: fixture.pairing)
@@ -121,8 +120,11 @@ struct InnerTLSTests {
         try await relay.start()
         let relayPort = await relay.port
 
-        let transport = try await DialClient.dial(
-            .relay(endpoint: try #require(URL(string: "ws://127.0.0.1:\(relayPort)")), instanceID: "pair", deviceToken: "token"),
+        let transport = try await DialClient.dialRelay(
+            endpoint: RelayEndpoint.unchecked(try #require(URL(string: "ws://127.0.0.1:\(relayPort)"))),
+            instanceID: "pair",
+            authToken: "token",
+            path: "session/dial",
             clientInfo: innerTLSClientInfo
         )
         let pairingConnection = try await InnerTLS.connectPairingViaTransport(transport: transport, caPin: caPin)
@@ -133,8 +135,11 @@ struct InnerTLSTests {
         let wrongCACertificate = try #require(try CertChain.certificates(fromPEM: wrongFixture.caCertificatePEM).first)
         let wrongSPKI = try CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: wrongCACertificate)
         let wrongPin = PairingCAPin(kind: .spkiSHA256, prefixBytes: Array(SHA256.hash(data: Data(wrongSPKI)).prefix(16)))
-        let rejectedTransport = try await DialClient.dial(
-            .relay(endpoint: try #require(URL(string: "ws://127.0.0.1:\(relayPort)")), instanceID: "pair", deviceToken: "token"),
+        let rejectedTransport = try await DialClient.dialRelay(
+            endpoint: RelayEndpoint.unchecked(try #require(URL(string: "ws://127.0.0.1:\(relayPort)"))),
+            instanceID: "pair",
+            authToken: "token",
+            path: "session/dial",
             clientInfo: innerTLSClientInfo
         )
         await expectInnerTLSError(.peerNotPinned) {

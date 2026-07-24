@@ -207,6 +207,23 @@ struct PairClientDirectTests {
         #expect(HTTPStubProtocol.state.requests(forHost: pairClientRelayHost).count == 1)
     }
 
+    @Test func controlURLRejectsPlaintextRelaySchemes() throws {
+        for endpoint in [
+            URL(string: "http://relay.example")!,
+            URL(string: "ws://relay.example")!,
+        ] {
+            #expect(throws: PairError.relayResponseInvalid(status: nil)) {
+                _ = try PairClient.controlURL(endpoint, path: "enroll/device")
+            }
+        }
+
+        let https = try PairClient.controlURL(URL(string: "https://relay.example/base")!, path: "enroll/device")
+        let wss = try PairClient.controlURL(URL(string: "wss://relay.example/base")!, path: "enroll/device")
+
+        #expect(https.absoluteString == "https://relay.example/base/enroll/device")
+        #expect(wss.absoluteString == "https://relay.example/base/enroll/device")
+    }
+
     fileprivate static func directPairURL(
         candidates: [PairCandidate],
         nonce: [UInt8] = Array(UInt8(0x10)...UInt8(0x1f)),
@@ -300,7 +317,7 @@ struct PairClientRelayTests {
                 _ = try await client.pair(
                     pairURL: pairURL,
                     deviceLabel: "test phone",
-                    relayEndpoint: relayEndpoint
+                    relayEndpoint: RelayEndpoint.unchecked(relayEndpoint)
                 )
             }
         }
@@ -332,7 +349,7 @@ struct PairClientRelayTests {
                 _ = try await client.pair(
                     pairURL: pairURL,
                     deviceLabel: "test phone",
-                    relayEndpoint: relayEndpoint
+                    relayEndpoint: RelayEndpoint.unchecked(relayEndpoint)
                 )
             }
         }

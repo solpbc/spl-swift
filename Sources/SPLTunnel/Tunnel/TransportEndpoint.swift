@@ -43,17 +43,15 @@ public enum TransportEndpoint: Sendable, Equatable {
             return local
         }
 
-        guard let relayEndpoint = URL(string: pairing.relayEndpoint),
-              let scheme = relayEndpoint.scheme,
-              !scheme.isEmpty,
-              relayEndpoint.host != nil else {
+        guard let relayEndpointURL = URL(string: pairing.relayEndpoint),
+              let relayEndpoint = try? RelayEndpoint(relayEndpointURL) else {
             transportLog.error("relay endpoint invalid; using lan candidates only")
             return local
         }
 
         return local + [
             .relay(
-                endpoint: relayEndpoint,
+                endpoint: relayEndpoint.url,
                 instanceID: pairing.instanceID,
                 deviceToken: deviceToken
             ),

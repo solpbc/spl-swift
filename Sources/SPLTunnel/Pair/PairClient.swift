@@ -39,6 +39,34 @@ public struct PairClient: Sendable {
                 orderCandidates: orderCandidates
             )
         case .relay:
+            let validatedRelayEndpoint = try Self.validatedRelayEndpoint(relayEndpoint)
+            return try await pairViaRelay(
+                pairURL: pairURL,
+                generated: generated,
+                deviceLabel: deviceLabel,
+                defaultRelayEndpoint: validatedRelayEndpoint
+            )
+        }
+    }
+
+    func pair(
+        pairURL: PairURL,
+        deviceLabel: String,
+        relayEndpoint: RelayEndpoint,
+        orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate] = { $0 }
+    ) async throws -> StoredPairing {
+        let generated = try Self.generatePairingMaterial(deviceLabel: deviceLabel)
+        switch pairURL.kind {
+        case .direct:
+            return try await pairDirect(
+                pairURL: pairURL,
+                generated: generated,
+                deviceLabel: deviceLabel,
+                relayEndpoint: relayEndpoint.url,
+                enrollmentEndpoint: relayEndpoint,
+                orderCandidates: orderCandidates
+            )
+        case .relay:
             return try await pairViaRelay(
                 pairURL: pairURL,
                 generated: generated,
@@ -53,6 +81,25 @@ public struct PairClient: Sendable {
         generated: PairingMaterial,
         deviceLabel: String,
         relayEndpoint: URL,
+        orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
+    ) async throws -> StoredPairing {
+        let enrollmentEndpoint = try? RelayEndpoint(relayEndpoint)
+        return try await pairDirect(
+            pairURL: pairURL,
+            generated: generated,
+            deviceLabel: deviceLabel,
+            relayEndpoint: relayEndpoint,
+            enrollmentEndpoint: enrollmentEndpoint,
+            orderCandidates: orderCandidates
+        )
+    }
+
+    private func pairDirect(
+        pairURL: PairURL,
+        generated: PairingMaterial,
+        deviceLabel: String,
+        relayEndpoint: URL,
+        enrollmentEndpoint: RelayEndpoint?,
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
     ) async throws -> StoredPairing {
         guard pairURL.candidates.allSatisfy({ TunnelAddressClassifier.isLocalNetworkAddressLiteral($0.address) }) else {
@@ -75,7 +122,7 @@ public struct PairClient: Sendable {
                     deviceLabel: deviceLabel
                 )
                 pairLog.notice("paired direct host=\(candidate.address, privacy: .public) port=\(candidatePort, privacy: .public)")
-                let relayEnrollment = await optionalRelayEnrollment(relayEndpoint: relayEndpoint, lanResponse: lanResponse)
+                let relayEnrollment = await optionalRelayEnrollment(relayEndpoint: enrollmentEndpoint, lanResponse: lanResponse)
                 return try Self.makeStoredPairing(
                     lanResponse: lanResponse,
                     generated: generated,
@@ -108,7 +155,7 @@ public struct PairClient: Sendable {
         pairURL: PairURL,
         generated: PairingMaterial,
         deviceLabel: String,
-        defaultRelayEndpoint: URL
+        defaultRelayEndpoint: RelayEndpoint
     ) async throws -> StoredPairing {
         let pairKey: PairWindowRelayKey
         do {
@@ -117,7 +164,7 @@ public struct PairClient: Sendable {
             throw PairError.relayResponseInvalid(status: nil)
         }
 
-        let relayEndpoint = pairURL.relayOrigin?.resolved(default: defaultRelayEndpoint) ?? defaultRelayEndpoint
+        let relayEndpoint = try Self.relayEndpoint(pairURL.relayOrigin, default: defaultRelayEndpoint)
         let lanResponse: LANPairResponse
         do {
             let transport = try await DialClient.dialPairRelay(
@@ -145,7 +192,7 @@ public struct PairClient: Sendable {
         return try Self.makeStoredPairing(
             lanResponse: lanResponse,
             generated: generated,
-            relayEndpoint: relayEndpoint,
+            relayEndpoint: relayEndpoint.url,
             relayEnrollment: relayEnrollment
         )
     }
@@ -185,7 +232,7 @@ public struct PairClient: Sendable {
         return try Self.decodePairResponse(status: response.status, body: response.body)
     }
 
-    private func postRelay(relayEndpoint: URL, lanResponse: LANPairResponse) async throws -> RelayEnrollResponse {
+    private func postRelay(relayEndpoint: RelayEndpoint, lanResponse: LANPairResponse) async throws -> RelayEnrollResponse {
         let request = try Self.makeRelayRequest(
             relayEndpoint: relayEndpoint,
             response: lanResponse,
@@ -224,7 +271,11 @@ public struct PairClient: Sendable {
         }
     }
 
-    private func optionalRelayEnrollment(relayEndpoint: URL, lanResponse: LANPairResponse) async -> RelayEnrollment {
+    private func optionalRelayEnrollment(relayEndpoint: RelayEndpoint?, lanResponse: LANPairResponse) async -> RelayEnrollment {
+        guard let relayEndpoint else {
+            pairLog.notice("relay enrollment failed")
+            return .unavailable
+        }
         do {
             let relayResponse = try await postRelay(relayEndpoint: relayEndpoint, lanResponse: lanResponse)
             return .enrolled(deviceToken: relayResponse.deviceToken, expiresAt: relayResponse.expiresAt)
@@ -336,6 +387,14 @@ public struct PairClient: Sendable {
     }
 
     static func makeRelayRequest(relayEndpoint: URL, response: LANPairResponse, userAgent: String) throws -> URLRequest {
+        try makeRelayRequest(
+            relayEndpoint: validatedRelayEndpoint(relayEndpoint),
+            response: response,
+            userAgent: userAgent
+        )
+    }
+
+    static func makeRelayRequest(relayEndpoint: RelayEndpoint, response: LANPairResponse, userAgent: String) throws -> URLRequest {
         var request = URLRequest(url: try controlURL(relayEndpoint, path: "enroll/device"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -373,22 +432,16 @@ public struct PairClient: Sendable {
     }
 
     static func controlURL(_ base: URL, path: String, queryItems: [URLQueryItem] = []) throws -> URL {
-        guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false),
-              let scheme = components.scheme?.lowercased(),
-              components.host != nil else {
+        try controlURL(validatedRelayEndpoint(base), path: path, queryItems: queryItems)
+    }
+
+    static func controlURL(_ base: RelayEndpoint, path: String, queryItems: [URLQueryItem] = []) throws -> URL {
+        guard var components = URLComponents(url: base.url, resolvingAgainstBaseURL: false),
+              let scheme = base.controlScheme else {
             throw PairError.relayResponseInvalid(status: nil)
         }
 
-        switch scheme {
-        case "https", "http":
-            components.scheme = scheme
-        case "wss":
-            components.scheme = "https"
-        case "ws":
-            components.scheme = "http"
-        default:
-            throw PairError.relayResponseInvalid(status: nil)
-        }
+        components.scheme = scheme
 
         let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let suffix = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -401,6 +454,26 @@ public struct PairClient: Sendable {
             throw PairError.relayResponseInvalid(status: nil)
         }
         return url
+    }
+
+    private static func validatedRelayEndpoint(_ url: URL) throws -> RelayEndpoint {
+        do {
+            return try RelayEndpoint(url)
+        } catch {
+            throw PairError.relayResponseInvalid(status: nil)
+        }
+    }
+
+    private static func relayEndpoint(_ origin: RelayOrigin?, default defaultEndpoint: RelayEndpoint) throws -> RelayEndpoint {
+        guard let origin else {
+            return defaultEndpoint
+        }
+        switch origin {
+        case .wellKnown:
+            return defaultEndpoint
+        case .custom(let url):
+            return try validatedRelayEndpoint(url)
+        }
     }
 
     static func parseHTTPResponse(_ data: Data) throws -> PairHTTPResponse {

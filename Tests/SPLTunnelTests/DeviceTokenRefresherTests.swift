@@ -103,6 +103,23 @@ struct DeviceTokenRefresherTests {
         #expect(HTTPStubProtocol.state.requests(forHost: deviceTokenRelayHost).isEmpty)
     }
 
+    @Test func refreshPlaintextRelayEndpointDoesNotCallRelay() async {
+        for relayEndpoint in ["http://\(deviceTokenRelayHost)", "ws://\(deviceTokenRelayHost)"] {
+            defer { HTTPStubProtocol.state.reset(host: deviceTokenRelayHost) }
+            let session = makeHTTPStubSession(host: deviceTokenRelayHost) { _ in
+                Issue.record("relay should not be called")
+                return .http(status: 500, data: Data())
+            }
+            let refresher = DeviceTokenRefresher(session: session, clientInfo: deviceTokenClientInfo)
+            let stored = pairing(relayEndpoint: relayEndpoint)
+
+            let result = await refresher.refreshNow(pairing: stored)
+
+            #expect(result == .transientFailure(stored))
+            #expect(HTTPStubProtocol.state.requests(forHost: deviceTokenRelayHost).isEmpty)
+        }
+    }
+
     private func expectRefreshResult(_ stub: HTTPStubResult, expected: DeviceTokenRefreshResult) async {
         defer { HTTPStubProtocol.state.reset(host: deviceTokenRelayHost) }
         let session = makeHTTPStubSession(host: deviceTokenRelayHost) { _ in stub }
@@ -121,11 +138,14 @@ struct DeviceTokenRefresherTests {
             .appendingPathComponent("Sources/SPLTunnel/Pair/DeviceTokenRefresher.swift")
     }
 
-    private func pairing(relayEnrollment: RelayEnrollment = .enrolled(deviceToken: "old-token", expiresAt: nil)) -> StoredPairing {
+    private func pairing(
+        relayEndpoint: String = "https://\(deviceTokenRelayHost)",
+        relayEnrollment: RelayEnrollment = .enrolled(deviceToken: "old-token", expiresAt: nil)
+    ) -> StoredPairing {
         StoredPairing(
             instanceID: "instance-1",
             homeLabel: "home",
-            relayEndpoint: "https://\(deviceTokenRelayHost)",
+            relayEndpoint: relayEndpoint,
             fingerprint: "sha256:\(String(repeating: "a", count: 64))",
             clientCertPEM: "cert",
             clientKeyPEM: "key",

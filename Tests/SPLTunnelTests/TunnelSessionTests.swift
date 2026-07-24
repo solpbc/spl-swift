@@ -48,7 +48,7 @@ struct TunnelSessionTests {
         try await relay.start()
         let endpoint = try #require(URL(string: "ws://127.0.0.1:\(await relay.port)"))
         let pairing = pairing(from: fixture, relayEndpoint: endpoint.absoluteString)
-        let session = TunnelSession(pairing: pairing, clientInfo: tunnelClientInfo)
+        let session = tunnelSessionAllowingPlaintextRelay(pairing: pairing, clientInfo: tunnelClientInfo)
 
         let via = try await session.connect(endpoints: [
             .relay(endpoint: endpoint, instanceID: pairing.instanceID, deviceToken: deviceToken(from: pairing)),
@@ -131,7 +131,7 @@ struct TunnelSessionTests {
         try await relay.start()
         let endpoint = try #require(URL(string: "ws://127.0.0.1:\(await relay.port)"))
         let pairing = pairing(from: fixture, relayEndpoint: endpoint.absoluteString)
-        let session = TunnelSession(
+        let session = tunnelSessionAllowingPlaintextRelay(
             pairing: pairing,
             clientInfo: tunnelClientInfo,
             policy: fastKeepalivePolicy(runsOnRelayPath: false)
@@ -161,7 +161,7 @@ struct TunnelSessionTests {
         try await relay.start()
         let endpoint = try #require(URL(string: "ws://127.0.0.1:\(await relay.port)"))
         let pairing = pairing(from: fixture, relayEndpoint: endpoint.absoluteString)
-        let session = TunnelSession(
+        let session = tunnelSessionAllowingPlaintextRelay(
             pairing: pairing,
             clientInfo: tunnelClientInfo,
             policy: fastKeepalivePolicy(runsOnRelayPath: true)

@@ -76,6 +76,28 @@ struct TransportEndpointTests {
         }
     }
 
+    @Test func candidatesDropPlaintextRelayEndpoint() {
+        let localEndpoints = [
+            LocalEndpoint(host: "192.168.1.10", port: 443, scope: "local"),
+            LocalEndpoint(host: "fd12:3456::1", port: 443, scope: "ula"),
+        ]
+        let expectedDirect = [
+            TransportEndpoint.lan(host: "192.168.1.10", port: 443, scope: "local"),
+            TransportEndpoint.lan(host: "192.168.1.10", port: 443, scope: "local", unpinnedInterface: true),
+            TransportEndpoint.lan(host: "fd12:3456::1", port: 443, scope: "ula"),
+        ]
+
+        for relayEndpoint in ["http://relay.example/session", "ws://relay.example/session"] {
+            let pairing = pairing(
+                relayEnrollment: .enrolled(deviceToken: "token", expiresAt: nil),
+                localEndpoints: localEndpoints,
+                relayEndpoint: relayEndpoint
+            )
+
+            #expect(TransportEndpoint.candidates(for: pairing) == expectedDirect)
+        }
+    }
+
     @Test func connectedViaDropsRelaySecrets() {
         #expect(
             TransportEndpoint.lan(

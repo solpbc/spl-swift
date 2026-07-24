@@ -111,6 +111,46 @@ actor FakeTunnelTLS: TunnelTLSIO {
     }
 }
 
+func tunnelSessionAllowingPlaintextRelay(
+    pairing: StoredPairing,
+    clientInfo: SPLClientInfo,
+    policy: SessionPolicy = SessionPolicy()
+) -> TunnelSession {
+    TunnelSession(
+        pairing: pairing,
+        policy: policy,
+        tlsConnector: plaintextRelayTLSConnector(clientInfo: clientInfo, policy: policy)
+    )
+}
+
+private func plaintextRelayTLSConnector(
+    clientInfo: SPLClientInfo,
+    policy: SessionPolicy
+) -> TunnelTLSConnector {
+    { endpoint, pairing, onAwaitingBroker in
+        switch endpoint {
+        case .lan(let host, let port, _, let unpinnedInterface):
+            return try await InnerTLS.connectLAN(
+                host: host,
+                port: port,
+                pairing: pairing,
+                unpinnedInterface: unpinnedInterface
+            )
+        case .relay(let endpointURL, let instanceID, let deviceToken):
+            let transport = try await DialClient.dialRelay(
+                endpoint: RelayEndpoint.unchecked(endpointURL),
+                instanceID: instanceID,
+                authToken: deviceToken,
+                path: "session/dial",
+                clientInfo: clientInfo,
+                timeout: policy.race.relayOpenTimeout
+            )
+            await onAwaitingBroker(.relay(endpoint: endpointURL))
+            return try await InnerTLS.connectViaTransport(transport: transport, pairing: pairing)
+        }
+    }
+}
+
 actor StateProbe {
     private var states: [TunnelState] = []
     private var task: Task<Void, Never>?

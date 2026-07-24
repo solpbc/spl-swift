@@ -35,8 +35,9 @@ public enum DialClient {
         case .lan(let host, let port, _, _):
             return try await dialLAN(host: host, port: port, timeout: timeout)
         case .relay(let endpoint, let instanceID, let deviceToken):
+            let relayEndpoint = try validateRelayEndpoint(endpoint)
             return try await dialRelay(
-                endpoint: endpoint,
+                endpoint: relayEndpoint,
                 instanceID: instanceID,
                 authToken: deviceToken,
                 path: "session/dial",
@@ -48,6 +49,21 @@ public enum DialClient {
 
     static func dialPairRelay(
         endpoint: URL,
+        pairKey: PairWindowRelayKey,
+        clientInfo: SPLClientInfo,
+        timeout: Duration = .seconds(5)
+    ) async throws -> any ByteTransport {
+        let relayEndpoint = try validateRelayEndpoint(endpoint)
+        return try await dialPairRelay(
+            endpoint: relayEndpoint,
+            pairKey: pairKey,
+            clientInfo: clientInfo,
+            timeout: timeout
+        )
+    }
+
+    static func dialPairRelay(
+        endpoint: RelayEndpoint,
         pairKey: PairWindowRelayKey,
         clientInfo: SPLClientInfo,
         timeout: Duration = .seconds(5)
@@ -86,13 +102,13 @@ public enum DialClient {
         }
     }
 
-    private static func dialRelay(
-        endpoint: URL,
+    static func dialRelay(
+        endpoint: RelayEndpoint,
         instanceID: String,
         authToken: String,
         path: String,
         clientInfo: SPLClientInfo,
-        timeout: Duration
+        timeout: Duration = .seconds(5)
     ) async throws -> RelayWSTransport {
         try await dialRelay(
             endpoint: endpoint,
@@ -104,7 +120,7 @@ public enum DialClient {
     }
 
     private static func dialRelay(
-        endpoint: URL,
+        endpoint: RelayEndpoint,
         credential: RelayCredential,
         path: String,
         clientInfo: SPLClientInfo,
@@ -128,6 +144,14 @@ public enum DialClient {
         } catch {
             await transport.close()
             throw error
+        }
+    }
+
+    fileprivate static func validateRelayEndpoint(_ endpoint: URL) throws -> RelayEndpoint {
+        do {
+            return try RelayEndpoint(endpoint)
+        } catch {
+            throw DialError.invalidRelayURL(endpoint.absoluteString)
         }
     }
 }
@@ -199,7 +223,7 @@ actor RelayWSTransport: ByteTransport {
     private let task: URLSessionWebSocketTask
     private var closed = false
 
-    init(endpoint: URL, credential: RelayCredential, path: String, clientInfo: SPLClientInfo) throws {
+    init(endpoint: RelayEndpoint, credential: RelayCredential, path: String, clientInfo: SPLClientInfo) throws {
         let request = try Self.makeRequest(
             endpoint: endpoint,
             path: path,
@@ -293,6 +317,21 @@ actor RelayWSTransport: ByteTransport {
         credential: RelayCredential,
         clientInfo: SPLClientInfo
     ) throws -> URLRequest {
+        let relayEndpoint = try DialClient.validateRelayEndpoint(endpoint)
+        return try makeRequest(
+            endpoint: relayEndpoint,
+            path: path,
+            credential: credential,
+            clientInfo: clientInfo
+        )
+    }
+
+    static func makeRequest(
+        endpoint: RelayEndpoint,
+        path: String,
+        credential: RelayCredential,
+        clientInfo: SPLClientInfo
+    ) throws -> URLRequest {
         let url = try Self.webSocketURL(endpoint: endpoint, path: path, instanceID: credential.instanceID)
         var request = URLRequest(url: url)
         request.setValue(clientInfo.userAgent, forHTTPHeaderField: "User-Agent")
@@ -306,21 +345,17 @@ actor RelayWSTransport: ByteTransport {
     }
 
     static func webSocketURL(endpoint: URL, path: String, instanceID: String?) throws -> URL {
-        guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
-              let scheme = components.scheme?.lowercased() else {
-            throw DialError.invalidRelayURL(endpoint.absoluteString)
+        let relayEndpoint = try DialClient.validateRelayEndpoint(endpoint)
+        return try webSocketURL(endpoint: relayEndpoint, path: path, instanceID: instanceID)
+    }
+
+    static func webSocketURL(endpoint: RelayEndpoint, path: String, instanceID: String?) throws -> URL {
+        guard var components = URLComponents(url: endpoint.url, resolvingAgainstBaseURL: false),
+              let scheme = endpoint.webSocketScheme else {
+            throw DialError.invalidRelayURL(endpoint.url.absoluteString)
         }
 
-        switch scheme {
-        case "https":
-            components.scheme = "wss"
-        case "http":
-            components.scheme = "ws"
-        case "wss", "ws":
-            components.scheme = scheme
-        default:
-            throw DialError.invalidRelayURL(endpoint.absoluteString)
-        }
+        components.scheme = scheme
 
         let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let dialPath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -332,7 +367,7 @@ actor RelayWSTransport: ByteTransport {
         components.queryItems = queryItems.isEmpty ? nil : queryItems
 
         guard let url = components.url else {
-            throw DialError.invalidRelayURL(endpoint.absoluteString)
+            throw DialError.invalidRelayURL(endpoint.url.absoluteString)
         }
         return url
     }

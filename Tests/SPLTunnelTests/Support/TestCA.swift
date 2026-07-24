@@ -57,7 +57,7 @@ enum TestCA {
         let pairing = StoredPairing(
             instanceID: "test-instance",
             homeLabel: "test home",
-            relayEndpoint: "ws://127.0.0.1:1",
+            relayEndpoint: "wss://127.0.0.1:1",
             fingerprint: "",
             clientCertPEM: clientPEM,
             clientKeyPEM: clientKeyPEM,
@@ -82,7 +82,7 @@ enum TestCA {
         let pairing = StoredPairing(
             instanceID: "identity",
             homeLabel: "identity",
-            relayEndpoint: "ws://127.0.0.1:1",
+            relayEndpoint: "wss://127.0.0.1:1",
             fingerprint: "",
             clientCertPEM: certificatePEM,
             clientKeyPEM: privateKeyPEM,
