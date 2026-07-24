@@ -3,7 +3,7 @@
 # The five-target contract: install, test, ci, format, clean.
 # ci runs BOTH destinations (macOS native + iOS Simulator) plus hygiene gates.
 
-CI_IOS_DEST ?= platform=iOS Simulator,name=iPhone 17
+CI_IOS_DEST ?= platform=iOS Simulator,name=iPhone 17 Pro
 
 .PHONY: install test test-ios ci ci-macos ci-ios hygiene format clean
 
@@ -14,7 +14,7 @@ test:
 	@swift test --no-parallel
 
 test-ios:
-	@xcodebuild test -scheme spl-swift-Package -destination '$(CI_IOS_DEST)' \
+	@xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' \
 		-quiet 2>&1 | tail -20
 
 ci: hygiene ci-macos ci-ios
@@ -25,7 +25,7 @@ ci-macos:
 	@swift test --no-parallel
 
 ci-ios:
-	@xcodebuild test -scheme spl-swift-Package -destination '$(CI_IOS_DEST)' \
+	@xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' \
 		-quiet 2>&1 | tail -20
 
 # Hygiene gates: forbidden constructs and internal-infrastructure strings must
