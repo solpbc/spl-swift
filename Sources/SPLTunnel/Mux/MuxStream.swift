@@ -29,6 +29,12 @@ enum SendCreditOutcome: Equatable, Sendable {
     case flowControlExceeded
 }
 
+private enum CreditWaiterSlot {
+    case pending
+    case installed(CheckedContinuation<Void, Error>)
+    case cancelled
+}
+
 public final actor MuxStream {
     public nonisolated let id: UInt32
     public nonisolated var inbound: MuxInboundSequence {
@@ -49,8 +55,7 @@ public final actor MuxStream {
     private var consumedSinceLastGrant = 0
     private var queuedInboundBytes = 0
     private var nextCreditWaiterID: UInt64 = 1
-    private var creditWaiters: [UInt64: CheckedContinuation<Void, Error>] = [:]
-    private var cancelledWaiterIDs: Set<UInt64> = []
+    private var creditWaiters: [UInt64: CreditWaiterSlot] = [:]
 
     init(
         id: UInt32,
@@ -233,6 +238,7 @@ public final actor MuxStream {
             try Task.checkCancellation()
             let id = nextCreditWaiterID
             nextCreditWaiterID &+= 1
+            prepareCreditWaiter(id: id)
             try await withTaskCancellationHandler {
                 try await installCreditWaiter(id: id)
             } onCancel: { [weak self] in
@@ -240,29 +246,42 @@ public final actor MuxStream {
                     await self?.cancelCreditWaiter(id: id)
                 }
             }
+            try Task.checkCancellation()
         }
 
         try ensureWritable()
         sendCredit -= byteCount
     }
 
+    func prepareCreditWaiter(id: UInt64) {
+        creditWaiters[id] = .pending
+    }
+
     func installCreditWaiter(id: UInt64) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            if cancelledWaiterIDs.remove(id) != nil {
+            switch creditWaiters[id] {
+            case .pending:
+                creditWaiters[id] = .installed(continuation)
+            case .cancelled:
+                creditWaiters.removeValue(forKey: id)
                 continuation.resume(throwing: CancellationError())
-                return
+            case .installed, nil:
+                continuation.resume(returning: ())
             }
-            creditWaiters[id] = continuation
         }
     }
 
     func cancelCreditWaiter(id: UInt64) {
-        guard let waiter = creditWaiters.removeValue(forKey: id) else {
-            cancelledWaiterIDs.insert(id)
+        switch creditWaiters[id] {
+        case .pending:
+            creditWaiters[id] = .cancelled
+        case let .installed(waiter):
+            // Removal from creditWaiters is the resume token; no path resumes twice.
+            creditWaiters.removeValue(forKey: id)
+            waiter.resume(throwing: CancellationError())
+        case .cancelled, nil:
             return
         }
-        cancelledWaiterIDs.remove(id)
-        waiter.resume(throwing: CancellationError())
     }
 
     private func ensureWritable() throws {
@@ -310,20 +329,22 @@ public final actor MuxStream {
     private func resumeCreditWaiters(returning value: Void) {
         let waiters = creditWaiters
         creditWaiters.removeAll()
-        for (id, waiter) in waiters {
-            // Removal from creditWaiters is the resume token; no path resumes twice.
-            cancelledWaiterIDs.remove(id)
-            waiter.resume(returning: value)
+        for (_, slot) in waiters {
+            if case let .installed(waiter) = slot {
+                // Removal from creditWaiters is the resume token; no path resumes twice.
+                waiter.resume(returning: value)
+            }
         }
     }
 
     private func resumeCreditWaiters(throwing error: Error) {
         let waiters = creditWaiters
         creditWaiters.removeAll()
-        for (id, waiter) in waiters {
-            // Removal from creditWaiters is the resume token; no path resumes twice.
-            cancelledWaiterIDs.remove(id)
-            waiter.resume(throwing: error)
+        for (_, slot) in waiters {
+            if case let .installed(waiter) = slot {
+                // Removal from creditWaiters is the resume token; no path resumes twice.
+                waiter.resume(throwing: error)
+            }
         }
     }
 }

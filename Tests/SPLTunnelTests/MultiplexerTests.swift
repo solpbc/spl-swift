@@ -88,7 +88,7 @@ struct MultiplexerTests {
     }
 
     @Test func openStreamSendFailureRollsBackRegisteredStreamOnly() async throws {
-        let sink = FailFirstMuxSink()
+        let sink = SelectiveMuxSink(failureMode: .first)
         let failingMux = Multiplexer(sink: { bytes in try await sink.recordOrThrow(bytes) }, role: .dialer)
         do {
             _ = try await failingMux.openStream()
@@ -240,6 +240,42 @@ struct MultiplexerTests {
         try await mux.feedInbound(try encodeFrame(buildClose(streamID: streams[0].id)))
         let next = try await mux.openStream()
         #expect(next.id == 513)
+    }
+
+    @Test func concurrentOpenStreamCallsCannotExceedCap() async throws {
+        let recorder = MuxFrameRecorder()
+        let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
+        for _ in 0..<(MuxConstants.maxConcurrentStreams - 1) {
+            _ = try await mux.openStream()
+        }
+        await recorder.reset()
+
+        let attempts = 32
+        let outcomes = await withTaskGroup(of: Bool?.self, returning: [Bool?].self) { group in
+            for _ in 0..<attempts {
+                group.addTask {
+                    do {
+                        _ = try await mux.openStream()
+                        return true
+                    } catch let error as MuxError where error == .streamLimitExceeded {
+                        return false
+                    } catch {
+                        return nil
+                    }
+                }
+            }
+
+            var collected: [Bool?] = []
+            for await outcome in group {
+                collected.append(outcome)
+            }
+            return collected
+        }
+
+        #expect(outcomes.filter { $0 == true }.count == 1)
+        #expect(outcomes.filter { $0 == false }.count == attempts - 1)
+        #expect(outcomes.allSatisfy { $0 != nil })
+        #expect(await recorder.frames().filter { $0.flags == FrameFlags.open.rawValue }.count == 1)
     }
 
     @Test func creditSuspendResume() async throws {
@@ -531,20 +567,7 @@ struct MultiplexerTests {
         }
     }
 
-    @Test func tearDownStillClearsStreams() async throws {
-        let recorder = MuxFrameRecorder()
-        let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
-        _ = try await mux.openStream()
-        _ = try await mux.openStream()
-
-        await mux.tearDown(reason: .normalShutdown)
-
-        await expectMuxError(.transportClosed) {
-            try await mux.feedInbound(try encodeFrame(buildData(streamID: 1, payload: Data([0x01]))))
-        }
-    }
-
-    @Test func tearDownFinishesRemainingLiveStreams() async throws {
+    @Test func tearDownClearsAndFinishesRemainingLiveStreams() async throws {
         let recorder = MuxFrameRecorder()
         let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
         let live = try await mux.openStream()
@@ -555,6 +578,7 @@ struct MultiplexerTests {
         await mux.tearDown(reason: .transportFailure)
 
         for stream in [live, halfClosedLocal, liveSibling] {
+            #expect(await stream.state == .closed)
             var iterator = stream.inbound.makeAsyncIterator()
             await expectMuxError(.transportClosed) {
                 _ = try await iterator.next()
@@ -1264,6 +1288,7 @@ struct MultiplexerTests {
         let probe = Task {
             do {
                 let waiterID: UInt64 = 999
+                await stream.prepareCreditWaiter(id: waiterID)
                 await stream.cancelCreditWaiter(id: waiterID)
                 try await stream.installCreditWaiter(id: waiterID)
                 await result.store(false)

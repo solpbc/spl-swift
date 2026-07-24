@@ -39,17 +39,24 @@ actor SelectiveMuxSink {
     enum FailureMode: Sendable {
         case any
         case flags(UInt8)
+        case first
     }
 
     private let failureMode: FailureMode
     private var decoder = FrameDecoder()
     private var recordedFrames: [Frame] = []
+    private var didFail = false
 
     init(failureMode: FailureMode) {
         self.failureMode = failureMode
     }
 
     func recordOrThrow(_ bytes: Data) throws {
+        if case .first = failureMode, !didFail {
+            didFail = true
+            throw MuxTestError.sinkFailure
+        }
+
         decoder.feed(bytes)
         var decoded: [Frame] = []
         while let frame = try decoder.next() {
@@ -66,6 +73,8 @@ actor SelectiveMuxSink {
             if decoded.contains(where: { $0.flags == flags }) {
                 throw MuxTestError.sinkFailure
             }
+        case .first:
+            break
         }
     }
 
@@ -75,28 +84,6 @@ actor SelectiveMuxSink {
 
     func matchingFrameCount(flags: UInt8) -> Int {
         recordedFrames.filter { $0.flags == flags }.count
-    }
-}
-
-actor FailFirstMuxSink {
-    private var decoder = FrameDecoder()
-    private var recordedFrames: [Frame] = []
-    private var shouldFail = true
-
-    func recordOrThrow(_ bytes: Data) throws {
-        guard !shouldFail else {
-            shouldFail = false
-            throw MuxTestError.sinkFailure
-        }
-
-        decoder.feed(bytes)
-        while let frame = try decoder.next() {
-            recordedFrames.append(frame)
-        }
-    }
-
-    func frames() -> [Frame] {
-        recordedFrames
     }
 }
 

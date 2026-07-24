@@ -39,7 +39,7 @@ public actor Multiplexer {
         keepaliveLostStream
     }
 
-    internal nonisolated let incomingStreams: AsyncStream<MuxStream>
+    public nonisolated let incomingStreams: AsyncStream<MuxStream>
 
     private let sink: @Sendable (Data) async throws -> Void
     private let sleeper: @Sendable (Duration) async throws -> Void
@@ -90,7 +90,7 @@ public actor Multiplexer {
         guard !tornDown else {
             throw MuxError.transportClosed
         }
-        guard await activeStreamCount() < MuxConstants.maxConcurrentStreams else {
+        guard activeStreamCount() < MuxConstants.maxConcurrentStreams else {
             throw MuxError.streamLimitExceeded
         }
 
@@ -276,7 +276,7 @@ public actor Multiplexer {
         let parityRejected = (role == .dialer && isOdd) || (role == .listener && !isOdd)
         if parityRejected {
             logger.warning(
-                "inbound OPEN parity rejected id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.protocolError.rawValue, privacy: .public)"
+                "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.protocolError.rawValue, privacy: .public)"
             )
             try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: .protocolError)))
             return
@@ -284,13 +284,16 @@ public actor Multiplexer {
 
         if streams[frame.streamID] != nil {
             logger.warning(
-                "duplicate inbound OPEN id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.protocolError.rawValue, privacy: .public)"
+                "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.protocolError.rawValue, privacy: .public)"
             )
             try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: .protocolError)))
             return
         }
 
-        guard await activeStreamCount() < MuxConstants.maxConcurrentStreams else {
+        guard activeStreamCount() < MuxConstants.maxConcurrentStreams else {
+            logger.warning(
+                "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.streamLimitExceeded.rawValue, privacy: .public)"
+            )
             try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: .streamLimitExceeded)))
             return
         }
@@ -307,7 +310,7 @@ public actor Multiplexer {
             let outcome = await stream.admitInitialPayload(frame.payload)
             if outcome == .receiveWindowExceeded {
                 logger.warning(
-                    "inbound OPEN payload exceeds window id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.flowControlError.rawValue, privacy: .public)"
+                    "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.flowControlError.rawValue, privacy: .public)"
                 )
                 try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: .flowControlError)))
                 return
@@ -348,7 +351,7 @@ public actor Multiplexer {
         }
 
         logger.warning(
-            "isolating stream violation id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(reason.rawValue, privacy: .public)"
+            "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(reason.rawValue, privacy: .public)"
         )
         try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: reason)))
     }
@@ -359,8 +362,8 @@ public actor Multiplexer {
         length: Int,
         reason: ResetReason
     ) async throws {
-        logger.debug(
-            "resetting unknown stream id=\(streamID, privacy: .public) flags=\(flags, privacy: .public) length=\(length, privacy: .public) reason=\(reason.rawValue, privacy: .public)"
+        logger.warning(
+            "framing_protocol_violation stream_id=\(streamID, privacy: .public) flags=\(flags, privacy: .public) length=\(length, privacy: .public) reason=\(reason.rawValue, privacy: .public)"
         )
         try await sink(try encodeFrame(buildReset(streamID: streamID, reason: reason)))
     }
@@ -382,6 +385,7 @@ public actor Multiplexer {
                 guard !Task.isCancelled, !(error is CancellationError) else {
                     return
                 }
+                // Sink failure means the transport write path is dead; tear down immediately.
                 logger.notice("mux keepalive lost reason=\("sendFailure", privacy: .public)")
                 keepaliveLostContinuation.yield(())
                 await tearDown(reason: .transportFailure)
@@ -413,6 +417,7 @@ public actor Multiplexer {
         if pendingPingNonce != nil {
             missedPings += 1
             if missedPings >= missedLimit {
+                // Missed PONGs are session policy: signal and let the session decide whether to tear down.
                 logger.notice("mux keepalive lost missed_pings=\(self.missedPings, privacy: .public)")
                 keepaliveLostContinuation.yield(())
                 keepaliveTask?.cancel()
@@ -426,18 +431,13 @@ public actor Multiplexer {
         try await sink(try encodeFrame(buildPing(nonce: nonce)))
     }
 
-    private func activeStreamCount() async -> Int {
-        var count = 0
-        for stream in streams.values {
-            let state = await stream.state
-            // framing.md:114-118 caps concurrent non-terminal streams to bound
-            // memory under a misbehaving peer; half-closed-local streams still
-            // deliver inbound data and hold receive-window buffers.
-            if state != .closed && state != .resetLocal && state != .resetRemote {
-                count += 1
-            }
-        }
-        return count
+    private func activeStreamCount() -> Int {
+        // framing.md:114-118 caps concurrent non-terminal streams to bound memory
+        // under a misbehaving peer; .halfClosedLocal and .halfClosedRemote streams
+        // still hold flow-control buffers, and terminal streams are evicted through
+        // onTerminal. The async eviction callback may briefly over-count a
+        // just-terminal stream, which is conservative and safe for a memory cap.
+        streams.count
     }
 
     private func randomNonce() throws -> Data {
