@@ -264,7 +264,9 @@ struct LoopbackProxyTests {
                 client.start(queue: .global(qos: .utility))
             }
 
-            #expect(await waitUntil("loopback churn accepted") {
+            // 200 real loopback connections need more than the 500 ms default: the
+            // bound is a safety net on a completion signal, not a timing assertion.
+            #expect(await waitUntil("loopback churn accepted", timeout: .seconds(10)) {
                 await opener.attemptCount() >= churnCount
             })
             for _ in 0..<100 {
