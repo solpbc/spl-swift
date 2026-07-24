@@ -582,7 +582,6 @@ struct LANPairResponse: Decodable {
     let clientCert: String
     let caChain: [String]
     let homeAttestation: String
-    let fingerprint: String?
     let localEndpoints: [LocalEndpoint]
 
     enum CodingKeys: String, CodingKey {
@@ -591,7 +590,6 @@ struct LANPairResponse: Decodable {
         case clientCert = "client_cert"
         case caChain = "ca_chain"
         case homeAttestation = "home_attestation"
-        case fingerprint
         case localEndpoints = "local_endpoints"
     }
 
@@ -602,7 +600,6 @@ struct LANPairResponse: Decodable {
         clientCert = try container.decode(String.self, forKey: .clientCert)
         caChain = try container.decode([String].self, forKey: .caChain)
         homeAttestation = try container.decode(String.self, forKey: .homeAttestation)
-        fingerprint = try container.decodeIfPresent(String.self, forKey: .fingerprint)
         localEndpoints = try container.decodeIfPresent([LocalEndpoint].self, forKey: .localEndpoints) ?? []
     }
 }

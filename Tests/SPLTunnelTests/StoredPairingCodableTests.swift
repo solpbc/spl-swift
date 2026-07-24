@@ -3,7 +3,7 @@
 
 import Foundation
 import Testing
-import SPLTunnel
+@testable import SPLTunnel
 
 @Suite("StoredPairing Codable")
 struct StoredPairingCodableTests {
