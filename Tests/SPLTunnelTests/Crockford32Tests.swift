@@ -13,7 +13,7 @@ struct Crockford32Tests {
 
     @Test func byteRoundTrip() throws {
         let bytes = Array(UInt8.min...UInt8.max)
-        #expect(try Crockford32.decode(Self.encode(bytes)) == bytes)
+        #expect(try Crockford32.decode(Crockford32TestEncoding.encode(bytes)) == bytes)
     }
 
     @Test func lowercaseFoldsToUppercase() throws {
@@ -59,30 +59,23 @@ struct Crockford32Tests {
         #expect(try Crockford32.decode("0") == [])
     }
 
-    private static func encode(_ bytes: [UInt8]) -> String {
-        let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
-        var accumulator: UInt64 = 0
-        var bitCount = 0
-        var output = ""
+    @Test func validPairURLBlobsRoundTripThroughParser() throws {
+        var generator = LCG(state: 0xDEADBEEF)
 
-        for byte in bytes {
-            accumulator = (accumulator << 8) | UInt64(byte)
-            bitCount += 8
+        for _ in 0..<128 {
+            var bytes = (0..<40).map { _ in generator.nextByte() }
+            bytes[0] = 0x04
+            bytes[1] = 0x01
 
-            while bitCount >= 5 {
-                bitCount -= 5
-                let index = Int((accumulator >> UInt64(bitCount)) & 0x1f)
-                output.append(alphabet[index])
-                accumulator &= (1 << UInt64(bitCount)) - 1
-            }
+            let fragment = Crockford32TestEncoding.encode(bytes)
+            let pairURL = try PairURL.parse(URL(string: "https://go.solstone.app/p#\(fragment)")!)
+            #expect(pairURL.version == bytes[0])
+            #expect(pairURL.kind == .direct)
+            #expect(pairURL.candidates.first?.address == Array(bytes[2..<6]).map(String.init).joined(separator: "."))
+            #expect(pairURL.candidates.first?.port == UInt16(bytes[6]) << 8 | UInt16(bytes[7]))
+            #expect(pairURL.nonceBytes == Array(bytes[8..<24]))
+            #expect(pairURL.caFingerprintBytes == Array(bytes[24..<40]))
         }
-
-        if bitCount > 0 {
-            let index = Int((accumulator << UInt64(5 - bitCount)) & 0x1f)
-            output.append(alphabet[index])
-        }
-
-        return output
     }
 
     private func expectThrows(_ expected: Crockford32Error, _ operation: () throws -> Void) {
@@ -94,5 +87,14 @@ struct Crockford32Tests {
         } catch {
             Issue.record("Expected \(expected), got \(error)")
         }
+    }
+}
+
+private struct LCG {
+    var state: UInt64
+
+    mutating func nextByte() -> UInt8 {
+        state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return UInt8((state >> 56) & 0xff)
     }
 }

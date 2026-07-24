@@ -57,7 +57,7 @@ enum Crockford32 {
     }
 }
 
-enum Crockford32Error: Error, Equatable, Sendable {
+public enum Crockford32Error: Error, Equatable, Sendable {
     case outOfAlphabet(Character)
     case nonCanonicalPadBits
 }
