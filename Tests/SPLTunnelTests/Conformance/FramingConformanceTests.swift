@@ -87,7 +87,8 @@ struct FramingConformanceTests {
     }
 
     @Test func openPayloadIsOrdinaryStreamBytes() throws {
-        // proto/framing.md:60 makes OPEN payload ordinary stream bytes; Mux enforces window debit later.
+        // proto/framing.md:60 says an OPEN initial payload counts against the stream window.
+        // The codec preserves those bytes; window accounting is enforced above this layer.
         let open = Frame(streamID: 1, flags: FrameFlags.open.rawValue, payload: Data([0x41]))
         let openData = Frame(
             streamID: 3,

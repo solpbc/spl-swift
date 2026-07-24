@@ -38,8 +38,10 @@ struct PairLinkConformanceTests {
         #expect(pairURL.version == 0x06)
         #expect(pairURL.kind == .relay)
         #expect(pairURL.sBytes == Self.sBytes)
+        #expect(pairURL.nonceBytes == [])
         #expect(pairURL.caPin.kind == .spkiSHA256)
         #expect(pairURL.caFingerprintBytes == Self.caFingerprintBytes)
+        #expect(pairURL.candidates == [])
         #expect(pairURL.relayOrigin == .wellKnown)
     }
 

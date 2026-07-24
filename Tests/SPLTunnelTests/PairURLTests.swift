@@ -7,51 +7,6 @@ import Testing
 
 @Suite("PairURL")
 struct PairURLTests {
-    @Test func canonicalReferenceVectorParses() throws {
-        let pairURL = try PairURL.parse(Self.url(fragment: Self.canonicalBlob))
-
-        #expect(pairURL.version == 0x04)
-        #expect(pairURL.kind == .direct)
-        #expect(pairURL.candidates == [PairCandidate(address: "192.0.2.42", port: 0x1B9E)])
-        #expect(pairURL.nonceBytes == [
-            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18,
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-        ])
-        #expect(pairURL.caFingerprintBytes == [
-            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
-        ])
-        #expect(pairURL.caPin.kind == .certificateSHA256)
-        #expect(pairURL.sBytes == [])
-        #expect(pairURL.relayOrigin == nil)
-    }
-
-    @Test func wellKnownRelayReferenceVectorParses() throws {
-        let pairURL = try PairURL.parse(Self.url(fragment: Self.wellKnownRelayBlob))
-
-        #expect(pairURL.version == 0x06)
-        #expect(pairURL.kind == .relay)
-        #expect(pairURL.sBytes == Self.relaySBytes)
-        #expect(pairURL.nonceBytes == [])
-        #expect(pairURL.caPin.kind == .spkiSHA256)
-        #expect(pairURL.caFingerprintBytes == Self.relayCAFingerprintBytes)
-        #expect(pairURL.candidates == [])
-        #expect(pairURL.relayOrigin == .wellKnown)
-
-        let override = URL(string: "https://relay.test")!
-        #expect(pairURL.relayOrigin?.resolved(default: override) == override)
-    }
-
-    @Test func customRelayReferenceVectorParses() throws {
-        let pairURL = try PairURL.parse(Self.url(fragment: Self.customRelayBlob))
-
-        #expect(pairURL.version == 0x06)
-        #expect(pairURL.kind == .relay)
-        #expect(pairURL.sBytes == Self.relaySBytes)
-        #expect(pairURL.caFingerprintBytes == Self.relayCAFingerprintBytes)
-        #expect(pairURL.relayOrigin == .custom(URL(string: "https://relay.example")!))
-    }
-
     // The 0x05 multi-candidate form is not specified anywhere in proto/; the
     // only 0x05 proto hit is framing.md:70 CANCEL, unrelated to pair links.
     // These tests pin existing client behavior, not wire conformance.
@@ -256,8 +211,6 @@ struct PairURLTests {
     private static let alternateDirectBlob = "0G0W000218EYJ001081G81860W40J2GB1G6GW3X0M6HA7955MTKTHADANEPAVBNF"
     private static let multiAddressBlob = "0M0G47F9R00042P66DJ18001081G81860W40J2GB1G6GW3X0M6HA7955MTKTHADANEPAVBNF"
     private static let multiAddressHex = "0501021de9c000020ac6336414000102030405060708090a0b0c0d0e0fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
-    private static let wellKnownRelayBlob = "0R0J6HB7H6NWVVR1VTPVXVYAZTXBW0938NKRKAYDXW00"
-    private static let customRelayBlob = "0R0J6HB7H6NWVVR1VTPVXVYAZTXBW0938NKRKAYDXWAPGX3ME1SKMBSFE9JPRRBS5SJQGRBDE1P6A"
     private static let relaySBytes: [UInt8] = [
         0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
     ]

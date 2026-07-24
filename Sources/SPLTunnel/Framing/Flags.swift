@@ -12,7 +12,7 @@ public enum FrameFlags: UInt8, Sendable {
     case ping = 0x20
     case pong = 0x40
 
-    public static let primaryMask: UInt8 =
+    static let primaryMask: UInt8 =
         FrameFlags.open.rawValue |
         FrameFlags.data.rawValue |
         FrameFlags.close.rawValue |
@@ -20,7 +20,7 @@ public enum FrameFlags: UInt8, Sendable {
         FrameFlags.window.rawValue |
         FrameFlags.ping.rawValue |
         FrameFlags.pong.rawValue
-    public static let reservedMask: UInt8 = 0x80
+    static let reservedMask: UInt8 = 0x80
     public static let validCombinations: Set<UInt8> = [
         FrameFlags.open.rawValue,
         FrameFlags.data.rawValue,
@@ -44,7 +44,7 @@ public enum ResetReason: UInt8, Sendable, Equatable {
     case cancel = 0x05
     case unspecified = 0xff
 
-    public static func normalized(fromRawByte rawByte: UInt8) -> ResetReason {
+    static func normalized(fromRawByte rawByte: UInt8) -> ResetReason {
         ResetReason(rawValue: rawByte) ?? .unspecified
     }
 }

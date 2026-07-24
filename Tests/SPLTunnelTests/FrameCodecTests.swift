@@ -314,6 +314,7 @@ struct FrameDecoderIncrementalTests {
         let frameCount = 20_000
         let payloadSize = 16
         let chunkSize = 31
+        let encodedFrameSize = 8 + payloadSize
         let frames = (0..<frameCount).map { index in
             Frame(
                 streamID: UInt32(index + 1),
@@ -328,6 +329,7 @@ struct FrameDecoderIncrementalTests {
         var decoded: [Frame] = []
         decoded.reserveCapacity(frameCount)
         var decoder = FrameDecoder()
+        var maxRetainedAfterDrain = 0
         var cursor = bytes.startIndex
         while cursor < bytes.endIndex {
             let next = bytes.index(cursor, offsetBy: chunkSize, limitedBy: bytes.endIndex) ?? bytes.endIndex
@@ -335,17 +337,23 @@ struct FrameDecoderIncrementalTests {
             while let frame = try decoder.next() {
                 decoded.append(frame)
             }
+            maxRetainedAfterDrain = max(maxRetainedAfterDrain, decoder.retainedBufferByteCount)
             cursor = next
         }
 
         #expect(decoded == frames)
         #expect(try decoder.next() == nil)
-        let encodedFrameSize = 8 + payloadSize
         let highWaterBound = (64 << 10) + encodedFrameSize + chunkSize
+        let steadyStateRetentionBound = 2 * (encodedFrameSize - 1)
+        // The high-water bound covers the 64 KiB compaction branch. Without compaction,
+        // the high-water mark would equal the full stream size.
         #expect(decoder.bufferHighWaterMark <= highWaterBound)
         #expect(highWaterBound < bytes.count / 4)
-        // Without compaction, the high-water mark would equal the full stream size.
         #expect(bytes.count > highWaterBound)
+        // The steady-state bound covers the half-buffer branch: after a drain,
+        // unread tail < one 24-byte frame and retained consumed bytes <= that tail,
+        // so retained buffer <= two partial frames. The 31-byte chunk is already drained.
+        #expect(maxRetainedAfterDrain <= steadyStateRetentionBound)
     }
 
     @Test func singleLargeFrameOneByteFeedsRetainsOnlyInFlightFrame() throws {

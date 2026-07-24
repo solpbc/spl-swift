@@ -3,8 +3,8 @@
 
 import Foundation
 
-public enum FramingLimits {
-    public static let maxPayload: Int = 0x00ff_ffff
+enum FramingLimits {
+    static let maxPayload: Int = 0x00ff_ffff
 }
 
 public enum FramingError: Error, Equatable, Sendable {
@@ -36,7 +36,7 @@ public func encodeFrame(_ frame: Frame) throws -> Data {
     return data
 }
 
-public func validateFlags(_ flags: UInt8) throws {
+func validateFlags(_ flags: UInt8) throws {
     guard flags & FrameFlags.reservedMask == 0 else {
         throw FramingError.reservedBitsSet
     }
@@ -54,7 +54,7 @@ public struct FrameDecoder {
     internal private(set) var bufferHighWaterMark: Int = 0
 
     internal var retainedBufferByteCount: Int {
-        buffer.count - cursor
+        buffer.count
     }
 
     public init() {}
