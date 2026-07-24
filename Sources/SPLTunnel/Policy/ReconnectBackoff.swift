@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-struct ReconnectBackoff: Sendable {
-    struct Step: Sendable, Equatable {
-        let attempt: Int
-        let delay: Duration
+public struct ReconnectBackoff: Sendable {
+    public struct Step: Sendable, Equatable {
+        public let attempt: Int
+        public let delay: Duration
     }
 
-    enum Schedule: Sendable, Equatable {
+    public enum Schedule: Sendable, Equatable {
         case table([Duration])
         case exponential(initial: Duration, multiplier: Double, cap: Duration)
 
-        static let defaultTable: [Duration] = [
+        public static let defaultTable: [Duration] = [
             .seconds(1),
             .seconds(5),
             .seconds(10),
             .seconds(30),
         ]
 
-        static let `default`: Schedule = .table(defaultTable)
+        public static let `default`: Schedule = .table(defaultTable)
 
         func delay(forAttempt attempt: Int) -> Duration {
             let clampedAttempt = max(attempt, 1)
@@ -41,14 +41,14 @@ struct ReconnectBackoff: Sendable {
         }
     }
 
-    static let defaultJitterRange = 0.75...1.25
+    public static let defaultJitterRange = 0.75...1.25
 
     private let schedule: Schedule
     private let jitterRange: ClosedRange<Double>
     private let random: @Sendable (ClosedRange<Double>) -> Double
     private var nextAttempt = 1
 
-    init(
+    public init(
         schedule: Schedule = .default,
         jitterRange: ClosedRange<Double> = defaultJitterRange,
         random: @escaping @Sendable (ClosedRange<Double>) -> Double = { Double.random(in: $0) }
@@ -58,11 +58,11 @@ struct ReconnectBackoff: Sendable {
         self.random = random
     }
 
-    mutating func reset() {
+    public mutating func reset() {
         nextAttempt = 1
     }
 
-    mutating func nextDelay() -> Step {
+    public mutating func nextDelay() -> Step {
         let attempt = nextAttempt
         nextAttempt += 1
         return Step(
