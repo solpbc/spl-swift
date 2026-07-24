@@ -20,6 +20,7 @@ struct RelayEndpoint: Sendable, Equatable {
         RelayEndpoint(url: url)
     }
 
+    // init(_:) admits only https/wss; plaintext arms are unchecked test endpoints.
     var webSocketScheme: String? {
         switch url.scheme?.lowercased() {
         case "https":
@@ -35,6 +36,7 @@ struct RelayEndpoint: Sendable, Equatable {
         }
     }
 
+    // init(_:) admits only https/wss; plaintext arms are unchecked test endpoints.
     var controlScheme: String? {
         switch url.scheme?.lowercased() {
         case "https":

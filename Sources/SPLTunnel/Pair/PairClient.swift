@@ -386,14 +386,6 @@ public struct PairClient: Sendable {
         }
     }
 
-    static func makeRelayRequest(relayEndpoint: URL, response: LANPairResponse, userAgent: String) throws -> URLRequest {
-        try makeRelayRequest(
-            relayEndpoint: validatedRelayEndpoint(relayEndpoint),
-            response: response,
-            userAgent: userAgent
-        )
-    }
-
     static func makeRelayRequest(relayEndpoint: RelayEndpoint, response: LANPairResponse, userAgent: String) throws -> URLRequest {
         var request = URLRequest(url: try controlURL(relayEndpoint, path: "enroll/device"))
         request.httpMethod = "POST"

@@ -93,14 +93,6 @@ public struct DeviceTokenRefresher: Sendable {
         }
     }
 
-    static func makeRefreshRequest(relayEndpoint: URL, deviceToken: String, userAgent: String) throws -> URLRequest {
-        try makeRefreshRequest(
-            relayEndpoint: RelayEndpoint(relayEndpoint),
-            deviceToken: deviceToken,
-            userAgent: userAgent
-        )
-    }
-
     static func makeRefreshRequest(relayEndpoint: RelayEndpoint, deviceToken: String, userAgent: String) throws -> URLRequest {
         var request = URLRequest(url: try PairClient.controlURL(relayEndpoint, path: "token/refresh"))
         request.httpMethod = "POST"

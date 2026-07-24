@@ -48,21 +48,6 @@ public enum DialClient {
     }
 
     static func dialPairRelay(
-        endpoint: URL,
-        pairKey: PairWindowRelayKey,
-        clientInfo: SPLClientInfo,
-        timeout: Duration = .seconds(5)
-    ) async throws -> any ByteTransport {
-        let relayEndpoint = try validateRelayEndpoint(endpoint)
-        return try await dialPairRelay(
-            endpoint: relayEndpoint,
-            pairKey: pairKey,
-            clientInfo: clientInfo,
-            timeout: timeout
-        )
-    }
-
-    static func dialPairRelay(
         endpoint: RelayEndpoint,
         pairKey: PairWindowRelayKey,
         clientInfo: SPLClientInfo,
