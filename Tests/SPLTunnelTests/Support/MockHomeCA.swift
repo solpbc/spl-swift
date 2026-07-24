@@ -58,8 +58,7 @@ enum MockHomeCA {
     static func signCSR(
         csrPEM: String,
         caKey: P256.Signing.PrivateKey,
-        caCertPEM: String,
-        validityDays _: Int = 1
+        caCertPEM: String
     ) throws -> String {
         let request = try parseAndVerifyCSR(csrPEM)
         let issuer = try issuerCommonName(caCertPEM: caCertPEM)
