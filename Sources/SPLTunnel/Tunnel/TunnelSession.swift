@@ -45,6 +45,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private var keepaliveWatchTask: Task<Void, Never>?
     private var innerTLS: (any TunnelTLSIO)?
     private var multiplexer: Multiplexer?
+    private var isTerminated = false
 
     public init(
         pairing: StoredPairing,
@@ -84,12 +85,15 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         guard !endpoints.isEmpty else {
             throw SessionError.unreachable
         }
+        guard !isTerminated else {
+            throw SessionError.notConnected
+        }
         guard case .disconnected = state else {
             // Single-shot: the owner creates a fresh session for every generation.
             if case .connected(let via) = state {
                 return via
             }
-            throw SessionError.unreachable
+            throw SessionError.notConnected
         }
 
         let connected = try await connectOnce(endpoints: endpoints)
@@ -99,6 +103,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     }
 
     public func disconnect() async {
+        isTerminated = true
         await tearDownCurrent(reason: .normalShutdown)
         setConnectionMode(nil)
         publish(.disconnected)
@@ -128,7 +133,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     }
 
     private func connectOnce(endpoints: [TransportEndpoint]) async throws -> ConnectedAttempt {
-        publish(.connecting(candidates: endpoints))
+        publish(.connecting(candidates: endpoints.map(\.connectedVia)))
 
         do {
             let coordinator = RaceCoordinator<ConnectedAttempt>(
@@ -266,10 +271,12 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         keepaliveWatchTask = nil
         inboundPumpTask?.cancel()
         inboundPumpTask = nil
-        await multiplexer?.tearDown(reason: reason)
+        let activeMultiplexer = multiplexer
+        let activeTLS = innerTLS
         multiplexer = nil
-        await innerTLS?.close()
         innerTLS = nil
+        await activeMultiplexer?.tearDown(reason: reason)
+        await activeTLS?.close()
         setConnectionMode(nil)
     }
 
@@ -283,6 +290,9 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     }
 
     private func publish(_ newState: TunnelState) {
+        if case .failed = newState {
+            isTerminated = true
+        }
         state = newState
         stateContinuation.yield(newState)
         sessionLog.notice("state=\(Self.describe(newState), privacy: .public)")
@@ -372,8 +382,8 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         }
     }
 
-    private static func describe(_ endpoints: [TransportEndpoint]) -> String {
-        endpoints.map(\.logDescription).joined(separator: ", ")
+    private static func describe(_ candidates: [ConnectedVia]) -> String {
+        candidates.map { describe($0) }.joined(separator: ", ")
     }
 
     private static func describe(_ via: ConnectedVia) -> String {
@@ -442,28 +452,20 @@ private actor RelayTransportLease {
 
 private func withSessionTimeout<T: Sendable>(
     _ timeout: Duration,
-    onTimeout: @escaping @Sendable () async -> Void = {},
     operation: @escaping @Sendable () async throws -> T
 ) async throws -> T {
-    try await withTaskCancellationHandler {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask {
-                try await operation()
-            }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                await onTimeout()
-                throw SessionError.unreachable
-            }
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask {
+            try await operation()
+        }
+        group.addTask {
+            try await Task.sleep(for: timeout)
+            throw SessionError.unreachable
+        }
 
-            let value = try await group.next()!
-            group.cancelAll()
-            return value
-        }
-    } onCancel: {
-        Task {
-            await onTimeout()
-        }
+        let value = try await group.next()!
+        group.cancelAll()
+        return value
     }
 }
 

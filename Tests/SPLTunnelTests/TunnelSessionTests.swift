@@ -82,6 +82,21 @@ struct TunnelSessionTests {
         await server.stop()
     }
 
+    @Test func connectAfterDisconnectThrowsNotConnected() async throws {
+        // Single-shot invariant: disconnect terminates the session and forbids a second generation.
+        let endpoint = relayEndpoint()
+        let tls = FakeTunnelTLS()
+        let connector = ConnectorProbe { _, _, _ in tls }
+        let session = TunnelSession(pairing: fakePairing(), tlsConnector: connector.connector)
+
+        _ = try await session.connect(endpoints: [endpoint])
+        await session.disconnect()
+        await expectSessionError(.notConnected) {
+            try await session.connect(endpoints: [endpoint])
+        }
+        #expect(await connector.invocationCount == 1)
+    }
+
     @Test func directKeepaliveDropControlPublishesDirectKeepaliveMissed() async throws {
         // S8 pins framing.md:163-169 direct-mode keepalive failure classification.
         let fixture = try TestCA.make()
@@ -188,6 +203,39 @@ struct TunnelSessionTests {
         #expect(await waitForState(.awaitingBroker(via: endpoint.connectedVia), in: states))
         await release.signal()
         #expect(try await task.value == endpoint.connectedVia)
+        #expect(await connector.invocationCount == 1)
+        await session.disconnect()
+        await states.stop()
+    }
+
+    @Test func connectingStateCarriesNoRelaySecrets() async throws {
+        // Secret-free state invariant: public TunnelState payloads must not carry relay token or instanceID.
+        let endpointURL = try #require(URL(string: "wss://relay.example/session"))
+        let endpoint = TransportEndpoint.relay(
+            endpoint: endpointURL,
+            instanceID: "secret-instance",
+            deviceToken: "secret-token"
+        )
+        let release = TestSignal()
+        let connector = ConnectorProbe { _, _, _ in
+            await release.wait()
+            return FakeTunnelTLS()
+        }
+        let session = TunnelSession(pairing: fakePairing(), tlsConnector: connector.connector)
+        let states = await stateProbe(for: session)
+        let task = Task {
+            try await session.connect(endpoints: [endpoint])
+        }
+
+        #expect(await waitUntil("secret-free connecting state") {
+            await states.connectingCandidates() == [.relay(endpoint: endpointURL)]
+        })
+        let candidates = await states.connectingCandidates()
+        #expect(candidates == [.relay(endpoint: endpointURL)])
+        #expect(String(describing: candidates).contains("secret-token") == false)
+        #expect(String(describing: candidates).contains("secret-instance") == false)
+        await release.signal()
+        #expect(try await task.value == .relay(endpoint: endpointURL))
         #expect(await connector.invocationCount == 1)
         await session.disconnect()
         await states.stop()
@@ -410,6 +458,15 @@ private actor StateProbe {
 
     func contains(_ expected: TunnelState) -> Bool {
         states.contains(expected)
+    }
+
+    func connectingCandidates() -> [ConnectedVia]? {
+        states.compactMap { state in
+            if case .connecting(let candidates) = state {
+                return candidates
+            }
+            return nil
+        }.first
     }
 
     func containsFailure(_ matches: @Sendable (SessionError) -> Bool) -> Bool {

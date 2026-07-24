@@ -13,7 +13,7 @@ This repo is the SPL (solstone private link) client library for Apple platforms 
 
 ## Conventions
 
-- Layout: `Sources/SPLTunnel/{Framing,Mux,Dial,TLS,Tunnel,Loopback,Pair,Crypto,Keychain,Policy,Support}`, tests mirror it under `Tests/SPLTunnelTests/`.
+- Layout: `Sources/SPLTunnel/{Framing,Mux,Dial,TLS,Tunnel,Loopback,Pair,Crypto,Keychain,Support}`, tests mirror it under `Tests/SPLTunnelTests/`.
 - Build/test: `make install`, `make test`, `make ci` (hygiene gates + macOS + iOS Simulator destinations). All must be green before any commit.
 - Tests use Swift Testing. Timing-sensitive suites run serialized; assert on completion signals, not wall-clock sleeps. A behavior fix lands with a test that fails on the pre-fix code where a compiling red is possible.
 - Every Swift source file carries the SPDX header (`AGPL-3.0-only`).

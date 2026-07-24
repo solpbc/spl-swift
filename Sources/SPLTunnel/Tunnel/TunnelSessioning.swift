@@ -21,7 +21,7 @@ public enum ConnectionMode: Sendable, Equatable {
 
 public enum TunnelState: Sendable, Equatable {
     case disconnected
-    case connecting(candidates: [TransportEndpoint])
+    case connecting(candidates: [ConnectedVia])
     case tlsHandshaking(via: ConnectedVia)
     case awaitingBroker(via: ConnectedVia)
     case connected(via: ConnectedVia)
