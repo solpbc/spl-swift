@@ -24,7 +24,7 @@ struct ReconnectBackoffPublicAPITests {
         var backoff = ReconnectBackoff(random: { _ in 1.0 })
         let steps = (0..<(defaultTable.count + 1)).map { _ in backoff.nextDelay() }
         #expect(steps.map(\.attempt) == Array(1...(defaultTable.count + 1)))
-        #expect(steps.map(\.delay) == defaultTable + [defaultTable.last!])
+        #expect(steps.map(\.delay) == defaultTable + defaultTable.suffix(1))
 
         backoff.reset()
         let resetStep = backoff.nextDelay()
