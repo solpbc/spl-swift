@@ -174,4 +174,19 @@ public struct StoredPairing: Codable, Sendable, Equatable {
         try container.encode(localEndpoints, forKey: .localEndpoints)
         try container.encode(pairedAt, forKey: .pairedAt)
     }
+
+    public func updatingRelayEnrollment(_ relayEnrollment: RelayEnrollment) -> StoredPairing {
+        StoredPairing(
+            instanceID: instanceID,
+            homeLabel: homeLabel,
+            relayEndpoint: relayEndpoint,
+            fingerprint: fingerprint,
+            clientCertPEM: clientCertPEM,
+            clientKeyPEM: clientKeyPEM,
+            caChainPEM: caChainPEM,
+            relayEnrollment: relayEnrollment,
+            localEndpoints: localEndpoints,
+            pairedAt: pairedAt
+        )
+    }
 }

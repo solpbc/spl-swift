@@ -117,6 +117,37 @@ struct StoredPairingCodableTests {
         #expect(pairing.relayEnrollment == .enrolled(deviceToken: "legacy-token", expiresAt: nil))
     }
 
+    @Test func updatingRelayEnrollmentPreservesAllStoredPairingFields() throws {
+        let original = StoredPairing(
+            instanceID: "instance-1",
+            homeLabel: "home",
+            relayEndpoint: "wss://relay.example.com",
+            fingerprint: "sha256:\(String(repeating: "c", count: 64))",
+            clientCertPEM: "cert",
+            clientKeyPEM: "key",
+            caChainPEM: "ca",
+            relayEnrollment: .unavailable,
+            localEndpoints: [LocalEndpoint(host: "192.168.1.10", port: 7657, scope: "lan")],
+            pairedAt: Date(timeIntervalSince1970: 1_800_000_100)
+        )
+
+        let updated = original.updatingRelayEnrollment(.enrolled(
+            deviceToken: "new-token",
+            expiresAt: "2036-01-01T00:00:00Z"
+        ))
+
+        #expect(updated.instanceID == original.instanceID)
+        #expect(updated.homeLabel == original.homeLabel)
+        #expect(updated.relayEndpoint == original.relayEndpoint)
+        #expect(updated.fingerprint == original.fingerprint)
+        #expect(updated.clientCertPEM == original.clientCertPEM)
+        #expect(updated.clientKeyPEM == original.clientKeyPEM)
+        #expect(updated.caChainPEM == original.caChainPEM)
+        #expect(updated.localEndpoints == original.localEndpoints)
+        #expect(updated.pairedAt == original.pairedAt)
+        #expect(updated.relayEnrollment == .enrolled(deviceToken: "new-token", expiresAt: "2036-01-01T00:00:00Z"))
+    }
+
     private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

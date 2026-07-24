@@ -46,18 +46,15 @@ public enum DialClient {
         }
     }
 
-    public static func dialPairRelay(
+    static func dialPairRelay(
         endpoint: URL,
-        rk: [UInt8],
+        pairKey: PairWindowRelayKey,
         clientInfo: SPLClientInfo,
         timeout: Duration = .seconds(5)
     ) async throws -> any ByteTransport {
-        guard rk.count == 16 else {
-            throw DialError.connectionFailed("invalid pair key")
-        }
         return try await dialRelay(
             endpoint: endpoint,
-            credential: .pair(rk: rk),
+            credential: .pair(pairKey: pairKey),
             path: "session/pair-dial",
             clientInfo: clientInfo,
             timeout: timeout
@@ -302,8 +299,8 @@ actor RelayWSTransport: ByteTransport {
         switch credential {
         case .session(_, let authToken):
             request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-        case .pair(let rk):
-            request.setValue(CertChain.hex(rk), forHTTPHeaderField: "Sec-Pair-Key")
+        case .pair(let pairKey):
+            request.setValue(pairKey.secPairKeyHeaderValue, forHTTPHeaderField: "Sec-Pair-Key")
         }
         return request
     }
@@ -377,7 +374,7 @@ actor RelayWSTransport: ByteTransport {
 
 enum RelayCredential: Sendable, Equatable {
     case session(instanceID: String, authToken: String)
-    case pair(rk: [UInt8])
+    case pair(pairKey: PairWindowRelayKey)
 
     var instanceID: String? {
         switch self {

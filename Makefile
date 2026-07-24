@@ -14,7 +14,7 @@ test:
 	@swift test --no-parallel
 
 test-ios:
-	@xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' \
+	@set -o pipefail; xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' \
 		-quiet 2>&1 | tail -20
 
 ci: hygiene ci-macos ci-ios
@@ -25,7 +25,7 @@ ci-macos:
 	@swift test --no-parallel
 
 ci-ios:
-	@xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' \
+	@set -o pipefail; xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' \
 		-quiet 2>&1 | tail -20
 
 # Hygiene gates: forbidden constructs and internal-infrastructure strings must

@@ -89,7 +89,7 @@ struct DialClientTests {
 
         let transport = try await DialClient.dialPairRelay(
             endpoint: try relayEndpoint(port: port),
-            rk: Array(UInt8(0x00)...UInt8(0x0f)),
+            pairKey: try PairWindowRelayKey(sBytes: [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
             clientInfo: dialClientInfo
         )
         try await transport.send(Data([0x07, 0x08, 0x09]))
@@ -102,7 +102,7 @@ struct DialClientTests {
 
         #expect(echoed == Data([0x07, 0x08, 0x09]))
         #expect(authorization == nil)
-        #expect(pairKey == "000102030405060708090a0b0c0d0e0f")
+        #expect(pairKey == "e34481a4cde647ba9c9fb29a59e18271")
         #expect(userAgent == dialClientInfo.userAgent)
         #expect(transport.transportKind == "relay")
     }
@@ -136,7 +136,7 @@ struct DialClientTests {
         await expectDialError(.pairingWindowClosed) {
             _ = try await DialClient.dialPairRelay(
                 endpoint: try relayEndpoint(port: port),
-                rk: Array(UInt8(0x00)...UInt8(0x0f)),
+                pairKey: try PairWindowRelayKey(sBytes: [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
                 clientInfo: dialClientInfo
             )
         }
