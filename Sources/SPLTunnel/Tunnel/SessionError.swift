@@ -7,4 +7,9 @@ public enum SessionError: Error, Equatable, Sendable {
     case revoked
     case authRefreshRequired
     case notEntitled
+    case notConnected
+    case directKeepaliveMissed
+    case relayKeepaliveMissed
+    case transportFailed(String)
+    case inboundClosed(fault: String?)
 }

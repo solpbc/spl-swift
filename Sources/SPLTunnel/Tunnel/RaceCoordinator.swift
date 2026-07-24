@@ -56,9 +56,9 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
     private let dial: @Sendable (TransportEndpoint, RaceAttemptProgress) async throws -> Value
 
     init(
-        stagger: Duration = .milliseconds(50),
-        loserGrace: Duration = .milliseconds(250),
-        budget: Duration = .seconds(8),
+        stagger: Duration,
+        loserGrace: Duration,
+        budget: Duration,
         close: @escaping @Sendable (Value) async -> Void,
         dial: @escaping @Sendable (TransportEndpoint, RaceAttemptProgress) async throws -> Value
     ) {
@@ -292,7 +292,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
         endpoints.map(\.logDescription).joined(separator: ", ")
     }
 
-    private static func sessionError(from error: any Error) -> SessionError {
+    static func sessionError(from error: any Error) -> SessionError {
         if let sessionError = error as? SessionError {
             return sessionError
         }
@@ -310,7 +310,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
         return .unreachable
     }
 
-    private static func aggregateFailure(
+    static func aggregateFailure(
         sawRevocation: Bool,
         sawNotEntitled: Bool,
         sawAuthRefreshRequired: Bool

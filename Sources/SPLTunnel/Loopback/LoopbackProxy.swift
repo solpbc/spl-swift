@@ -7,12 +7,6 @@ import os
 
 private let logger = SPLLogging.logger(for: .loopback)
 
-public protocol MuxStreamOpening: Sendable {
-    func openStream() async throws -> MuxStream
-}
-
-extension Multiplexer: MuxStreamOpening {}
-
 public enum LoopbackProxyError: Error, Sendable, Equatable {
     case listenerMissingPort
     case listenerFailed(String)

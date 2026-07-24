@@ -76,6 +76,24 @@ struct TransportEndpointTests {
         }
     }
 
+    @Test func connectedViaDropsRelaySecrets() {
+        #expect(
+            TransportEndpoint.lan(
+                host: "192.168.1.10",
+                port: 443,
+                scope: "local",
+                unpinnedInterface: true
+            ).connectedVia == .lanDirect(host: "192.168.1.10", port: 443)
+        )
+        #expect(
+            TransportEndpoint.relay(
+                endpoint: URL(string: "wss://relay.example/session")!,
+                instanceID: "secret-instance",
+                deviceToken: "secret-token"
+            ).connectedVia == .relay(endpoint: URL(string: "wss://relay.example/session")!)
+        )
+    }
+
     private func pairing(
         relayEnrollment: RelayEnrollment,
         localEndpoints: [LocalEndpoint],

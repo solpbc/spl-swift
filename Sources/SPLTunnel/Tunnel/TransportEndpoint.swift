@@ -94,6 +94,15 @@ public enum TransportEndpoint: Sendable, Equatable {
         }
     }
 
+    public var connectedVia: ConnectedVia {
+        switch self {
+        case .lan(let host, let port, _, _):
+            return .lanDirect(host: host, port: port)
+        case .relay(let endpoint, _, _):
+            return .relay(endpoint: endpoint)
+        }
+    }
+
 }
 
 public protocol ByteTransport: Sendable {
