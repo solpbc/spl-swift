@@ -8,7 +8,7 @@ import Testing
 @Suite("InnerTLS acceptor cancellation", .serialized)
 struct InnerTLSAcceptorCancellationTests {
     @Test func acceptorCancelResolvesSuspendedWaiter() async throws {
-        // L4 §6.3 T3 pins acceptor cancellation resolving a suspended waiter.
+        // Acceptor cancellation must resolve a suspended waiter.
         let acceptor = OneShotConnectionAcceptor()
         let started = TestSignal()
         let task = Task {
@@ -34,7 +34,7 @@ struct InnerTLSAcceptorCancellationTests {
     }
 
     @Test func acceptorCompleteAfterCancelCancelsLateConnection() async throws {
-        // L4 §6.3 T3 pins late accepted connections being cancelled after acceptor cancellation.
+        // Late accepted connections must be cancelled after acceptor cancellation.
         let pair = try await makeConnectionPair()
         defer {
             pair.client.cancel()
@@ -59,7 +59,7 @@ struct InnerTLSAcceptorCancellationTests {
     }
 
     @Test func acceptorCancelAfterCompleteCancelsStoredConnection() async throws {
-        // L4 §6.3 T3 pins cancellation of a stored accepted connection.
+        // Cancelling after accept completion must cancel the stored connection.
         let pair = try await makeConnectionPair()
         defer {
             pair.client.cancel()
@@ -84,7 +84,7 @@ struct InnerTLSAcceptorCancellationTests {
     }
 
     @Test func connectionReadyWaiterResolvesWhenConnectionIsCancelled() async throws {
-        // L4 §6.3 T3 pins connection-ready waiter cancellation resolving with InnerTLSError.closed.
+        // Cancelling a connection-ready waiter must resolve with InnerTLSError.closed.
         let port = NWEndpoint.Port(rawValue: 65_000)!
         let connection = NWConnection(host: "198.51.100.1", port: port, using: .tcp)
         let waiter = startAndReturnReadyWaiter(connection)

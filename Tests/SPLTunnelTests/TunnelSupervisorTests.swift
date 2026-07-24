@@ -399,8 +399,8 @@ struct TunnelSupervisorTests {
     }
 
     @Test func disconnectIgnoresLaterChildFailureWithoutRedrive() async throws {
-        // Pins supervisor stale-child handling after deliberate disconnect. The §9.10(b)
-        // mux cancellation falsifier is MuxKeepaliveTests.normalKeepaliveCancellationEmitsNoLost.
+        // Stale child teardown after parent disconnect must not redrive the supervisor.
+        // Mux keepalive cancellation is covered separately.
         let direct = directEndpoint("10.0.0.5")
         let factory = FakeGenerationFactory(scripts: [
             .success(direct),

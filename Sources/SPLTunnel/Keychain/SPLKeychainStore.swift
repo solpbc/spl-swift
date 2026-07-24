@@ -33,7 +33,7 @@ public struct KeychainPolicy: Sendable, Equatable {
         /// The bundle holds a device-specific client cert + private key authenticating THIS
         /// Mac. It must never be backed up or moved by Migration Assistant; ThisDeviceOnly
         /// keeps it off backups and pinned to this device. Re-pairing on a new or restored Mac
-        /// is the intended path — there is no migration (founder-decided 2026-07-02).
+        /// is the intended path; this policy does not migrate pairing material.
         case afterFirstUnlockThisDeviceOnly
 
         var secAttrValue: CFString {

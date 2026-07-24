@@ -7,22 +7,22 @@ import Testing
 @Suite("ErrorMapping")
 struct ErrorMappingTests {
     @Test func relay401And403DialErrorsMapToAuthRefreshRequired() {
-        // S15 pins the single DialError -> SessionError mapping.
+        // Relay authorization failures must map to auth-refresh-required session errors.
         #expect(RaceCoordinator<Int>.sessionError(from: DialError.relayUnauthorized) == .authRefreshRequired)
     }
 
     @Test func relayClose4401MapsToAuthRefreshRequired() {
-        // S15 pins tokens.md:260 4401 close surfacing through DialError.relayCloseUnauthorized.
+        // WebSocket close code 4401 must surface as an auth-refresh-required session error.
         #expect(RaceCoordinator<Int>.sessionError(from: DialError.relayCloseUnauthorized) == .authRefreshRequired)
     }
 
     @Test func relay402MapsToNotEntitled() {
-        // S15 pins the single DialError -> SessionError mapping.
+        // Relay payment-required failures must map to not-entitled session errors.
         #expect(RaceCoordinator<Int>.sessionError(from: DialError.relayNotEntitled) == .notEntitled)
     }
 
     @Test func innerTLSErrorMapsToTLSFailed() throws {
-        // S15 pins the single InnerTLSError -> SessionError mapping.
+        // Inner TLS failures must map to TLS-failed session errors.
         let mapped = RaceCoordinator<Int>.sessionError(from: InnerTLSError.peerNotPinned)
         guard case .tlsFailed(let message) = mapped else {
             Issue.record("Expected tlsFailed, got \(mapped)")
@@ -32,12 +32,12 @@ struct ErrorMappingTests {
     }
 
     @Test func otherDialErrorMapsToUnreachable() {
-        // S15 pins the fallback mapping.
+        // Other dial errors must fall back to unreachable session errors.
         #expect(RaceCoordinator<Int>.sessionError(from: DialError.connectTimeout) == .unreachable)
     }
 
     @Test func aggregateFailurePrecedence() {
-        // S15 pins aggregate precedence revoked > notEntitled > authRefreshRequired > unreachable.
+        // Aggregate failure precedence is revoked, not-entitled, auth-refresh-required, then unreachable.
         #expect(RaceCoordinator<Int>.aggregateFailure(
             sawRevocation: true,
             sawNotEntitled: true,

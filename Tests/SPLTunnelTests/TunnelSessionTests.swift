@@ -19,7 +19,7 @@ private let tunnelClientInfo = SPLClientInfo(userAgent: "spl-swift-tests/1")
 )
 struct TunnelSessionTests {
     @Test func lanHappyPathOpensMuxStreamAndEchoesPayload() async throws {
-        // §9.4 pins LAN single-shot session round trip through real InnerTLS/NWListener traffic.
+        // LAN sessions must round-trip through real InnerTLS and NWListener traffic.
         let fixture = try TestCA.make()
         let server = TLSEchoServer(bundle: fixture, mode: .mux)
         try await server.start()
@@ -40,7 +40,7 @@ struct TunnelSessionTests {
     }
 
     @Test func relayHappyPathOpensMuxStreamAndEchoesPayload() async throws {
-        // §9.4/S2 pins relay single-shot session round trip and presence-hold lifecycle entrypoint.
+        // Relay sessions must round-trip and enter the presence-hold lifecycle when brokered.
         let fixture = try TestCA.make()
         let tlsServer = TLSEchoServer(bundle: fixture, mode: .mux)
         try await tlsServer.start()
@@ -62,7 +62,7 @@ struct TunnelSessionTests {
     }
 
     @Test func disconnectTearsDownAndOpenStreamThrowsNotConnected() async throws {
-        // §9.4 pins disconnect terminal behavior for the single-shot session.
+        // Disconnect must publish terminal state and reject later stream opens.
         let fixture = try TestCA.make()
         let server = TLSEchoServer(bundle: fixture, mode: .mux)
         try await server.start()
@@ -98,7 +98,7 @@ struct TunnelSessionTests {
     }
 
     @Test func directKeepaliveDropControlPublishesDirectKeepaliveMissed() async throws {
-        // S8 pins framing.md:163-169 direct-mode keepalive failure classification.
+        // Direct-mode keepalive loss must surface as a direct keepalive miss.
         let fixture = try TestCA.make()
         let server = TLSEchoServer(bundle: fixture, mode: .muxDropControl)
         try await server.start()
@@ -123,7 +123,7 @@ struct TunnelSessionTests {
     }
 
     @Test func relayKeepaliveDropControlStaysConnectedWhenRunsOnRelayPathFalse() async throws {
-        // X10 pins framing.md:163-169 direct-mode default: relay keepalive is off unless opted in.
+        // Relay keepalive remains off by default unless policy opts in.
         let fixture = try TestCA.make()
         let tlsServer = TLSEchoServer(bundle: fixture, mode: .muxDropControl)
         try await tlsServer.start()
@@ -153,7 +153,7 @@ struct TunnelSessionTests {
     }
 
     @Test func relayKeepaliveDropControlPublishesRelayKeepaliveMissedWhenOptedIn() async throws {
-        // X10 pins the macOS opt-in relay keepalive policy.
+        // Relay keepalive policy opt-in must surface relay keepalive misses.
         let fixture = try TestCA.make()
         let tlsServer = TLSEchoServer(bundle: fixture, mode: .muxDropControl)
         try await tlsServer.start()
@@ -179,7 +179,7 @@ struct TunnelSessionTests {
     }
 
     @Test func relayAwaitingBrokerCanHoldThenConnectAtSessionLayer() async throws {
-        // S2 pins session.md:340,344 presence-hold and client-owned waiting lifecycle.
+        // Presence-hold is client-owned and may wait for the broker before connecting.
         let endpoint = relayEndpoint()
         let tls = FakeTunnelTLS()
         let release = TestSignal()
@@ -242,7 +242,7 @@ struct TunnelSessionTests {
     }
 
     @Test func heldRelayTimeoutFailsWaitingRelayAndClearsRaceWait() async throws {
-        // S2+S12 pins session.md:344 and the RaceCoordinator waiting exemption clearing path.
+        // Held relay timeout must clear the RaceCoordinator waiting exemption.
         let direct = TransportEndpoint.lan(host: "127.0.0.1", port: 1, scope: "local")
         let relay = relayEndpoint()
         let awaiting = TestSignal()
@@ -275,7 +275,7 @@ struct TunnelSessionTests {
     }
 
     @Test func pumpEndPublishesInboundClosedNilAndDoesNotReconnect() async throws {
-        // S3 pins clean EOF terminal publish and no reconnect path.
+        // Clean EOF must publish terminal closure without reconnecting.
         let endpoint = relayEndpoint()
         let tls = FakeTunnelTLS()
         let connector = ConnectorProbe { _, _, _ in tls }
@@ -291,7 +291,7 @@ struct TunnelSessionTests {
     }
 
     @Test func pumpFaultPublishesInboundClosedFaultAndDoesNotReconnect() async throws {
-        // S3 pins decoder/TLS pump fault surfacing as distinguishable non-nil fault.
+        // Decoder and TLS pump faults must surface as distinguishable non-nil faults.
         let endpoint = relayEndpoint()
         let tls = FakeTunnelTLS()
         let connector = ConnectorProbe { _, _, _ in tls }
@@ -312,7 +312,7 @@ struct TunnelSessionTests {
     }
 
     @Test func disconnectBeforePumpEndIgnoresStalePumpEpoch() async throws {
-        // S3 pins pump epoch handling: stale pump completion after disconnect must not publish failure.
+        // Stale pump completion after disconnect must not publish failure.
         let endpoint = relayEndpoint()
         let tls = FakeTunnelTLS()
         let connector = ConnectorProbe { _, _, _ in tls }
@@ -331,7 +331,7 @@ struct TunnelSessionTests {
     }
 
     @Test func openStreamTransportClosedPublishesMuxClosedTearsDownOnceAndServesNoOpen() async throws {
-        // S7 pins dead mux: caller .notConnected, terminal .transportFailed("mux closed"), one teardown, zero opens.
+        // Dead mux handling must coalesce caller failure, terminal state, teardown, and open rejection.
         let endpoint = relayEndpoint()
         let tls = FakeTunnelTLS(sendError: .transportClosed)
         let connector = ConnectorProbe { _, _, _ in tls }

@@ -9,7 +9,7 @@ import Testing
 @Suite("SPLKeychainStore", .serialized)
 struct SPLKeychainStoreTests {
     @Test func policyDerivesMacProductionShapeQuery() throws {
-        // L5 §D2/K3 pins policy-derived DP keychain + access group query shape without production literals.
+        // Production policy must derive the DP keychain and access-group query shape without production literals.
         let policy = KeychainPolicy(
             service: Self.syntheticService(),
             accessGroup: "test.spl.keychain.access-group",
@@ -40,7 +40,7 @@ struct SPLKeychainStoreTests {
     }
 
     @Test func policyDerivesMacAdHocPlainQuery() throws {
-        // L5 §D2/K3 pins ad-hoc/plain keychain query shape.
+        // Ad-hoc policy must derive the plain keychain query shape.
         let policy = KeychainPolicy(
             service: Self.syntheticService(),
             accessGroup: nil,
@@ -60,7 +60,7 @@ struct SPLKeychainStoreTests {
     }
 
     @Test func policyDerivesIOSMigratableQuery() throws {
-        // L5 §D1 pins backup-migratable iOS policy shape.
+        // Backup-migratable policy must derive the iOS keychain query shape.
         let policy = KeychainPolicy(
             service: Self.syntheticService(),
             accessGroup: nil,
@@ -80,7 +80,7 @@ struct SPLKeychainStoreTests {
     }
 
     @Test func updateAttributesContainOnlyValueData() throws {
-        // L5 §D2/K2 pins SecItemUpdate value-only attributes to avoid errSecParam -50.
+        // SecItemUpdate must carry value-only attributes to avoid errSecParam.
         let data = Data([0x04, 0x05])
         let attributes = KeychainPolicy(
             service: Self.syntheticService(),
@@ -95,7 +95,7 @@ struct SPLKeychainStoreTests {
 
     @Test(.enabled(if: PlainKeychainCapability.isAvailable, "\(PlainKeychainCapability.reason)"))
     func saveTwiceOverwritesWithoutDeleteWindow() throws {
-        // L5 §D3/K2 pins add-then-update overwrite semantics.
+        // Saving must preserve add-then-update overwrite semantics.
         let store = Self.store(
             service: Self.syntheticService(),
             accessGroup: nil,
@@ -130,7 +130,7 @@ struct SPLKeychainStoreTests {
 
     @Test(.enabled(if: PlainKeychainCapability.isAvailable, "\(PlainKeychainCapability.reason)"))
     func plainKeychainSaveLoadDeleteRoundTrip() throws {
-        // L5 §D8 pins ungated plain keychain round-trip with synthetic service cleanup.
+        // Plain keychain round-trip must clean up its synthetic service.
         let store = Self.store(
             service: Self.syntheticService(),
             accessGroup: nil,
@@ -155,7 +155,7 @@ struct SPLKeychainStoreTests {
         "\(DataProtectionAccessGroupKeychainCapability.reason)"
     ))
     func dataProtectionAccessGroupSaveLoadDeleteRoundTrip() throws {
-        // L5 §D8/K3 pins DP/access-group round-trip when the host is entitled.
+        // DP access-group round-trip must work when the host has the required access.
         let store = Self.store(
             service: Self.syntheticService(),
             accessGroup: "test.spl.keychain.access-group",

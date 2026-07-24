@@ -45,7 +45,7 @@ struct StoredPairingCodableTests {
     }
 
     @Test func relayEnrollmentRoundTripsExpiresAt() throws {
-        // L5 correction pins non-nil relay enrollment expiry round-trip in the existing L1 suite.
+        // Relay enrollment expiry must round-trip when present.
         let pairing = StoredPairing(
             instanceID: "expires-at",
             homeLabel: "home",
@@ -65,7 +65,7 @@ struct StoredPairingCodableTests {
     }
 
     @Test func currentRelayEnrollmentWithoutExpiresAtDecodesAsNil() throws {
-        // L5 correction pins nil expiry decode for current relay enrollment in the existing L1 suite.
+        // Current relay enrollment may decode with nil expiry.
         let pairing = try Self.decoder.decode(StoredPairing.self, from: Self.payload(extra: [
             "relayEnrollment": [
                 "enrolled": [

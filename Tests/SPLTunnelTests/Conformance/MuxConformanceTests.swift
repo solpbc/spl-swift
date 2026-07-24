@@ -38,6 +38,30 @@ struct MuxConformanceTests {
         }
     }
 
+    @Test func dataCloseResetOnStreamZeroAreTunnelFatal() async throws {
+        // proto/framing.md:105 DATA, CLOSE, and RESET on stream 0 are tunnel-fatal protocol errors.
+        let cases: [(flags: UInt8, payload: Data)] = [
+            (FrameFlags.data.rawValue, Data([0x41])),
+            (FrameFlags.close.rawValue, Data()),
+            (FrameFlags.reset.rawValue, Data([ResetReason.cancel.rawValue])),
+        ]
+
+        for testCase in cases {
+            let recorder = MuxFrameRecorder()
+            let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
+
+            await expectFramingError(.unknownControlFrame) {
+                try await mux.feedInbound(rawMuxFrame(
+                    streamID: 0,
+                    flags: testCase.flags,
+                    payload: testCase.payload
+                ))
+            }
+
+            #expect(await recorder.frames().isEmpty)
+        }
+    }
+
     @Test func malformedStreamZeroControlFrameIsTunnelFatal() async {
         // proto/framing.md:60 permits OPEN|DATA as a stream frame, not as a stream-zero control frame.
         let mux = Multiplexer(sink: { _ in }, role: .dialer)
@@ -76,6 +100,25 @@ struct MuxConformanceTests {
         ))
 
         #expect(await recorder.frames().isEmpty)
+    }
+
+    @Test func strayPongIsSilentlyDropped() async throws {
+        // proto/framing.md:146-159 unsolicited PONG frames are tolerated and silently dropped.
+        let recorder = MuxFrameRecorder()
+        let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
+
+        try await mux.feedInbound(try encodeFrame(buildPong(nonce: Data([1, 2, 3, 4, 5, 6, 7, 8]))))
+        #expect(await recorder.frames().isEmpty)
+
+        _ = try await mux.openStream()
+        let open = try #require(await recorder.frames().last)
+        #expect(open.streamID == 1)
+        #expect(open.flags == FrameFlags.open.rawValue)
+    }
+
+    @Test func initialCreditIsOneMiB() {
+        // proto/framing.md:124 each side starts with 1 MiB of send credit when a stream opens.
+        #expect(MuxConstants.initialCredit == 1 << 20)
     }
 
     @Test func dataQueuedAndUndrainedDoesNotEmitWindowGrant() async throws {

@@ -8,6 +8,7 @@ import Testing
 @Suite("Multiplexer")
 struct MultiplexerTests {
     @Test func outboundIDsAllocateOddMonotonically() async throws {
+        // proto/framing.md:101-106 dialing side uses odd stream ids monotonically.
         let recorder = MuxFrameRecorder()
         let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
 
@@ -19,6 +20,7 @@ struct MultiplexerTests {
     }
 
     @Test func listenerOutboundIDsAllocateEvenMonotonically() async throws {
+        // proto/framing.md:101-106 listening side uses even stream ids monotonically.
         let recorder = MuxFrameRecorder()
         let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .listener)
 
@@ -161,6 +163,7 @@ struct MultiplexerTests {
     }
 
     @Test func inboundCloseAfterLocalCloseRemovesTerminalStream() async throws {
+        // proto/framing.md:75-98 a stream closes after both sides send CLOSE.
         let recorder = MuxFrameRecorder()
         let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
         let stream = try await mux.openStream()
@@ -177,6 +180,7 @@ struct MultiplexerTests {
     }
 
     @Test func inboundCloseOnOpenStreamHalfClosesWithoutRemoving() async throws {
+        // proto/framing.md:75-98 inbound CLOSE moves an open stream to remote-half-closed.
         let recorder = MuxFrameRecorder()
         let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
         let stream = try await mux.openStream()
@@ -302,6 +306,7 @@ struct MultiplexerTests {
     }
 
     @Test func writeChunksLargePayload() async throws {
+        // proto/framing.md:189-197 large writes split into recommended 64 KiB DATA frames.
         let recorder = MuxFrameRecorder()
         let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
         let stream = try await mux.openStream()
@@ -333,6 +338,7 @@ struct MultiplexerTests {
     }
 
     @Test func halfCloseRoundTrip() async throws {
+        // proto/framing.md:75-98 local and remote CLOSE complete the half-close lifecycle.
         let recorder = MuxFrameRecorder()
         let mux = Multiplexer(sink: { bytes in try await recorder.record(bytes) }, role: .dialer)
         let stream = try await mux.openStream()
@@ -1229,6 +1235,7 @@ struct MultiplexerTests {
     }
 
     @Test func cancelledWriteWaitingForCreditThrowsCancellationError() async throws {
+        // proto/framing.md:124-129 zero-credit senders wait for WINDOW credit.
         let recorder = MuxFrameRecorder()
         let stream = MuxStream(id: 1, sink: { bytes in try await recorder.record(bytes) }, onTerminal: { _ in })
         try await stream.write(Data(repeating: 0x41, count: Int(MuxConstants.initialCredit)))
@@ -1260,6 +1267,7 @@ struct MultiplexerTests {
     }
 
     @Test func creditWaiterCancelledBeforeInstallStillResumes() async throws {
+        // proto/framing.md:124-129 zero-credit senders do not emit DATA while waiting.
         let recorder = MuxFrameRecorder()
         let stream = MuxStream(id: 1, sink: { bytes in try await recorder.record(bytes) }, onTerminal: { _ in })
         try await stream.write(Data(repeating: 0x41, count: Int(MuxConstants.initialCredit)))

@@ -140,7 +140,7 @@ struct RaceCoordinatorTests {
     }
 
     @Test func candidatesKeepDirectWhenRelayMetadataIsAbsentBlankOrMalformed() {
-        // L4 §6.3 T11 pins candidates(for:) as non-throwing and direct-preserving when relay metadata is absent or invalid.
+        // candidates(for:) remains non-throwing and direct-preserving when relay metadata is absent or invalid.
         let localEndpoints = [
             LocalEndpoint(host: "192.168.1.10", port: 443, scope: "local"),
             LocalEndpoint(host: "fd12:3456::1", port: 443, scope: "ula"),
@@ -580,7 +580,7 @@ struct RaceCoordinatorTests {
     }
 
     @Test func budgetExpiryClosesCollectedAndLateSuccessesExactlyOnce() async throws {
-        // L4 §6.3 S13 pins exactly-once close/drain on every race exit path.
+        // Race budget expiry must close and drain collected values exactly once.
         let winner = TransportEndpoint.lan(host: "10.0.0.5", port: 443, scope: "local")
         let loser = TransportEndpoint.lan(host: "192.168.1.10", port: 443, scope: "local")
         let log = CloseLog()
@@ -610,7 +610,7 @@ struct RaceCoordinatorTests {
     }
 
     @Test func budgetWithoutWinnerDrainsLateSuccessExactlyOnce() async throws {
-        // L4 §6.3 S13 pins exactly-once close/drain on every race exit path.
+        // Budget exhaustion must drain a late success exactly once.
         let pending = TransportEndpoint.lan(host: "10.0.0.5", port: 443, scope: "local")
         let failing = TransportEndpoint.lan(host: "192.168.1.10", port: 443, scope: "local")
         let log = CloseLog()
@@ -637,7 +637,7 @@ struct RaceCoordinatorTests {
     }
 
     @Test func allFailAggregatesNotEntitledAndClosesNothing() async {
-        // L4 §6.3 S13 pins all-fail aggregation without closing uncollected values.
+        // All-fail aggregation must not close values that were never collected.
         let direct = TransportEndpoint.lan(host: "10.0.0.5", port: 443, scope: "local")
         let relay = TransportEndpoint.relay(
             endpoint: URL(string: "wss://relay.example.com")!,
@@ -664,7 +664,7 @@ struct RaceCoordinatorTests {
     }
 
     @Test func taskCancellationDrainsLateSuccessesExactlyOnce() async throws {
-        // L4 §6.3 S13 pins exactly-once close/drain on every race exit path.
+        // Task cancellation must drain late successes exactly once.
         let firstSuccess = Signal()
         let loserStarted = Signal()
         let winner = TransportEndpoint.lan(host: "10.0.0.5", port: 443, scope: "local")

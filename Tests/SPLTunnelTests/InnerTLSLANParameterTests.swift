@@ -8,7 +8,7 @@ import Testing
 @Suite("InnerTLS LAN parameters")
 struct InnerTLSLANParameterTests {
     @Test func lanParametersPinOnlyRFC1918IPv4LiteralsToNonOtherInterfaces() {
-        // L4 §6.3 T1 pins interface-type prohibition to pinned RFC1918 IPv4 literals only.
+        // Interface-type restrictions apply only to pinned RFC1918 IPv4 literals.
         let pinnedRFC1918 = InnerTLS.lanParametersForTesting(host: "192.168.1.10", unpinnedInterface: false)
         #expect(pinnedRFC1918.prohibitedInterfaceTypes == [.other])
 

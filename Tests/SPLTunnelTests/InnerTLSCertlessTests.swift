@@ -11,6 +11,7 @@ import Testing
 @Suite("InnerTLS certless")
 struct InnerTLSCertlessTests {
     @Test func certlessTrustAcceptsMatchingCAAndRejectsWrongCA() throws {
+        // proto/pairing.md:147-163 everyday tunnel TLS pins the returned CA chain.
         let chain = try CertChain.certificates(fromPEM: CertlessTrustFixtures.chainPEM)
         let wrongChain = try CertChain.certificates(fromPEM: CertlessTrustFixtures.wrongChainPEM)
         #expect(chain.count == 2)
@@ -39,7 +40,7 @@ struct InnerTLSCertlessTests {
     }
 
     @Test func bridgeListenerParametersBindLoopback() throws {
-        // L4 §6.3 T2 pins both relay bridge factories to loopback-only listener parameters.
+        // Relay bridge factories must bind listener parameters to loopback only.
         try Self.expectLoopback(InnerTLS.makeBridgeListenerParameters())
         try Self.expectLoopback(InnerTLS.makeBridgeListenerParameters())
     }

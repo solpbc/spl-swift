@@ -9,6 +9,7 @@ import Security
 enum TestCA {
     struct Bundle: Sendable {
         let caCertificatePEM: String
+        let caPrivateKeyPEM: String
         let serverCertificatePEM: String
         let serverPrivateKeyPEM: String
         let clientCertificatePEM: String
@@ -48,6 +49,7 @@ enum TestCA {
         )
 
         let caPEM = CryptoCSR.pemEncode(caDER, label: "CERTIFICATE")
+        let caKeyPEM = CryptoCSR.pemEncode(CryptoCSR.exportPKCS8(caKey), label: "PRIVATE KEY")
         let serverPEM = CryptoCSR.pemEncode(serverDER, label: "CERTIFICATE")
         let clientPEM = CryptoCSR.pemEncode(clientDER, label: "CERTIFICATE")
         let clientKeyPEM = CryptoCSR.pemEncode(CryptoCSR.exportPKCS8(clientKey), label: "PRIVATE KEY")
@@ -67,6 +69,7 @@ enum TestCA {
 
         return Bundle(
             caCertificatePEM: caPEM,
+            caPrivateKeyPEM: caKeyPEM,
             serverCertificatePEM: serverPEM,
             serverPrivateKeyPEM: CryptoCSR.pemEncode(CryptoCSR.exportPKCS8(serverKey), label: "PRIVATE KEY"),
             clientCertificatePEM: clientPEM,

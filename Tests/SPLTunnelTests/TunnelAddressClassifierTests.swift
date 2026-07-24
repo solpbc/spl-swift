@@ -7,7 +7,8 @@ import Testing
 @Suite("TunnelAddressClassifier")
 struct TunnelAddressClassifierTests {
     @Test func ipv6ULAClassifierParsesLiteralsAndRejectsHostnames() {
-        // L4 §6.3 ULA-classification pins fc00::/7 parsing to IPv6 literals, not string prefixes.
+        // proto/pairing.md:95 pins the IPv6 ULA range definition, not end-to-end scan-time refusal.
+        // ULA classification must parse IPv6 literals, not string prefixes.
         let cases: [(host: String, expected: Bool)] = [
             ("fd12:3456::1", true),
             ("[fd00::1]", true),
@@ -32,6 +33,7 @@ struct TunnelAddressClassifierTests {
     }
 
     @Test func rfc1918ClassifierCoversIPv4LiteralEdgeCasesOnly() {
+        // proto/pairing.md:95 pins the IPv4 private range definitions, not end-to-end scan-time refusal.
         let cases: [(host: String, expected: Bool)] = [
             ("172.15.255.255", false),
             ("172.32.0.1", false),

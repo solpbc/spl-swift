@@ -10,7 +10,7 @@ import Testing
 @Suite("LoopbackProxy", .serialized)
 struct LoopbackProxyTests {
     @Test func listenerReadyWaiterResolvesWhenListenerIsCancelled() async throws {
-        // L5 §D6/T7 pins listener cancellation resolving suspended start waiter.
+        // Listener cancellation must resolve a suspended start waiter.
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
         let listener = try NWListener(using: parameters)
@@ -107,7 +107,7 @@ struct LoopbackProxyTests {
     }
 
     @Test func receiveCancelCancelsConnectionAndResolves() async throws {
-        // L5 §D6/T7 pins receive cancellation closing NWConnection.
+        // Receive cancellation must close the NWConnection.
         let pair = try await makeConnectionPair()
         defer {
             pair.client.cancel()
@@ -153,7 +153,7 @@ struct LoopbackProxyTests {
     }
 
     @Test func sendCancelResolvesPendingSend() async throws {
-        // L5 §D6/T7 pins send cancellation closing NWConnection.
+        // Send cancellation must close the NWConnection.
         let pair = try await makeConnectionPair()
         defer {
             pair.client.cancel()
@@ -201,7 +201,7 @@ struct LoopbackProxyTests {
     }
 
     @Test func bidirectionalRoundTripThroughInMemoryOpener() async throws {
-        // L5 §D10 pins loopback proxy bidirectional TCP↔MuxStream pumping.
+        // Loopback proxy must pump bidirectionally between TCP and MuxStream.
         let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
         let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
         let opener = InMemoryLoopbackOpener(response: response)
@@ -244,7 +244,7 @@ struct LoopbackProxyTests {
     }
 
     @Test func shortLivedConnectionChurnDoesNotRetainCompletedTasks() async throws {
-        // L5 final pins actor-owned task bookkeeping staying bounded under short-lived connection churn.
+        // Actor-owned task bookkeeping must stay bounded under short-lived connection churn.
         let churnCount = 200
         let opener = FailingLoopbackOpener()
 

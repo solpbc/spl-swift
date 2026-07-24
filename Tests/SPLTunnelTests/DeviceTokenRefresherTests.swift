@@ -10,6 +10,7 @@ private let deviceTokenRelayHost = "refresh-relay.test"
 
 @Suite("DeviceTokenRefresher", .serialized)
 struct DeviceTokenRefresherTests {
+    // proto/tokens.md:214-228 refresh verdicts distinguish definitive auth failures from transient failures.
     @Test func refresh401ExpiredIsDefinitiveAuthFailure() async {
         await expectRefreshResult(
             .http(status: 401, data: Data(#"{"reason":"expired"}"#.utf8)),

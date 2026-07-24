@@ -43,7 +43,7 @@ struct TransportEndpointTests {
     }
 
     @Test func candidatesKeepDirectWhenRelayMetadataIsAbsentBlankOrMalformed() {
-        // L4 §6.3 T11 pins candidates(for:) as non-throwing and direct-preserving when relay metadata is absent or invalid.
+        // candidates(for:) remains non-throwing and direct-preserving when relay metadata is absent or invalid.
         let localEndpoints = [
             LocalEndpoint(host: "192.168.1.10", port: 443, scope: "local"),
             LocalEndpoint(host: "fd12:3456::1", port: 443, scope: "ula"),

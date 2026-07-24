@@ -29,7 +29,7 @@ struct PairingHTTPServerResponse: Sendable, Equatable {
 
 actor PairingMuxServer {
     private let bundle: TestCA.Bundle
-    private let response: PairingHTTPServerResponse
+    private let responseProvider: @Sendable (PairingHTTPServerRequest) async -> PairingHTTPServerResponse
     private let onRequest: @Sendable (PairingHTTPServerRequest) async -> Void
     private var listener: NWListener?
     private var connections: [NWConnection] = []
@@ -43,8 +43,29 @@ actor PairingMuxServer {
         response: PairingHTTPServerResponse,
         onRequest: @escaping @Sendable (PairingHTTPServerRequest) async -> Void = { _ in }
     ) {
+        self.init(bundle: bundle, onRequest: onRequest) { _ in
+            response
+        }
+    }
+
+    init(
+        bundle: TestCA.Bundle,
+        directPair configuration: PairingDirectPairConfiguration,
+        onRequest: @escaping @Sendable (PairingHTTPServerRequest) async -> Void = { _ in }
+    ) {
+        let responder = PairingDirectPairResponder(bundle: bundle, configuration: configuration)
+        self.init(bundle: bundle, onRequest: onRequest) { request in
+            await responder.response(for: request)
+        }
+    }
+
+    init(
+        bundle: TestCA.Bundle,
+        onRequest: @escaping @Sendable (PairingHTTPServerRequest) async -> Void = { _ in },
+        responseProvider: @escaping @Sendable (PairingHTTPServerRequest) async -> PairingHTTPServerResponse
+    ) {
         self.bundle = bundle
-        self.response = response
+        self.responseProvider = responseProvider
         self.onRequest = onRequest
     }
 
@@ -103,6 +124,7 @@ actor PairingMuxServer {
             lastRequest = request
             requestCount += 1
             await onRequest(request)
+            let response = await responseProvider(request)
             try await stream.write(Self.encode(response))
             try await stream.close()
         } catch {
@@ -240,6 +262,149 @@ actor PairingMuxServer {
         var data = Data(lines.joined(separator: "\r\n").utf8)
         data.append(response.body)
         return data
+    }
+}
+
+struct PairingDirectPairConfiguration: Sendable {
+    let outstandingTokens: Set<String>
+    let instanceID: String
+    let homeLabel: String
+    let homeAttestation: String
+    let localEndpoints: [LocalEndpoint]
+    let authorizedClients: MockAuthorizedClients
+
+    init(
+        token: String,
+        instanceID: String,
+        homeLabel: String,
+        homeAttestation: String,
+        localEndpoints: [LocalEndpoint],
+        authorizedClients: MockAuthorizedClients
+    ) {
+        self.outstandingTokens = [token]
+        self.instanceID = instanceID
+        self.homeLabel = homeLabel
+        self.homeAttestation = homeAttestation
+        self.localEndpoints = localEndpoints
+        self.authorizedClients = authorizedClients
+    }
+
+    init(
+        outstandingTokens: Set<String>,
+        instanceID: String,
+        homeLabel: String,
+        homeAttestation: String,
+        localEndpoints: [LocalEndpoint],
+        authorizedClients: MockAuthorizedClients
+    ) {
+        self.outstandingTokens = outstandingTokens
+        self.instanceID = instanceID
+        self.homeLabel = homeLabel
+        self.homeAttestation = homeAttestation
+        self.localEndpoints = localEndpoints
+        self.authorizedClients = authorizedClients
+    }
+}
+
+private actor PairingDirectPairResponder {
+    private var outstandingTokens: Set<String>
+    private let bundle: TestCA.Bundle
+    private let instanceID: String
+    private let homeLabel: String
+    private let homeAttestation: String
+    private let localEndpoints: [LocalEndpoint]
+    private let authorizedClients: MockAuthorizedClients
+
+    init(bundle: TestCA.Bundle, configuration: PairingDirectPairConfiguration) {
+        self.bundle = bundle
+        self.outstandingTokens = configuration.outstandingTokens
+        self.instanceID = configuration.instanceID
+        self.homeLabel = configuration.homeLabel
+        self.homeAttestation = configuration.homeAttestation
+        self.localEndpoints = configuration.localEndpoints
+        self.authorizedClients = configuration.authorizedClients
+    }
+
+    func addToken(_ token: String) {
+        outstandingTokens.insert(token)
+    }
+
+    func response(for request: PairingHTTPServerRequest) -> PairingHTTPServerResponse {
+        guard request.method == "POST" else {
+            return Self.json(status: 404, ["error": "not_found"])
+        }
+        guard let components = URLComponents(string: "http://mock-home\(request.path)"),
+              components.path == "/app/network/pair" else {
+            return Self.json(status: 404, ["error": "not_found"])
+        }
+        guard let token = components.queryItems?.first(where: { $0.name == "token" })?.value,
+              outstandingTokens.remove(token) != nil else {
+            return Self.json(status: 410, ["error": "nonce_expired"])
+        }
+        guard let pairRequest = try? JSONDecoder().decode(DirectPairRequest.self, from: request.body),
+              !pairRequest.csr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !pairRequest.deviceLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return Self.json(status: 400, ["error": "bad_request"])
+        }
+
+        do {
+            let caKey = try CryptoCSR.pkcs8PEMToPrivateKey(bundle.caPrivateKeyPEM)
+            let clientCert = try MockHomeCA.signCSR(
+                csrPEM: pairRequest.csr,
+                caKey: caKey,
+                caCertPEM: bundle.caCertificatePEM
+            )
+            guard let leaf = try CertChain.certificates(fromPEM: clientCert).first else {
+                return Self.json(status: 500, ["error": "cert_sign_failed"])
+            }
+            authorizedClients.insert(CertChain.sha256Fingerprint(of: leaf))
+            let response = DirectPairResponse(
+                instanceID: instanceID,
+                homeLabel: homeLabel,
+                clientCert: clientCert,
+                caChain: [bundle.caCertificatePEM],
+                homeAttestation: homeAttestation,
+                localEndpoints: localEndpoints
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return PairingHTTPServerResponse(status: 200, body: try encoder.encode(response))
+        } catch {
+            return Self.json(status: 400, ["error": "bad_request"])
+        }
+    }
+
+    private static func json(status: Int, _ object: [String: String]) -> PairingHTTPServerResponse {
+        let body = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
+        return PairingHTTPServerResponse(status: status, body: body)
+    }
+}
+
+private struct DirectPairRequest: Decodable {
+    let csr: String
+    let deviceLabel: String
+
+    enum CodingKeys: String, CodingKey {
+        case csr
+        case deviceLabel = "device_label"
+    }
+}
+
+private struct DirectPairResponse: Encodable {
+    let instanceID: String
+    let homeLabel: String
+    let clientCert: String
+    let caChain: [String]
+    let homeAttestation: String
+    let localEndpoints: [LocalEndpoint]
+
+    enum CodingKeys: String, CodingKey {
+        case instanceID = "instance_id"
+        case homeLabel = "home_label"
+        case clientCert = "client_cert"
+        case caChain = "ca_chain"
+        case homeAttestation = "home_attestation"
+        case localEndpoints = "local_endpoints"
     }
 }
 

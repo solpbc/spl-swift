@@ -24,7 +24,7 @@ struct CryptoCSRTests {
     }
 
     @Test func csrSubjectCNMatchesDeviceLabel() throws {
-        let csr = try buildTestCSR(label: "Jer's mac")
+        let csr = try buildTestCSR(label: "Test Device")
         let certInfo = try certificateInfo(from: csr)
         let subject = try ASN1.children(of: certInfo)[1]
         let rdn = try #require(try ASN1.children(of: subject).first)
@@ -32,7 +32,7 @@ struct CryptoCSRTests {
         let attrChildren = try ASN1.children(of: attr)
 
         #expect(attrChildren[0].full == DER.objectIdentifier([2, 5, 4, 3]))
-        #expect(String(decoding: attrChildren[1].value, as: UTF8.self) == "Jer's mac")
+        #expect(String(decoding: attrChildren[1].value, as: UTF8.self) == "Test Device")
     }
 
     @Test func csrContainsExpectedP256SPKI() throws {
@@ -51,6 +51,7 @@ struct CryptoCSRTests {
     }
 
     @Test func csrSignatureVerifies() throws {
+        // proto/pairing.md:98-117 mobile generates a signed CSR carrying the device label.
         let privateKey = P256.Signing.PrivateKey()
         let csr = try CryptoCSR.buildCSR(commonName: "test mac", privateKey: privateKey)
         let outer = try ASN1.children(of: ASN1.readSingle(csr))
@@ -73,6 +74,7 @@ struct CryptoCSRTests {
     }
 
     @Test func pkcs8RoundTripsPrivateScalar() throws {
+        // proto/pairing.md:98-104 the private key stays on-device while the CSR carries its public key.
         let privateKey = P256.Signing.PrivateKey()
         let pem = CryptoCSR.pemEncode(CryptoCSR.exportPKCS8(privateKey), label: "PRIVATE KEY")
         let parsed = try CryptoCSR.pkcs8PEMToPrivateKey(pem)

@@ -80,6 +80,7 @@ struct InnerTLSTests {
     }
 
     @Test func relayOneKiBPlaintextBytesRoundTripViaWSToTLSBridgeByteEqual() async throws {
+        // proto/session.md:71-73,113 the dial WebSocket becomes the inner TLS tunnel.
         let fixture = try TestCA.make()
         let tlsServer = TLSEchoServer(bundle: fixture)
         try await tlsServer.start()
@@ -108,7 +109,7 @@ struct InnerTLSTests {
     }
 
     @Test func pairingTLSConnectionReturnsAnchorSPKIAndRejectsMissingAnchor() async throws {
-        // L4 §6.3 T4 pins returned pairing TLS anchor SPKI and missing-anchor peerNotPinned surfacing.
+        // Pairing TLS must return the anchor SPKI and surface missing anchors as peerNotPinned.
         let fixture = try TestCA.make()
         let caCertificate = try #require(try CertChain.certificates(fromPEM: fixture.caCertificatePEM).first)
         let caSPKI = try CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: caCertificate)

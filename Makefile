@@ -43,6 +43,20 @@ hygiene:
 		if [ "$$platform_count" -gt 2 ]; then echo "hygiene: #if os/!os platform conditional budget exceeded ($$platform_count > 2)"; exit 1; fi
 	@! grep -rniE 'hopper|extro|pro5e|fedora\.local|suze\.local' Sources/ Tests/ README.md AGENTS.md \
 		|| { echo 'hygiene: internal-infrastructure reference found'; exit 1; }
+	@! grep -rniE 'spl-relay-staging\.jer-3f2\.workers\.dev' Sources/ Tests/ README.md AGENTS.md \
+		|| { echo 'hygiene: staging relay hostname found'; exit 1; }
+	@! grep -rnE '(^|[^_[:alnum:]])(Sparkle|TestFlight|TF[0-9]+)([^_[:alnum:]]|$$)' Sources/ Tests/ README.md AGENTS.md \
+		|| { echo 'hygiene: app-distribution narrative found'; exit 1; }
+	@! grep -rnE '(^|[^._[:alnum:]-])([[:alnum:]._/-]+\.entitlements|com\.apple\.[[:alnum:]._/-]+)([^._[:alnum:]-]|$$)' Sources/ Tests/ README.md AGENTS.md \
+		|| { echo 'hygiene: Apple code-signing entitlement reference found'; exit 1; }
+	@! grep -rnE '[Ff]ounder[- ]decided[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}' Sources/ Tests/ README.md AGENTS.md \
+		|| { echo 'hygiene: founder-decision datestamp found'; exit 1; }
+	@! grep -rniE '^[[:space:]]*//.*(^|[^_[:alnum:]])(lode|lodes|arc|arcs|request[-_ ]?id)([^_[:alnum:]]|$$)' Sources/ Tests/ README.md AGENTS.md \
+		|| { echo 'hygiene: internal lode/arc/request-id comment found'; exit 1; }
+	@! grep -rnE "(^|[^_[:alnum:]])(Jer['’]s|Jeremy|Jared)([^_[:alnum:]]|$$)" Sources/ Tests/ README.md AGENTS.md \
+		|| { echo 'hygiene: person-name literal found'; exit 1; }
+	@! grep -rniE '(^|[^_[:alnum:]])solstone-macos-internal([^_[:alnum:]]|$$)' Sources/ Tests/ README.md AGENTS.md \
+		|| { echo 'hygiene: internal macOS repo reference found'; exit 1; }
 	@missing=$$(find Sources -name '*.swift' -exec grep -L 'SPDX-License-Identifier: AGPL-3.0-only' {} +); \
 		if [ -n "$$missing" ]; then echo "hygiene: missing SPDX header: $$missing"; exit 1; fi
 	@test ! -d .github/workflows \

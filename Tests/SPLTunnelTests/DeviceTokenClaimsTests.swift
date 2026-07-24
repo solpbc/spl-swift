@@ -8,6 +8,7 @@ import SPLTunnel
 @Suite("DeviceTokenClaims")
 struct DeviceTokenClaimsTests {
     @Test func parseValidToken() throws {
+        // proto/tokens.md:78-89 device-token claims include iat and exp seconds.
         let token = Self.token(payload: ["iat": 1_000.0, "exp": 2_000.0])
 
         let claims = try #require(DeviceTokenClaims.parse(token))
@@ -17,6 +18,7 @@ struct DeviceTokenClaimsTests {
     }
 
     @Test func needsRefreshForMalformedShortMissingClaimsAndBadTTL() {
+        // proto/tokens.md:78-99 malformed or incomplete token timing claims force refresh.
         #expect(DeviceTokenClaims.needsRefresh(token: nil, now: Date(timeIntervalSince1970: 1_500)))
         #expect(DeviceTokenClaims.needsRefresh(token: "not-a-jwt", now: Date(timeIntervalSince1970: 1_500)))
         #expect(DeviceTokenClaims.needsRefresh(token: Self.token(payload: ["iat": 1_000.0]), now: Date(timeIntervalSince1970: 1_500)))

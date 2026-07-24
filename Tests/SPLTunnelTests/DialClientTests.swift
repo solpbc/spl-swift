@@ -38,6 +38,7 @@ struct DialClientTests {
     }
 
     @Test func relayConnectTimeoutCancelsPendingOpen() async throws {
+        // proto/session.md:338-344 waiting-phase timeout is client-owned and cancelable.
         let server = TCPHangingServer()
         try await server.start()
         let port = await server.port
@@ -83,6 +84,7 @@ struct DialClientTests {
     }
 
     @Test func pairRelayConnectsWithPairDialPathAndPairKeyHeader() async throws {
+        // proto/session.md:89-113 and proto/pair-window.md:70-81 pair-dial uses Sec-Pair-Key with no instance query.
         let server = WebSocketEchoServer()
         try await server.start()
         let port = await server.port
@@ -108,6 +110,7 @@ struct DialClientTests {
     }
 
     @Test func webSocketURLBuildsSessionAndPairDialPaths() throws {
+        // proto/session.md:60-73,89-113 data dial carries instance while pair-dial does not.
         let relayURL = try RelayWSTransport.webSocketURL(
             endpoint: URL(string: "https://link.solstone.app")!,
             path: "session/dial",
@@ -225,6 +228,7 @@ struct DialClientTests {
     }
 
     @Test func relayDialRequestUsesBearerInstanceAndUserAgent() throws {
+        // proto/session.md:60-73 data dial uses /session/dial?instance= with bearer auth.
         let request = try RelayWSTransport.makeRequest(
             endpoint: URL(string: "https://link.solstone.app")!,
             path: "session/dial",

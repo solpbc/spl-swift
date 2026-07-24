@@ -181,6 +181,7 @@ struct PairClientDirectTests {
     }
 
     @Test func enrollmentFailureReturnsUnavailableOnValidPairing() async throws {
+        // proto/pairing.md:147-179 cert storage precedes relay enrollment, so enrollment failure preserves LAN pairing.
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let fixture = try TestCA.make()
         let responseBody = try Self.pairResponseData(bundle: fixture)
