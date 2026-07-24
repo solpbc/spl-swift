@@ -39,8 +39,8 @@ hygiene:
 		|| { echo 'hygiene: print() is forbidden in package sources (use os.Logger via SPLLogging)'; exit 1; }
 	@! grep -rniE 'hopper|extro|pro5e|fedora\.local|suze\.local' Sources/ Tests/ README.md AGENTS.md \
 		|| { echo 'hygiene: internal-infrastructure reference found'; exit 1; }
-	@test "$$(find Sources -name '*.swift' | xargs grep -L 'SPDX-License-Identifier: AGPL-3.0-only' | wc -l)" = "0" \
-		|| { echo 'hygiene: missing SPDX header in Sources'; exit 1; }
+	@missing=$$(find Sources -name '*.swift' -exec grep -L 'SPDX-License-Identifier: AGPL-3.0-only' {} +); \
+		if [ -n "$$missing" ]; then echo "hygiene: missing SPDX header: $$missing"; exit 1; fi
 	@test ! -d .github/workflows \
 		|| { echo 'hygiene: CI workflows are not used in this repo'; exit 1; }
 	@echo "hygiene: clean"
