@@ -44,6 +44,39 @@ struct StoredPairingCodableTests {
         #expect(pairing.relayEnrollment == .enrolled(deviceToken: "current-token", expiresAt: "2036-01-01T00:00:00Z"))
     }
 
+    @Test func relayEnrollmentRoundTripsExpiresAt() throws {
+        // L5 correction pins non-nil relay enrollment expiry round-trip in the existing L1 suite.
+        let pairing = StoredPairing(
+            instanceID: "expires-at",
+            homeLabel: "home",
+            relayEndpoint: "wss://relay.example.com",
+            fingerprint: "sha256:\(String(repeating: "b", count: 64))",
+            clientCertPEM: "cert",
+            clientKeyPEM: "key",
+            caChainPEM: "ca",
+            relayEnrollment: .enrolled(deviceToken: "current-token", expiresAt: "2036-01-01T00:00:00Z"),
+            localEndpoints: [],
+            pairedAt: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+
+        let decoded = try Self.decoder.decode(StoredPairing.self, from: Self.encoder.encode(pairing))
+
+        #expect(decoded.relayEnrollment == .enrolled(deviceToken: "current-token", expiresAt: "2036-01-01T00:00:00Z"))
+    }
+
+    @Test func currentRelayEnrollmentWithoutExpiresAtDecodesAsNil() throws {
+        // L5 correction pins nil expiry decode for current relay enrollment in the existing L1 suite.
+        let pairing = try Self.decoder.decode(StoredPairing.self, from: Self.payload(extra: [
+            "relayEnrollment": [
+                "enrolled": [
+                    "deviceToken": "current-token",
+                ],
+            ],
+        ]))
+
+        #expect(pairing.relayEnrollment == .enrolled(deviceToken: "current-token", expiresAt: nil))
+    }
+
     @Test func localEndpointEncodesCanonicalIPKeyAndDecodesBothWireShapes() throws {
         let endpoint = LocalEndpoint(host: "192.168.1.10", port: 7657, scope: "lan")
         let data = try Self.encoder.encode(endpoint)

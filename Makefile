@@ -37,6 +37,10 @@ hygiene:
 		|| { echo 'hygiene: DispatchQueue.main.async is forbidden'; exit 1; }
 	@! grep -rn --include='*.swift' -E '(^|[^_[:alnum:]])print\(' Sources/ \
 		|| { echo 'hygiene: print() is forbidden in package sources (use os.Logger via SPLLogging)'; exit 1; }
+	@os_count=$$(grep -Ern --include='*.swift' '#if[[:space:]]+os\(' Sources/ | wc -l | tr -d ' '); \
+		if [ "$$os_count" -gt 1 ]; then echo "hygiene: #if os(...) budget exceeded ($$os_count > 1)"; exit 1; fi
+	@platform_count=$$(grep -Ern --include='*.swift' '#if[[:space:]]+!?os\(' Sources/ | wc -l | tr -d ' '); \
+		if [ "$$platform_count" -gt 2 ]; then echo "hygiene: #if os/!os platform conditional budget exceeded ($$platform_count > 2)"; exit 1; fi
 	@! grep -rniE 'hopper|extro|pro5e|fedora\.local|suze\.local' Sources/ Tests/ README.md AGENTS.md \
 		|| { echo 'hygiene: internal-infrastructure reference found'; exit 1; }
 	@missing=$$(find Sources -name '*.swift' -exec grep -L 'SPDX-License-Identifier: AGPL-3.0-only' {} +); \
