@@ -12,6 +12,7 @@ public enum FramingError: Error, Equatable, Sendable {
     case reservedBitsSet
     case noPrimaryFlag
     case invalidFlagCombination
+    case unknownControlFrame
     case lengthMismatch
 }
 
