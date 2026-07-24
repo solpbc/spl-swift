@@ -17,7 +17,7 @@ public struct ProbeWatchdogVerdict: Sendable, Equatable {
     public let action: ProbeAction
     public let nextInterval: Duration
 
-    public init(health: ProbeHealth, action: ProbeAction, nextInterval: Duration) {
+    init(health: ProbeHealth, action: ProbeAction, nextInterval: Duration) {
         self.health = health
         self.action = action
         self.nextInterval = nextInterval

@@ -163,12 +163,12 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
             let result = try await coordinator.connect(endpoints: endpoints, preferredEndpoint: preferredEndpoint)
             return result.value
         } catch let error as SessionError {
-            sessionLog.warning("connect failed error=\(Self.describe(error), privacy: .public)")
+            sessionLog.warning("connect failed error=\(TunnelStateLogDescription.describe(error), privacy: .public)")
             publish(.failed(error))
             throw error
         } catch {
             let sessionError = SessionError.unreachable
-            sessionLog.warning("connect failed error=\(Self.describe(sessionError), privacy: .public)")
+            sessionLog.warning("connect failed error=\(TunnelStateLogDescription.describe(sessionError), privacy: .public)")
             publish(.failed(sessionError))
             throw sessionError
         }
@@ -313,7 +313,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         }
         state = newState
         stateContinuation.yield(newState)
-        sessionLog.notice("state=\(Self.describe(newState), privacy: .public)")
+        sessionLog.notice("state=\(TunnelStateLogDescription.describe(newState), privacy: .public)")
     }
 
     private func publishAwaitingBroker(via: ConnectedVia) {
@@ -383,63 +383,6 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         }
     }
 
-    private static func describe(_ state: TunnelState) -> String {
-        switch state {
-        case .disconnected:
-            return "disconnected"
-        case .connecting(let candidates):
-            return "connecting candidates=\(describe(candidates))"
-        case .tlsHandshaking(let via):
-            return "tls_handshaking via=\(describe(via))"
-        case .awaitingBroker(let via):
-            return "awaiting_broker via=\(describe(via))"
-        case .connected(let via):
-            return "connected via=\(describe(via))"
-        case .failed(let error):
-            return "failed error=\(describe(error))"
-        }
-    }
-
-    private static func describe(_ candidates: [ConnectedVia]) -> String {
-        candidates.map { describe($0) }.joined(separator: ", ")
-    }
-
-    private static func describe(_ via: ConnectedVia) -> String {
-        switch via {
-        case .lanDirect(let host, let port):
-            return "lan \(host):\(port)"
-        case .relay(let endpoint):
-            let scheme = endpoint.scheme ?? "unknown"
-            let host = endpoint.host ?? "unknown"
-            let port = endpoint.port.map(String.init) ?? "default"
-            return "relay \(scheme)://\(host):\(port)"
-        }
-    }
-
-    private static func describe(_ error: SessionError) -> String {
-        switch error {
-        case .unreachable:
-            return "unreachable"
-        case .tlsFailed:
-            return "tlsFailed"
-        case .revoked:
-            return "revoked"
-        case .authRefreshRequired:
-            return "authRefreshRequired"
-        case .notEntitled:
-            return "notEntitled"
-        case .notConnected:
-            return "notConnected"
-        case .directKeepaliveMissed:
-            return "directKeepaliveMissed"
-        case .relayKeepaliveMissed:
-            return "relayKeepaliveMissed"
-        case .transportFailed(let reason):
-            return "transportFailed(\(reason))"
-        case .inboundClosed(let fault):
-            return "inboundClosed(fault=\(fault ?? "nil"))"
-        }
-    }
 }
 
 private struct ConnectedAttempt: Sendable {

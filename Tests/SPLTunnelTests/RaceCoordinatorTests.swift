@@ -31,6 +31,39 @@ struct RaceCoordinatorTests {
         ])
     }
 
+    @Test func preferredEndpointSortsBeforeRankAndPreservesRankForOthers() {
+        let relay = TransportEndpoint.relay(
+            endpoint: URL(string: "wss://relay.example/session")!,
+            instanceID: "instance",
+            deviceToken: "token"
+        )
+        let rankedFirst = TransportEndpoint.lan(host: "10.0.0.8", port: 443, scope: "ranked")
+        let ula = TransportEndpoint.lan(host: "fd12:3456::1", port: 443, scope: "ula")
+        let publicDirect = TransportEndpoint.lan(host: "203.0.113.10", port: 443, scope: "public")
+        let preferred = TransportEndpoint.lan(
+            host: "192.168.1.20",
+            port: 443,
+            scope: "trusted",
+            unpinnedInterface: true
+        )
+        let endpoints = [relay, publicDirect, preferred, rankedFirst, ula]
+
+        #expect(RaceCoordinator<Int>.sorted(endpoints, preferredEndpoint: preferred) == [
+            preferred,
+            rankedFirst,
+            ula,
+            publicDirect,
+            relay,
+        ])
+        #expect(RaceCoordinator<Int>.sorted(endpoints, preferredEndpoint: nil) == [
+            rankedFirst,
+            ula,
+            publicDirect,
+            preferred,
+            relay,
+        ])
+    }
+
     @Test func rfc1918WinsOverULAWithStaggerAndSimilarHandshakeTime() async throws {
         let ula = TransportEndpoint.lan(host: "fd12:3456::1", port: 443, scope: "ula")
         let rfc1918 = TransportEndpoint.lan(host: "192.168.1.10", port: 443, scope: "local")

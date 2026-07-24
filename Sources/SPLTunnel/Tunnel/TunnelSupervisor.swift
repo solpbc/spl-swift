@@ -11,7 +11,7 @@ public struct ReconnectStatus: Sendable, Equatable {
     public let retryAfter: Duration?
     public let terminalPause: Bool
 
-    public init(
+    init(
         reason: SessionError?,
         attempt: Int,
         retryAfter: Duration?,
@@ -57,12 +57,33 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private enum Lifecycle: Sendable, Equatable {
         case idle
         case running
-        case paused(SessionError)
+        case paused
     }
 
     private struct Generation: Sendable {
         let token: UInt64
         let session: any TunnelGeneration
+    }
+
+    private struct Establishment: Sendable {
+        let token: UInt64
+        let task: Task<ConnectedVia, Error>
+    }
+
+    private struct RedriveRequest: Sendable, Equatable {
+        var sourceToken: UInt64?
+        var reason: SessionError?
+        var immediate: Bool
+
+        mutating func merge(reason: SessionError?, immediate: Bool, sourceToken: UInt64?) {
+            if self.reason == nil {
+                self.reason = reason
+            }
+            self.immediate = self.immediate || immediate
+            if let sourceToken {
+                self.sourceToken = sourceToken
+            }
+        }
     }
 
     private let pairing: StoredPairing
@@ -80,14 +101,16 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private let reconnectContinuation: AsyncStream<ReconnectStatus>.Continuation
 
     private var lifecycle: Lifecycle = .idle
-    private var state: TunnelState = .disconnected
     private var generation: Generation?
     private var nextGenerationToken: UInt64 = 0
     private var connectingToken: UInt64?
+    private var establishment: Establishment?
+    private var nextEstablishmentToken: UInt64 = 0
     private var stateTask: Task<Void, Never>?
     private var modeTask: Task<Void, Never>?
     private var redriveTask: Task<Void, Never>?
-    private var pendingRedrive = false
+    private var pendingRedrive: RedriveRequest?
+    private var redriveSourceToken: UInt64?
     private var plannedEndpoints: [TransportEndpoint] = []
     private var currentVia: ConnectedVia?
     private var planner = DialPlanner()
@@ -155,23 +178,28 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             if let currentVia {
                 return currentVia
             }
+            return try await establish(reason: nil, immediate: true)
         case .idle, .paused:
             lifecycle = .running
-            pendingRedrive = false
+            pendingRedrive = nil
+            redriveSourceToken = nil
             redriveTask?.cancel()
             redriveTask = nil
+            cancelEstablishment()
             backoff.reset()
             setReconnectStatus(nil)
         }
 
-        return try await connectUntilEstablished(reason: nil, immediate: true)
+        return try await establish(reason: nil, immediate: true)
     }
 
     public func disconnect() async {
         lifecycle = .idle
-        pendingRedrive = false
+        pendingRedrive = nil
+        redriveSourceToken = nil
         redriveTask?.cancel()
         redriveTask = nil
+        cancelEstablishment()
         connectingToken = nil
         backoff.reset()
         setReconnectStatus(nil)
@@ -186,17 +214,23 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             return
         }
         backoff.reset()
-        requestRedrive(reason: nil, immediate: true)
+        requestRedrive(reason: nil, immediate: true, sourceToken: redriveSourceToken ?? currentGenerationToken())
     }
 
     public func openStream() async throws -> MuxStream {
-        guard let session = generation?.session else {
+        guard let current = generation else {
             throw SessionError.notConnected
         }
         do {
-            return try await session.openStream()
+            return try await current.session.openStream()
         } catch {
-            requestRedrive(reason: .transportFailed("mux closed"), immediate: true)
+            if generation?.token == current.token {
+                requestRedrive(
+                    reason: .transportFailed("mux closed"),
+                    immediate: true,
+                    sourceToken: current.token
+                )
+            }
             throw error
         }
     }
@@ -206,6 +240,45 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             return 0
         }
         return await session.inboundActivitySnapshot()
+    }
+
+    private func establish(reason: SessionError?, immediate: Bool) async throws -> ConnectedVia {
+        let current = ensureEstablishment(reason: reason, immediate: immediate)
+        do {
+            let via = try await current.task.value
+            clearEstablishment(token: current.token)
+            return via
+        } catch {
+            clearEstablishment(token: current.token)
+            throw error
+        }
+    }
+
+    private func ensureEstablishment(reason: SessionError?, immediate: Bool) -> Establishment {
+        if let establishment {
+            return establishment
+        }
+
+        nextEstablishmentToken += 1
+        let token = nextEstablishmentToken
+        let task = Task {
+            try await self.connectUntilEstablished(reason: reason, immediate: immediate)
+        }
+        let establishment = Establishment(token: token, task: task)
+        self.establishment = establishment
+        return establishment
+    }
+
+    private func clearEstablishment(token: UInt64) {
+        guard establishment?.token == token else {
+            return
+        }
+        establishment = nil
+    }
+
+    private func cancelEstablishment() {
+        establishment?.task.cancel()
+        establishment = nil
     }
 
     private func connectUntilEstablished(reason: SessionError?, immediate: Bool) async throws -> ConnectedVia {
@@ -331,7 +404,8 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             guard connectingToken != token else {
                 return
             }
-            requestRedrive(reason: error, immediate: false)
+            publish(.connecting(candidates: plannedEndpoints.map(\.connectedVia)))
+            requestRedrive(reason: error, immediate: false, sourceToken: token)
         }
     }
 
@@ -342,37 +416,56 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         setConnectionMode(mode)
     }
 
-    private func requestRedrive(reason: SessionError?, immediate: Bool) {
+    private func requestRedrive(reason: SessionError?, immediate: Bool, sourceToken: UInt64?) {
         guard lifecycle == .running else {
             return
         }
-        pendingRedrive = true
+        if let redriveSourceToken, redriveSourceToken == sourceToken {
+            return
+        }
+        if var request = pendingRedrive {
+            request.merge(reason: reason, immediate: immediate, sourceToken: sourceToken)
+            pendingRedrive = request
+        } else {
+            pendingRedrive = RedriveRequest(sourceToken: sourceToken, reason: reason, immediate: immediate)
+        }
         guard redriveTask == nil else {
             return
         }
         redriveTask = Task {
-            await self.runRedrive(reason: reason, immediate: immediate)
+            await self.runRedrive()
         }
     }
 
-    private func runRedrive(reason: SessionError?, immediate: Bool) async {
-        pendingRedrive = false
-        do {
-            _ = try await connectUntilEstablished(reason: reason, immediate: immediate)
-        } catch {
-            if !Self.isTerminalPause(error) {
-                supervisorLog.notice("supervisor redrive stopped")
+    private func runRedrive() async {
+        while lifecycle == .running {
+            guard let request = pendingRedrive else {
+                break
             }
+            pendingRedrive = nil
+            redriveSourceToken = request.sourceToken
+            do {
+                _ = try await establish(reason: request.reason, immediate: request.immediate)
+            } catch {
+                if !Self.isTerminalPause(error) {
+                    supervisorLog.notice("supervisor redrive stopped")
+                }
+            }
+            redriveSourceToken = nil
         }
-        pendingRedrive = false
         redriveTask = nil
     }
 
     private func pause(_ error: SessionError) async {
-        lifecycle = .paused(error)
-        pendingRedrive = false
+        guard lifecycle == .running else {
+            return
+        }
+        lifecycle = .paused
+        pendingRedrive = nil
+        redriveSourceToken = nil
         redriveTask?.cancel()
         redriveTask = nil
+        cancelEstablishment()
         connectingToken = nil
         backoff.reset()
         planner.noteTerminalPause()
@@ -389,9 +482,8 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     }
 
     private func publish(_ newState: TunnelState) {
-        state = newState
         stateContinuation.yield(newState)
-        supervisorLog.notice("supervisor state=\(String(describing: newState), privacy: .public)")
+        supervisorLog.notice("supervisor state=\(TunnelStateLogDescription.describe(newState), privacy: .public)")
     }
 
     private func setConnectionMode(_ newMode: ConnectionMode?) {
@@ -404,6 +496,10 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         if let status {
             reconnectContinuation.yield(status)
         }
+    }
+
+    private func currentGenerationToken() -> UInt64? {
+        generation?.token ?? connectingToken
     }
 
     private static func isTerminalPause(_ error: any Error) -> Bool {

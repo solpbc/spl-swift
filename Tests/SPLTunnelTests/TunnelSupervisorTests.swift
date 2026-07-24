@@ -48,7 +48,7 @@ struct TunnelSupervisorTests {
         await server.stop()
     }
 
-    @Test func trustDirectReordersCachedEndpointFirstWithinCurrentPlannedSet() async throws {
+    @Test func trustDirectUsesNormalRaceWithoutExtraCandidates() async throws {
         let trusted = TransportEndpoint.lan(host: "192.168.1.20", port: 443, scope: "trusted", unpinnedInterface: true)
         let rankedFirst = TransportEndpoint.lan(host: "10.0.0.8", port: 443, scope: "ranked")
         let relay = relayEndpoint()
@@ -64,8 +64,9 @@ struct TunnelSupervisorTests {
 
         await connector.waitForInvocationCount(1 + planned.count)
         let attempts = await connector.attemptedEndpoints()
-        #expect(Array(attempts.dropFirst()) == [trusted, rankedFirst, relay])
-        #expect(attempts.count == 1 + planned.count)
+        let redriveAttempts = Array(attempts.dropFirst())
+        #expect(redriveAttempts.count == planned.count)
+        expectSameEndpoints(redriveAttempts, planned)
 
         await supervisor.disconnect()
     }
@@ -86,9 +87,11 @@ struct TunnelSupervisorTests {
 
         await connector.waitForInvocationCount(1 + planned.count)
         let attempts = await connector.attemptedEndpoints()
-        #expect(Array(attempts.dropFirst()) == planned)
+        let redriveAttempts = Array(attempts.dropFirst())
+        #expect(redriveAttempts.count == planned.count)
+        expectSameEndpoints(redriveAttempts, planned)
         #expect(attempts.contains(trusted) == true)
-        #expect(Array(attempts.dropFirst()).contains(trusted) == false)
+        #expect(redriveAttempts.contains(trusted) == false)
         #expect(attempts.count == 1 + planned.count)
 
         await supervisor.disconnect()
@@ -137,6 +140,41 @@ struct TunnelSupervisorTests {
         await supervisor.disconnect()
     }
 
+    @Test func healableFailurePublishesConnectingBeforeRetryDelayElapses() async throws {
+        let direct = directEndpoint("10.0.0.5")
+        let sleeper = SleepProbe()
+        let factory = FakeGenerationFactory(scripts: [
+            .success(direct),
+            .success(direct),
+        ])
+        let supervisor = fakeSupervisor(factory: factory, sleeper: sleeper.sleep)
+        let states = await stateProbe(for: supervisor)
+
+        _ = try await supervisor.connect(endpoints: [direct])
+        let connectingCount = await states.count(.connecting(candidates: [direct.connectedVia]))
+        let first = try await factory.generation(at: 0)
+        await first.fail(.inboundClosed(fault: nil))
+
+        #expect(await waitUntil("healable failure connecting state") {
+            await states.count(.connecting(candidates: [direct.connectedVia])) > connectingCount
+        })
+        try await sleeper.waitForSleepCount(1)
+        #expect(await factory.count() == 1)
+        #expect(await supervisor.reconnectStatus == ReconnectStatus(
+            reason: .inboundClosed(fault: nil),
+            attempt: 1,
+            retryAfter: .milliseconds(1),
+            terminalPause: false
+        ))
+
+        await sleeper.releaseSleeps()
+        #expect(await waitUntil("healable failure retry connects") {
+            await factory.count() == 2
+        })
+        await supervisor.disconnect()
+        await states.stop()
+    }
+
     @Test func deadMuxOpenStreamCoalescesWithGenerationFailureAndThrowsNotConnected() async throws {
         let direct = directEndpoint("10.0.0.5")
         let factory = FakeGenerationFactory(scripts: [
@@ -165,23 +203,33 @@ struct TunnelSupervisorTests {
         ])
         let supervisor = fakeSupervisor(factory: factory)
         let states = await stateProbe(for: supervisor)
+        let reconnects = await reconnectProbe(for: supervisor)
+        let terminalStatus = ReconnectStatus(
+            reason: .authRefreshRequired,
+            attempt: 1,
+            retryAfter: nil,
+            terminalPause: true
+        )
 
         await expectSessionError(.authRefreshRequired) {
             try await supervisor.connect(endpoints: [relay])
         }
         #expect(await waitForFailure(.authRefreshRequired, in: states))
-        #expect(await supervisor.reconnectStatus == ReconnectStatus(
-            reason: .authRefreshRequired,
-            attempt: 1,
-            retryAfter: nil,
-            terminalPause: true
-        ))
+        #expect(await states.count(.failed(.authRefreshRequired)) == 1)
+        #expect(await reconnects.count(terminalStatus) == 1)
+        #expect(await conditionObserved(timeout: .milliseconds(100)) {
+            let failureCount = await states.count(.failed(.authRefreshRequired))
+            let statusCount = await reconnects.count(terminalStatus)
+            return failureCount > 1 || statusCount > 1
+        } == false)
+        #expect(await supervisor.reconnectStatus == terminalStatus)
 
         _ = try await supervisor.connect(endpoints: [relay])
         #expect(await factory.count() == 2)
 
         await supervisor.disconnect()
         await states.stop()
+        await reconnects.stop()
     }
 
     @Test func requestReconnectWhilePausedDoesNotUnpause() async throws {
@@ -247,6 +295,74 @@ struct TunnelSupervisorTests {
         await supervisor.disconnect()
     }
 
+    @Test func replacementGenerationFailureDuringRedriveQueuesOneMoreGeneration() async throws {
+        let direct = directEndpoint("10.0.0.5")
+        let connected = TestSignal()
+        let releaseReturn = TestSignal()
+        let factory = FakeGenerationFactory(scripts: [
+            .success(direct),
+            .success(
+                direct,
+                connectedSignal: connected,
+                returnGate: releaseReturn,
+                openStreamFailure: .transportFailed("mux closed")
+            ),
+            .success(direct),
+        ])
+        let supervisor = fakeSupervisor(factory: factory)
+
+        _ = try await supervisor.connect(endpoints: [direct])
+        await supervisor.requestReconnect()
+        #expect(await waitUntil("replacement generation installed") {
+            await factory.count() == 2
+        })
+        try await connected.waitWithTimeout()
+
+        await expectSessionError(.notConnected) {
+            _ = try await supervisor.openStream()
+        }
+        #expect(await conditionObserved(timeout: .milliseconds(100)) {
+            await factory.count() > 2
+        } == false)
+
+        await releaseReturn.signal()
+        #expect(await waitUntil("queued replacement redrive") {
+            await factory.count() == 3
+        })
+
+        await supervisor.disconnect()
+    }
+
+    @Test func concurrentConnectsShareInFlightEstablishment() async throws {
+        let direct = directEndpoint("10.0.0.5")
+        let release = TestSignal()
+        let factory = FakeGenerationFactory(scripts: Array(
+            repeating: .success(direct, gate: release),
+            count: 5
+        ))
+        let supervisor = fakeSupervisor(factory: factory)
+        let tasks = (0..<5).map { _ in
+            Task {
+                try await supervisor.connect(endpoints: [direct])
+            }
+        }
+
+        #expect(await waitUntil("one shared connect generation") {
+            await factory.count() == 1
+        })
+        #expect(await conditionObserved(timeout: .milliseconds(100)) {
+            await factory.count() > 1
+        } == false)
+
+        await release.signal()
+        for task in tasks {
+            #expect(try await task.value == direct.connectedVia)
+        }
+        #expect(await factory.count() == 1)
+
+        await supervisor.disconnect()
+    }
+
     @Test func convergingDeathSignalsProduceOneReconnect() async throws {
         let direct = directEndpoint("10.0.0.5")
         let release = TestSignal()
@@ -282,7 +398,9 @@ struct TunnelSupervisorTests {
         await supervisor.disconnect()
     }
 
-    @Test func cleanDisconnectDoesNotRedriveAfterKeepaliveCancellation() async throws {
+    @Test func disconnectIgnoresLaterChildFailureWithoutRedrive() async throws {
+        // Pins supervisor stale-child handling after deliberate disconnect. The §9.10(b)
+        // mux cancellation falsifier is MuxKeepaliveTests.normalKeepaliveCancellationEmitsNoLost.
         let direct = directEndpoint("10.0.0.5")
         let factory = FakeGenerationFactory(scripts: [
             .success(direct),
@@ -301,12 +419,15 @@ struct TunnelSupervisorTests {
     }
 }
 
-private func fakeSupervisor(factory: FakeGenerationFactory) -> TunnelSupervisor {
+private func fakeSupervisor(
+    factory: FakeGenerationFactory,
+    sleeper: @escaping @Sendable (Duration) async throws -> Void = { _ in }
+) -> TunnelSupervisor {
     TunnelSupervisor(
         pairing: fakePairing(),
         clientInfo: supervisorClientInfo,
         reconnectBackoff: ReconnectBackoff(schedule: .table([.milliseconds(1)]), random: { _ in 1.0 }),
-        sleeper: { _ in },
+        sleeper: sleeper,
         makeSession: { _, _, _ in
             await factory.makeSession()
         }
@@ -371,18 +492,34 @@ private struct FakeConnectCall: Sendable, Equatable {
 private struct FakeGenerationScript: Sendable {
     let result: Result<TransportEndpoint, SessionError>
     let gate: TestSignal?
+    let connectedSignal: TestSignal?
+    let returnGate: TestSignal?
     let openStreamFailure: SessionError?
 
     static func success(
         _ endpoint: TransportEndpoint,
         gate: TestSignal? = nil,
+        connectedSignal: TestSignal? = nil,
+        returnGate: TestSignal? = nil,
         openStreamFailure: SessionError? = nil
     ) -> FakeGenerationScript {
-        FakeGenerationScript(result: .success(endpoint), gate: gate, openStreamFailure: openStreamFailure)
+        FakeGenerationScript(
+            result: .success(endpoint),
+            gate: gate,
+            connectedSignal: connectedSignal,
+            returnGate: returnGate,
+            openStreamFailure: openStreamFailure
+        )
     }
 
     static func failure(_ error: SessionError) -> FakeGenerationScript {
-        FakeGenerationScript(result: .failure(error), gate: nil, openStreamFailure: nil)
+        FakeGenerationScript(
+            result: .failure(error),
+            gate: nil,
+            connectedSignal: nil,
+            returnGate: nil,
+            openStreamFailure: nil
+        )
     }
 }
 
@@ -456,6 +593,8 @@ private actor FakeGeneration: TunnelGeneration {
             self.endpoint = endpoint
             setConnectionMode(endpoint.isDirect ? .plDirect : .plViaSpl)
             publish(.connected(via: endpoint.connectedVia))
+            await script.connectedSignal?.signal()
+            await script.returnGate?.wait()
             return endpoint.connectedVia
         case .failure(let error):
             publish(.failed(error))
@@ -504,5 +643,84 @@ private actor FakeGeneration: TunnelGeneration {
     private func setConnectionMode(_ mode: ConnectionMode?) {
         connectionMode = mode
         connectionModeContinuation.yield(mode)
+    }
+}
+
+private actor SleepProbe {
+    private var count = 0
+    private var countWaiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private let release = TestSignal()
+
+    func sleep(_: Duration) async throws {
+        count += 1
+        resumeSatisfiedWaiters()
+        await release.wait()
+    }
+
+    func waitForSleepCount(_ target: Int) async throws {
+        if count >= target {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            countWaiters.append((target, continuation))
+        }
+    }
+
+    func releaseSleeps() async {
+        await release.signal()
+    }
+
+    private func resumeSatisfiedWaiters() {
+        var remaining: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+        for waiter in countWaiters {
+            if count >= waiter.target {
+                waiter.continuation.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        countWaiters = remaining
+    }
+}
+
+private actor ReconnectProbe {
+    private var statuses: [ReconnectStatus] = []
+    private var task: Task<Void, Never>?
+
+    func start(stream: AsyncStream<ReconnectStatus>) {
+        guard task == nil else {
+            return
+        }
+        task = Task { [weak self] in
+            for await status in stream {
+                await self?.record(status)
+            }
+        }
+    }
+
+    func stop() {
+        task?.cancel()
+        task = nil
+    }
+
+    func count(_ expected: ReconnectStatus) -> Int {
+        statuses.filter { $0 == expected }.count
+    }
+
+    private func record(_ status: ReconnectStatus) {
+        statuses.append(status)
+    }
+}
+
+private func reconnectProbe(for supervisor: TunnelSupervisor) async -> ReconnectProbe {
+    let probe = ReconnectProbe()
+    await probe.start(stream: supervisor.reconnectUpdates)
+    return probe
+}
+
+private func expectSameEndpoints(_ actual: [TransportEndpoint], _ expected: [TransportEndpoint]) {
+    #expect(actual.count == expected.count)
+    for endpoint in expected {
+        #expect(actual.contains(endpoint))
     }
 }
