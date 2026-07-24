@@ -3,8 +3,6 @@
 
 import os
 
-// This is the package's only shared mutable state: process-wide log policy is
-// selected once at app launch, while all runtime state stays actor-owned.
 enum SPLLogCategory: String, Sendable, CaseIterable {
     case dial
     case mux
@@ -17,6 +15,8 @@ enum SPLLogCategory: String, Sendable, CaseIterable {
     case transport
 }
 
+// This is the package's only shared mutable state: process-wide log policy is
+// selected once at app launch, while all runtime state stays actor-owned.
 public enum SPLLogging {
     private static let defaultSubsystem = "app.solstone.observer.spl"
     private static let stateLock = OSAllocatedUnfairLock(

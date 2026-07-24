@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+import Crypto
 import Foundation
+import Security
 import Testing
 import SPLTunnel
 
@@ -34,6 +36,7 @@ struct CertChainTests {
     """
 
     private let cert1Fingerprint = "005a64c08d69da268c62971466aca5324eaba7ead27e3d4e33ddaa244535e168"
+    private static let cert1CanonicalSPKIHex = "3059301306072a8648ce3d020106082a8648ce3d03010703420004f8a17468f44dbcc10175fab8b4edfeb2a9c1deedf03a213852d9e388bd2a57df292acc1efa360ee7cffe851507e57f8c9cbdd0f42e09cfbf8f636b4ed1ce877c"
 
     @Test func parseSingleCertificate() throws {
         let certificates = try CertChain.certificates(fromPEM: cert1)
@@ -55,7 +58,87 @@ struct CertChainTests {
     @Test func canonicalP256SPKIMatchesOpenSSLFixture() throws {
         let certificate = try #require(try CertChain.certificates(fromPEM: cert1).first)
         let spki = try CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: certificate)
-        #expect(Self.hex(spki) == "3059301306072a8648ce3d020106082a8648ce3d03010703420004f8a17468f44dbcc10175fab8b4edfeb2a9c1deedf03a213852d9e388bd2a57df292acc1efa360ee7cffe851507e57f8c9cbdd0f42e09cfbf8f636b4ed1ce877c")
+        #expect(Self.hex(spki) == Self.cert1CanonicalSPKIHex)
+    }
+
+    @Test func pinMatchesCertificateSHA256Prefixes() throws {
+        let certificate = try #require(try CertChain.certificates(fromPEM: cert1).first)
+        let digest = Self.bytes(cert1Fingerprint)
+        let prefix = Array(digest.prefix(8))
+        var wrongPrefix = prefix
+        wrongPrefix[0] ^= 0xff
+
+        #expect(CertChain.pinMatches(
+            certificate: certificate,
+            pin: PairingCAPin(kind: .certificateSHA256, prefixBytes: prefix)
+        ))
+        #expect(!CertChain.pinMatches(
+            certificate: certificate,
+            pin: PairingCAPin(kind: .certificateSHA256, prefixBytes: wrongPrefix)
+        ))
+    }
+
+    @Test func pinMatchesSPKISHA256Prefixes() throws {
+        let certificate = try #require(try CertChain.certificates(fromPEM: cert1).first)
+        let spki = Self.bytes(Self.cert1CanonicalSPKIHex)
+        let digest = Array(SHA256.hash(data: Data(spki)))
+        let prefix = Array(digest.prefix(8))
+        var wrongPrefix = prefix
+        wrongPrefix[0] ^= 0xff
+
+        #expect(CertChain.pinMatches(
+            certificate: certificate,
+            pin: PairingCAPin(kind: .spkiSHA256, prefixBytes: prefix)
+        ))
+        #expect(!CertChain.pinMatches(
+            certificate: certificate,
+            pin: PairingCAPin(kind: .spkiSHA256, prefixBytes: wrongPrefix)
+        ))
+    }
+
+    @Test func pinMatchesSPKISHA256ReturnsFalseWhenPublicKeyCannotCanonicalize() throws {
+        let original = try #require(try CertChain.certificates(fromPEM: cert1).first)
+        var der = Array(SecCertificateCopyData(original) as Data)
+        let spki = Self.bytes(Self.cert1CanonicalSPKIHex)
+        let spkiRange = try #require(der.firstRange(of: spki))
+        let uncompressedP256ECPointByteCount = 1 + 32 + 32
+        let ecPointMarkerIndex = spkiRange.upperBound - uncompressedP256ECPointByteCount
+        // The SPKI fixture ends with the uncompressed P-256 EC point
+        // (0x04 || 32-byte X || 32-byte Y). Corrupt the marker to 0x05 so
+        // P256.Signing.PublicKey(x963Representation:) rejects it,
+        // canonicalP256SubjectPublicKeyInfoDER throws, and pinMatches fails
+        // closed instead of trapping or matching. This intentionally provokes
+        // a Security framework diagnostic while the corrupted key is rejected;
+        // that log line is expected and is not package logging.
+        der[ecPointMarkerIndex] = 0x05
+        let malformed = try #require(SecCertificateCreateWithData(nil, Data(der) as CFData))
+
+        #expect(!CertChain.pinMatches(
+            certificate: malformed,
+            pin: PairingCAPin(kind: .spkiSHA256, prefixBytes: [0x00])
+        ))
+    }
+
+    @Test func pinMatchesRejectsEmptyAndOverlongPrefixes() throws {
+        let certificate = try #require(try CertChain.certificates(fromPEM: cert1).first)
+        let overlongPrefix = Array(repeating: UInt8(0), count: 33)
+
+        #expect(!CertChain.pinMatches(
+            certificate: certificate,
+            pin: PairingCAPin(kind: .certificateSHA256, prefixBytes: [])
+        ))
+        #expect(!CertChain.pinMatches(
+            certificate: certificate,
+            pin: PairingCAPin(kind: .spkiSHA256, prefixBytes: [])
+        ))
+        #expect(!CertChain.pinMatches(
+            certificate: certificate,
+            pin: PairingCAPin(kind: .certificateSHA256, prefixBytes: overlongPrefix)
+        ))
+        #expect(!CertChain.pinMatches(
+            certificate: certificate,
+            pin: PairingCAPin(kind: .spkiSHA256, prefixBytes: overlongPrefix)
+        ))
     }
 
     @Test func jidFromSPKIMatchesMarkVector() {
