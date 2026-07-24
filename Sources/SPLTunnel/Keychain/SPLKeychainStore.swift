@@ -36,12 +36,17 @@ public struct KeychainPolicy: Sendable, Equatable {
         /// is the intended path; this policy does not migrate pairing material.
         case afterFirstUnlockThisDeviceOnly
 
+        /// The bundle is available only after user unlock and is pinned to this device.
+        case whenUnlockedThisDeviceOnly
+
         var secAttrValue: CFString {
             switch self {
             case .afterFirstUnlock:
                 kSecAttrAccessibleAfterFirstUnlock
             case .afterFirstUnlockThisDeviceOnly:
                 kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            case .whenUnlockedThisDeviceOnly:
+                kSecAttrAccessibleWhenUnlockedThisDeviceOnly
             }
         }
     }
@@ -156,9 +161,14 @@ extension KeychainPolicy {
     }
 
     func updateAttributes(data: Data) -> [String: Any] {
-        // attributesToUpdate for SecItemUpdate must contain ONLY the new value — never
-        // kSecClass or any query/primary key (kSecAttrService/kSecAttrAccount), which
-        // return errSecParam (-50). Kept as an inspectable helper so the shape is unit-tested.
-        [kSecValueData as String: data]
+        // attributesToUpdate for SecItemUpdate must never contain kSecClass or any
+        // query/primary key (kSecAttrService/kSecAttrAccount), which return errSecParam
+        // (-50). kSecAttrAccessible is a Data Protection keychain attribute, so include it
+        // only when the policy targets that keychain.
+        var attributes: [String: Any] = [kSecValueData as String: data]
+        if useDataProtectionKeychain {
+            attributes[kSecAttrAccessible as String] = accessibility.secAttrValue
+        }
+        return attributes
     }
 }

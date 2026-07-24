@@ -59,8 +59,8 @@ struct SPLKeychainStoreTests {
         #expect(base[kSecAttrAccessGroup as String] == nil)
     }
 
-    @Test func policyDerivesIOSMigratableQuery() throws {
-        // Backup-migratable policy must derive the iOS keychain query shape.
+    @Test func policyDerivesPlainMigratableQuery() throws {
+        // Backup-migratable plain policy must derive the plain keychain query shape.
         let policy = KeychainPolicy(
             service: Self.syntheticService(),
             accessGroup: nil,
@@ -79,18 +79,46 @@ struct SPLKeychainStoreTests {
         #expect(add[kSecAttrAccessible as String] as? String == kSecAttrAccessibleAfterFirstUnlock as String)
     }
 
-    @Test func updateAttributesContainOnlyValueData() throws {
-        // SecItemUpdate must carry value-only attributes to avoid errSecParam.
+    @Test func updateAttributesIncludeAccessibilityOnlyForDataProtectionKeychain() throws {
+        // Data Protection keychain updates may carry accessibility alongside new value data.
         let data = Data([0x04, 0x05])
-        let attributes = KeychainPolicy(
+        let dataProtectionAccessGroup = KeychainPolicy(
+            service: Self.syntheticService(),
+            accessGroup: "test.spl.keychain.access-group",
+            useDataProtectionKeychain: true,
+            accessibility: .afterFirstUnlockThisDeviceOnly
+        ).updateAttributes(data: data)
+        #expect(Set(dataProtectionAccessGroup.keys) == [kSecValueData as String, kSecAttrAccessible as String])
+        #expect(dataProtectionAccessGroup[kSecValueData as String] as? Data == data)
+        #expect(
+            dataProtectionAccessGroup[kSecAttrAccessible as String] as? String ==
+                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String
+        )
+
+        // Plain macOS keychain updates must remain value-only.
+        let plainDeviceOnly = KeychainPolicy(
+            service: Self.syntheticService(),
+            accessGroup: nil,
+            useDataProtectionKeychain: false,
+            accessibility: .afterFirstUnlockThisDeviceOnly
+        ).updateAttributes(data: data)
+        #expect(Set(plainDeviceOnly.keys) == [kSecValueData as String])
+        #expect(plainDeviceOnly[kSecValueData as String] as? Data == data)
+
+        // Plain backup-migratable keychain updates must also remain value-only.
+        let plainMigratable = KeychainPolicy(
             service: Self.syntheticService(),
             accessGroup: nil,
             useDataProtectionKeychain: false,
             accessibility: .afterFirstUnlock
         ).updateAttributes(data: data)
 
-        #expect(Set(attributes.keys) == [kSecValueData as String])
-        #expect(attributes[kSecValueData as String] as? Data == data)
+        #expect(Set(plainMigratable.keys) == [kSecValueData as String])
+        #expect(plainMigratable[kSecValueData as String] as? Data == data)
+        #expect(
+            KeychainPolicy.Accessibility.whenUnlockedThisDeviceOnly.secAttrValue as String ==
+                kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String
+        )
     }
 
     @Test(.enabled(if: PlainKeychainCapability.isAvailable, "\(PlainKeychainCapability.reason)"))
