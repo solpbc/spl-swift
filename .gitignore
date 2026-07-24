@@ -66,3 +66,6 @@ fastlane/test_output
 .env
 DerivedData/
 *.xcresult
+
+# Swift package: libraries do not pin resolved deps
+Package.resolved
