@@ -78,3 +78,24 @@ struct CertlessPairExchangeTests {
         }
     }
 }
+
+@Suite("CertlessPairExchange Parser")
+struct CertlessPairExchangeParserTests {
+    @Test func parseResponseReturnsNilUntilCompleteBody() throws {
+        let response = Data("HTTP/1.1 201 Created\r\nContent-Length: 5\r\n\r\nhello".utf8)
+
+        #expect(try CertlessPairExchange.parseResponse(Data(response.prefix(32))) == nil)
+        #expect(try CertlessPairExchange.parseResponse(Data(response.prefix(46))) == nil)
+        let parsed = try #require(try CertlessPairExchange.parseResponse(response))
+        #expect(parsed.status == 201)
+        #expect(parsed.body == Data("hello".utf8))
+    }
+
+    @Test func parseResponseRejectsMalformedStatusLine() {
+        let malformed = Data("SPL/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".utf8)
+
+        #expect(throws: CertlessPairError.malformedResponse) {
+            _ = try CertlessPairExchange.parseResponse(malformed)
+        }
+    }
+}

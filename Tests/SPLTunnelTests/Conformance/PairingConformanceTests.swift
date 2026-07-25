@@ -73,6 +73,54 @@ struct PairingConformanceTests {
         #expect(await transport.requests.map(\.host) == ["192.168.0.10"])
     }
 
+    @Test func relayEnrollBodyContainsOnlyInstanceIDAndHomeAttestation() throws {
+        // proto/pairing.md:27 and proto/pairing.md:169-175 keep the relay blind to pairing payload; enroll carries only instance_id and home_attestation.
+        let fixture = try TestCA.make()
+        let response = try PairClient.decodeLANResponse(data: Self.pairResponseData(bundle: fixture))
+        let endpoint = try RelayEndpoint(Self.relayEndpoint)
+        let request = try PairClient.makeRelayRequest(
+            relayEndpoint: endpoint,
+            response: response,
+            userAgent: pairingConformanceClientInfo.userAgent
+        )
+
+        let body = try #require(request.httpBody)
+        let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect(Set(json.keys) == ["instance_id", "home_attestation"])
+        #expect(json["instance_id"] as? String == "instance-1")
+        #expect(json["home_attestation"] as? String == "attestation")
+    }
+
+    @Test func lanPairResponseMissingLocalEndpointsDefaultsEmptyAndStillPairs() async throws {
+        // proto/pairing.md:151-159 defines the step-7 response body without local_endpoints; omission is accepted as an empty response endpoint list.
+        let fixture = try TestCA.make()
+        let responseBody = try Self.pairResponseDataOmittingLocalEndpoints(bundle: fixture)
+        let response = try PairClient.decodeLANResponse(data: responseBody)
+        #expect(response.localEndpoints == [])
+
+        let dialed = LocalEndpoint(host: "192.168.0.10", port: 7657, scope: "")
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: dialed.host, port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: responseBody),
+        ])
+        let client = Self.client(transport: transport)
+
+        let pairing = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
+
+        #expect(pairing.instanceID == "instance-1")
+        #expect(pairing.homeLabel == "test home")
+        #expect(pairing.fingerprint.hasPrefix("sha256:"))
+        #expect(!pairing.clientCertPEM.isEmpty)
+        #expect(!pairing.caChainPEM.isEmpty)
+        #expect(pairing.localEndpoints == [dialed])
+    }
+
     private static func client(transport: FakeLANPairTransport) -> PairClient {
         PairClient(
             session: makeHTTPStubSession(host: pairingConformanceRelayHost) { _ in
@@ -132,6 +180,16 @@ struct PairingConformanceTests {
             "ca_chain": [bundle.caCertificatePEM],
             "home_attestation": "attestation",
             "local_endpoints": [],
+        ] as [String: Any])
+    }
+
+    private static func pairResponseDataOmittingLocalEndpoints(bundle: TestCA.Bundle) throws -> Data {
+        try JSONSerialization.data(withJSONObject: [
+            "instance_id": "instance-1",
+            "home_label": "test home",
+            "client_cert": bundle.clientCertificatePEM,
+            "ca_chain": [bundle.caCertificatePEM],
+            "home_attestation": "attestation",
         ] as [String: Any])
     }
 
