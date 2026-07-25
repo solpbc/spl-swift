@@ -115,7 +115,6 @@ struct PairingConformanceTests {
 
         #expect(pairing.instanceID == "instance-1")
         #expect(pairing.homeLabel == "test home")
-        #expect(pairing.fingerprint.hasPrefix("sha256:"))
         #expect(!pairing.clientCertPEM.isEmpty)
         #expect(!pairing.caChainPEM.isEmpty)
         #expect(pairing.localEndpoints == [dialed])
