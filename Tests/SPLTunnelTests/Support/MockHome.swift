@@ -76,9 +76,14 @@ actor MockHome {
             connection.cancel()
         }
         connections.removeAll()
-        listener?.cancel()
-        listener = nil
-        boundPort = nil
+        let listener = self.listener
+        self.listener = nil
+        self.boundPort = nil
+        guard let listener else {
+            return
+        }
+
+        await cancelListenerAndWaitForRelease(listener)
     }
 
     private func accept(_ connection: NWConnection) {

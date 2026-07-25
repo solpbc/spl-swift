@@ -281,9 +281,9 @@ struct LoopbackProxyTests {
     @Test(.enabled(if: IdentityAssemblyCapability.isAvailable, "\(IdentityAssemblyCapability.reason)"))
     func supervisorLoopbackPortStaysStableAcrossReconnectGenerations() async throws {
         let fixture = try TestCA.make()
+        let tunnelPort = FixedPortReclaimTestPorts.loopbackProxyRebindPort
         var server = TLSEchoServer(bundle: fixture, mode: .mux)
-        try await server.start()
-        let tunnelPort = await server.port
+        try await server.start(port: tunnelPort)
         let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: tunnelPort, scope: "local")
         let supervisor = TunnelSupervisor(
             pairing: loopbackPairing(from: fixture, localEndpoints: [

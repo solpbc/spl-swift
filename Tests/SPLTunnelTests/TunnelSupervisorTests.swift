@@ -15,9 +15,9 @@ private let supervisorClientInfo = SPLClientInfo(userAgent: "spl-swift-superviso
 struct TunnelSupervisorTests {
     @Test func reconnectSurvivesThreeFixedPortServerKillRestartCycles() async throws {
         let fixture = try TestCA.make()
+        let port = FixedPortReclaimTestPorts.tunnelSupervisorRebindPort
         var server = TLSEchoServer(bundle: fixture, mode: .mux)
-        try await server.start()
-        let port = await server.port
+        try await server.start(port: port)
         let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: port, scope: "local")
         let supervisor = TunnelSupervisor(
             pairing: pairing(from: fixture, localEndpoints: [

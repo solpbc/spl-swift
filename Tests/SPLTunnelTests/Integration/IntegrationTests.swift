@@ -74,7 +74,10 @@ struct IntegrationTests {
     }
 
     @Test func reconnectRetainsLoopbackPortAcrossRestarts() async throws {
-        let connected = try await Self.makePairedHome(pairingMode: .direct)
+        let connected = try await Self.makePairedHome(
+            pairingMode: .direct,
+            homePort: FixedPortReclaimTestPorts.integrationMockHomeRebindPort
+        )
         let supervisor = TunnelSupervisor(
             pairing: connected.pairing,
             clientInfo: integrationClientInfo,
@@ -176,11 +179,14 @@ struct IntegrationTests {
         }
     }
 
-    private static func makePairedHome(pairingMode: PairingMode) async throws -> PairedHome {
+    private static func makePairedHome(
+        pairingMode: PairingMode,
+        homePort: Int? = nil
+    ) async throws -> PairedHome {
         let bundle = try TestCA.make()
         let authorizedClients = MockAuthorizedClients()
         let home = MockHome(bundle: bundle, authorizedClients: authorizedClients)
-        let homeEndpoint = try await home.start()
+        let homeEndpoint = try await home.start(port: homePort)
         let relay = try MockRelay()
         let relayEndpoint = try await relay.start()
         let tokenBytes = pairingMode.tokenBytes
