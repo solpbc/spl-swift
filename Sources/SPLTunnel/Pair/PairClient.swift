@@ -151,6 +151,9 @@ public struct PairClient: Sendable {
                 )
             } catch {
                 await attempt?.close()
+                if error is CancellationError {
+                    throw error
+                }
                 let pairError = Self.mapDirectPairError(error)
                 if requestCommitted {
                     throw pairError

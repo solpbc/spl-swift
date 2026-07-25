@@ -315,7 +315,7 @@ struct PairClientDirectTests {
         #expect(await transport.closeCount == 1)
     }
 
-    @Test func cancellationAfterRequestCommitIsTerminal() async throws {
+    @Test func cancellationAfterRequestCommitPropagatesAndIsTerminal() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
@@ -331,12 +331,17 @@ struct PairClientDirectTests {
             clientInfo: pairClientInfo
         )
 
-        await expectPairError(.lanRequestFailed(underlying: nil)) {
+        do {
             _ = try await client.pair(
                 pairURL: pairURL,
                 deviceLabel: "test phone",
                 relayEndpoint: Self.relayEndpoint
             )
+            Issue.record("expected cancellation")
+        } catch is CancellationError {
+            // Cancellation must remain observable to the caller after the request commit.
+        } catch {
+            Issue.record("expected CancellationError, got \(error)")
         }
 
         #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])

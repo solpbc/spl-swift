@@ -63,6 +63,9 @@ struct TunnelAddressClassifierTests {
             ("100.127.255.255", true),
             ("100.128.0.0", false),
             ("100.64.0", false),
+            ("100.64..1", false),
+            ("100.64.0.256", false),
+            ("100.64.0.1.example", false),
             ("100.64.0.1.extra", false),
             ("home.local", false),
         ]
