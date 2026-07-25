@@ -92,7 +92,66 @@ struct PairClientDirectTests {
         #expect(await transport.requestCount == 1)
     }
 
-    @Test func pairingWindowClosedShortCircuitsCandidateLoop() async throws {
+    @Test func closedBeforeStatusTriesNextCandidateAndPairs() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let fixture = try TestCA.make()
+        let responseBody = try Self.pairResponseData(bundle: fixture)
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .error(CertlessPairError.closedBeforeStatus),
+            .response(status: 200, body: responseBody),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        let pairing = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
+
+        #expect(pairing.instanceID == "instance-1")
+        #expect(await transport.requestCount == 2)
+    }
+
+    @Test func singleCandidateClosedBeforeStatusRethrowsLANClosedBeforeResponse() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .error(CertlessPairError.closedBeforeStatus),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        do {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+            Issue.record("Expected lanClosedBeforeResponse")
+        } catch let error as PairError {
+            #expect(error == .lanClosedBeforeResponse)
+            #expect(error != .pairingWindowClosed)
+        } catch {
+            Issue.record("Expected lanClosedBeforeResponse, got \(error)")
+        }
+
+        #expect(await transport.requestCount == 1)
+    }
+
+    @Test func allCandidatesClosedBeforeStatusExhaustsCandidates() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
@@ -100,7 +159,59 @@ struct PairClientDirectTests {
         ])
         let transport = FakeLANPairTransport(outcomes: [
             .error(CertlessPairError.closedBeforeStatus),
-            .error(FakeLANPairError.unreachable),
+            .error(CertlessPairError.closedBeforeStatus),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        await expectPairError(.lanCandidatesExhausted(sawCAFingerprintMismatch: false)) {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+        }
+
+        #expect(await transport.requestCount == 2)
+    }
+
+    @Test func malformedCertlessPairResponseMapsLANResponseInvalid() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .error(CertlessPairError.malformedResponse),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        await expectPairError(.lanResponseInvalid(status: nil)) {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+        }
+
+        #expect(await transport.requestCount == 1)
+    }
+
+    @Test func pairingWindowClosed403BodyMapsPairingWindowClosed() async throws {
+        // solpbc/spl wsgi.py write_simple_response emits this text/plain cert-less gate body;
+        // no repo-local proto clause pins the exact text.
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 403, body: Data("pairing window closed\n".utf8)),
         ])
         let client = PairClient(
             session: Self.relayFailureSession(status: 503),
@@ -115,8 +226,37 @@ struct PairClientDirectTests {
                 relayEndpoint: Self.relayEndpoint
             )
         }
+    }
 
-        #expect(await transport.requestCount == 1)
+    @Test func pairingTunnelWrongPath403BodyMapsLANResponseInvalid() async throws {
+        // solpbc/spl wsgi.py write_simple_response emits this text/plain cert-less gate body;
+        // no repo-local proto clause pins the exact text.
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 403, body: Data("pairing tunnel may only use /app/network/pair\n".utf8)),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        await expectPairError(.lanResponseInvalid(status: 403)) {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+        }
+    }
+
+    @Test func lanClosedBeforeResponseEqualityAndStatusCode() {
+        #expect(PairError.lanClosedBeforeResponse == .lanClosedBeforeResponse)
+        #expect(PairError.lanClosedBeforeResponse != .pairingWindowClosed)
+        #expect(PairError.lanClosedBeforeResponse.statusCode == nil)
     }
 
     @Test func directRequestLineUsesQueryTokenAndBodyOmitsNonce() async throws {
@@ -284,6 +424,33 @@ struct PairClientDirectTests {
         let head = try #require(String(data: data[..<range.lowerBound], encoding: .utf8))
         let requestLine = try #require(head.components(separatedBy: "\r\n").first)
         return (requestLine, Data(data[range.upperBound...]))
+    }
+}
+
+@Suite("PairClient Relay Dial Failures", .serialized)
+struct PairClientRelayDialFailureTests {
+    @Test func pairRelay401MapsPairingWindowClosedThroughPairClient() async throws {
+        let pairURL = try Self.relayPairURL()
+        let server = WebSocketFailingServer(statusCode: 401)
+        try await server.start()
+        let port = await server.port
+        let client = PairClient(clientInfo: pairClientInfo)
+
+        await expectPairError(.pairingWindowClosed) {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: RelayEndpoint.unchecked(try #require(URL(string: "ws://127.0.0.1:\(port)")))
+            )
+        }
+        await server.stop()
+    }
+
+    private static func relayPairURL() throws -> PairURL {
+        let sBytes: [UInt8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        let caPrefix = Array(UInt8(0xa0)...UInt8(0xaf))
+        let bytes: [UInt8] = [0x06] + sBytes + [0x01] + caPrefix + [0x00]
+        return try PairURL.parse(URL(string: "https://go.solstone.app/p#\(Crockford32TestEncoding.encode(bytes))")!)
     }
 }
 

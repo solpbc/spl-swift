@@ -132,7 +132,7 @@ public struct PairClient: Sendable {
                 )
             } catch let error as PairError {
                 switch error {
-                case .nonceExpired, .pairingWindowClosed:
+                case .nonceExpired:
                     throw error
                 case .lanCAFingerprintMismatch:
                     sawCAFingerprintMismatch = true
@@ -222,7 +222,7 @@ public struct PairClient: Sendable {
         } catch InnerTLSError.peerNotPinned {
             throw PairError.lanCAFingerprintMismatch
         } catch CertlessPairError.closedBeforeStatus {
-            throw PairError.pairingWindowClosed
+            throw PairError.lanClosedBeforeResponse
         } catch CertlessPairError.malformedResponse {
             throw PairError.lanResponseInvalid(status: nil)
         } catch {
@@ -525,6 +525,16 @@ public struct PairClient: Sendable {
             }
         case 400, 401, 404:
             throw PairError.lanResponseInvalid(status: status)
+        case 403:
+            // The cert-less gate also emits "pairing tunnel may only use /app/network/pair";
+            // only "pairing window closed" is a window-closed signal.
+            let message = String(data: body, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if message == "pairing window closed" {
+                throw PairError.pairingWindowClosed
+            }
+            throw PairError.lanResponseInvalid(status: status)
         case 410:
             throw PairError.nonceExpired
         case 500...599:
@@ -698,6 +708,7 @@ public enum PairError: Error, Equatable, Sendable {
     case lanRequestFailed(underlying: (any Error & Sendable)?)
     case lanCAFingerprintMismatch
     case lanResponseInvalid(status: Int?)
+    case lanClosedBeforeResponse
     case nonceExpired
     case pairingWindowClosed
     case lanCandidatesExhausted(sawCAFingerprintMismatch: Bool)
@@ -724,6 +735,7 @@ public enum PairError: Error, Equatable, Sendable {
         case (.csrBuildFailed, .csrBuildFailed),
              (.lanRequestFailed, .lanRequestFailed),
              (.lanCAFingerprintMismatch, .lanCAFingerprintMismatch),
+             (.lanClosedBeforeResponse, .lanClosedBeforeResponse),
              (.nonceExpired, .nonceExpired),
              (.pairingWindowClosed, .pairingWindowClosed),
              (.relayRequestFailed, .relayRequestFailed),
