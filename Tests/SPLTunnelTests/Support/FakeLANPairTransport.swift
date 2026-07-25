@@ -32,12 +32,6 @@ struct FakeLANRequest: Sendable, Equatable {
     let requestBytes: Data
 }
 
-enum FakeLANEvent: Sendable, Equatable {
-    case prepare(host: String, port: Int)
-    case send(host: String, port: Int)
-    case close(host: String, port: Int)
-}
-
 actor FakeLANPairTransport: LANPairTransport {
     private var prepareOutcomes: [FakeLANPrepareOutcome]
     private let recorder = FakeLANRecorder()
@@ -71,12 +65,6 @@ actor FakeLANPairTransport: LANPairTransport {
     var closeCount: Int {
         get async {
             await recorder.closeCount
-        }
-    }
-
-    var events: [FakeLANEvent] {
-        get async {
-            await recorder.events
         }
     }
 
@@ -136,39 +124,32 @@ private actor FakeLANPairAttempt: LANPairAttempt {
             return
         }
         closed = true
-        await recorder.recordClose(prepare)
+        await recorder.recordClose()
     }
 }
 
 private actor FakeLANRecorder {
     private(set) var prepares: [FakeLANPrepare] = []
     private(set) var requests: [FakeLANRequest] = []
-    private(set) var events: [FakeLANEvent] = []
+    private var recordedCloseCount = 0
 
     var requestCount: Int {
         requests.count
     }
 
     var closeCount: Int {
-        events.filter { event in
-            if case .close = event {
-                return true
-            }
-            return false
-        }.count
+        recordedCloseCount
     }
 
     func recordPrepare(_ prepare: FakeLANPrepare) {
         prepares.append(prepare)
-        events.append(.prepare(host: prepare.host, port: prepare.port))
     }
 
     func recordRequest(_ request: FakeLANRequest) {
         requests.append(request)
-        events.append(.send(host: request.host, port: request.port))
     }
 
-    func recordClose(_ prepare: FakeLANPrepare) {
-        events.append(.close(host: prepare.host, port: prepare.port))
+    func recordClose() {
+        recordedCloseCount += 1
     }
 }

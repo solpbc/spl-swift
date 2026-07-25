@@ -74,7 +74,8 @@ struct PairingConformanceTests {
     }
 
     @Test func directPairCGNATOnlyV04BeginsOneRequestToEncodedEndpoint() async throws {
-        // proto/pairing.md:117 explicitly admits RFC 6598 shared address space 100.64.0.0/10.
+        // proto/pairing.md:117 admits RFC 6598 shared address space 100.64.0.0/10.
+        // proto/pairing.md:96 allows at most one nonce-bearing request; :147-157 define the request shape.
         let fixture = try TestCA.make()
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "100.64.0.5", port: 7657),
@@ -96,6 +97,7 @@ struct PairingConformanceTests {
 
     @Test func directPairRFC1918AndCGNATMultiAdmitsIntact() async throws {
         // proto/pairing.md:117 admits 0x05 sets only when all candidates satisfy the direct allow-list.
+        // proto/pairing.md:96 allows at most one nonce-bearing request; :147-157 define the request shape.
         let fixture = try TestCA.make()
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
@@ -118,6 +120,9 @@ struct PairingConformanceTests {
 
     @Test func directPairCGNATWithPublicRefusesWholeSetBeforeMaterialPrepareOrWrite() async throws {
         // proto/pairing.md:117 refuses the whole 0x05 link unless all candidates satisfy the direct allow-list.
+        // This is not independently red on pre-RFC6598 code because CGNAT was also refused there.
+        // directPairCGNATOnlyV04BeginsOneRequestToEncodedEndpoint and
+        // directPairRFC1918AndCGNATMultiAdmitsIntact are the red pre-fix admission controls.
         let cases = [
             [
                 PairCandidate(address: "100.64.0.5", port: 7657),
