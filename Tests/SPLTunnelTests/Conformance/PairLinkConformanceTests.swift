@@ -27,6 +27,30 @@ struct PairLinkConformanceTests {
         #expect(pairURL.relayOrigin == nil)
     }
 
+    @Test func multiCandidateCountBoundariesFollowProtocolRange() throws {
+        // proto/pairing.md:90 pins the 0x05 candidate count range to 1-4.
+        for count in 1...4 {
+            let pairURL = try PairURL.parse(Self.multiCandidateLink(count: count))
+
+            #expect(pairURL.version == 0x05)
+            #expect(pairURL.kind == .direct)
+            #expect(pairURL.candidates.count == count)
+        }
+    }
+
+    @Test func multiCandidateOutOfRangeCountsAreMalformed() throws {
+        // proto/pairing.md:96,102,104 require out-of-range 0x05 counts to be refused before key generation or dialing.
+        let zero = Self.multiCandidateBytes(count: 0)
+        #expect(throws: PairURLError.invalidLength(zero.count)) {
+            _ = try PairURL.parse(Self.link(bytes: zero))
+        }
+
+        let five = Self.multiCandidateBytes(count: 5)
+        #expect(throws: PairURLError.invalidLength(five.count)) {
+            _ = try PairURL.parse(Self.link(bytes: five))
+        }
+    }
+
     @Test func defaultRelayVectorIsByteIdentical() throws {
         // proto/pair-window.md:28-37,39-45,53-55,66 pins the default relay vector bytes.
         let expectedBlob = try Self.bytes(hex: Self.defaultRelayBlobHex)
@@ -84,6 +108,30 @@ struct PairLinkConformanceTests {
         0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
         0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
     ]
+
+    private static func multiCandidateLink(count: Int) -> URL {
+        link(bytes: multiCandidateBytes(count: count))
+    }
+
+    private static func link(bytes: [UInt8]) -> URL {
+        URL(string: "https://go.solstone.app/p#\(Crockford32TestEncoding.encode(bytes))")!
+    }
+
+    private static func multiCandidateBytes(count: Int) -> [UInt8] {
+        var bytes: [UInt8] = [
+            0x05,
+            0x01,
+            UInt8(count),
+            0x1d,
+            0xe9,
+        ]
+        for index in 0..<count {
+            bytes.append(contentsOf: [192, 168, 0, UInt8(index + 1)])
+        }
+        bytes.append(contentsOf: Array(UInt8(0x10)...UInt8(0x1f)))
+        bytes.append(contentsOf: Array(UInt8(0xa0)...UInt8(0xaf)))
+        return bytes
+    }
 
     private static func bytes(hex: String) throws -> [UInt8] {
         #expect(hex.count.isMultiple(of: 2))

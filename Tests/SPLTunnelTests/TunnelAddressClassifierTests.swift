@@ -7,7 +7,7 @@ import Testing
 @Suite("TunnelAddressClassifier")
 struct TunnelAddressClassifierTests {
     @Test func ipv6ULAClassifierParsesLiteralsAndRejectsHostnames() {
-        // proto/pairing.md:95 pins the IPv6 ULA range used by local direct-candidate refusal.
+        // proto/pairing.md:117 pins the IPv6 ULA range used by local direct-candidate refusal.
         // ULA classification must parse IPv6 literals, not string prefixes.
         let cases: [(host: String, expected: Bool)] = [
             ("fd12:3456::1", true),
@@ -33,7 +33,7 @@ struct TunnelAddressClassifierTests {
     }
 
     @Test func rfc1918ClassifierCoversIPv4LiteralEdgeCasesOnly() {
-        // proto/pairing.md:95 pins the IPv4 private range definitions used by local direct-candidate refusal.
+        // proto/pairing.md:117 pins the IPv4 private range definitions used by local direct-candidate refusal.
         let cases: [(host: String, expected: Bool)] = [
             ("172.15.255.255", false),
             ("172.32.0.1", false),
@@ -49,6 +49,27 @@ struct TunnelAddressClassifierTests {
         for testCase in cases {
             #expect(
                 TunnelAddressClassifier.isRFC1918IPv4Literal(testCase.host) == testCase.expected,
+                "host \(testCase.host)"
+            )
+        }
+    }
+
+    @Test func rfc6598ClassifierCoversSharedAddressSpaceLiteralEdgesOnly() {
+        // proto/pairing.md:117 explicitly admits RFC 6598 shared address space 100.64.0.0/10.
+        let cases: [(host: String, expected: Bool)] = [
+            ("100.63.255.255", false),
+            ("100.64.0.0", true),
+            ("100.64.0.1", true),
+            ("100.127.255.255", true),
+            ("100.128.0.0", false),
+            ("100.64.0", false),
+            ("100.64.0.1.extra", false),
+            ("home.local", false),
+        ]
+
+        for testCase in cases {
+            #expect(
+                TunnelAddressClassifier.isRFC6598IPv4Literal(testCase.host) == testCase.expected,
                 "host \(testCase.host)"
             )
         }
@@ -93,18 +114,19 @@ struct TunnelAddressClassifierTests {
     }
 
     @Test func localNetworkAddressCompositeCoversPairingLocalRanges() {
-        // proto/pairing.md:95 direct candidate refusal accepts private/local literals and rejects non-local literals.
+        // proto/pairing.md:117 direct candidate refusal accepts the explicit local/shared allow-list and rejects non-local literals.
         let cases: [(host: String, expected: Bool)] = [
             ("10.2.3.4", true),
             ("172.16.0.1", true),
             ("192.168.4.20", true),
+            ("100.64.0.1", true),
             ("127.0.0.1", true),
             ("169.254.1.10", true),
             ("fd12:3456::1", true),
             ("[fd00::1]", true),
             ("192.0.2.10", false),
             ("198.51.100.20", false),
-            ("100.64.0.1", false),
+            ("100.128.0.0", false),
             ("fe80::1", false),
             ("home.local", false),
         ]

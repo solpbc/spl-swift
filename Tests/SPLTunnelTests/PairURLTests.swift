@@ -7,9 +7,8 @@ import Testing
 
 @Suite("PairURL")
 struct PairURLTests {
-    // The 0x05 multi-candidate form is not specified anywhere in proto/; the
-    // only 0x05 proto hit is framing.md:70 CANCEL, unrelated to pair links.
-    // These tests pin existing client behavior, not wire conformance.
+    // proto/pairing.md:84-96 specifies the 0x05 multi-candidate direct form.
+    // These tests pin parser behavior; conformance vectors live under Conformance/.
     @Test func multiAddressReferenceVectorParses() throws {
         let pairURL = try PairURL.parse(Self.url(fragment: Self.multiAddressBlob))
 

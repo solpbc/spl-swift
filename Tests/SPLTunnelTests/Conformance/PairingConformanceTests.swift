@@ -11,7 +11,7 @@ private let pairingConformanceRelayHost = "pairing-conformance-relay.test"
 @Suite("PairingConformance", .serialized)
 struct PairingConformanceTests {
     @Test func directPairRejectsNonLocalIPv4CandidateBeforeDial() async throws {
-        // proto/pairing.md:95 direct candidates are local/private addresses; non-local direct candidates are refused before dial.
+        // proto/pairing.md:117 direct candidates outside the explicit allow-list are refused before dial.
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.0.2.10", port: 7657),
             PairCandidate(address: "192.0.2.20", port: 7657),
@@ -31,7 +31,7 @@ struct PairingConformanceTests {
     }
 
     @Test func directPairRejectsMixedLocalAndNonLocalCandidatesBeforeDial() async throws {
-        // proto/pairing.md:95 the local/private requirement applies to the whole direct candidate set, not only the first candidate.
+        // proto/pairing.md:117 the direct allow-list applies to the whole candidate set, not only the first candidate.
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
             PairCandidate(address: "192.0.2.20", port: 7657),
@@ -52,7 +52,7 @@ struct PairingConformanceTests {
     }
 
     @Test func directPairAcceptsAllLocalCandidatesAndDialsNormally() async throws {
-        // proto/pairing.md:95 RFC1918, IPv4 link-local, and IPv4 loopback direct candidates are local/private dial candidates.
+        // proto/pairing.md:117 admits RFC1918, RFC 6598, IPv4 link-local, IPv4 loopback, and IPv6 ULA direct candidates.
         let fixture = try TestCA.make()
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
@@ -71,6 +71,99 @@ struct PairingConformanceTests {
         )
 
         #expect(await transport.requests.map(\.host) == ["192.168.0.10"])
+    }
+
+    @Test func directPairCGNATOnlyV04BeginsOneRequestToEncodedEndpoint() async throws {
+        // proto/pairing.md:117 explicitly admits RFC 6598 shared address space 100.64.0.0/10.
+        let fixture = try TestCA.make()
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "100.64.0.5", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: try Self.pairResponseData(bundle: fixture)),
+        ])
+        let client = Self.client(transport: transport)
+
+        _ = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
+
+        #expect(await transport.requests.map(\.host) == ["100.64.0.5"])
+        #expect(await transport.requestCount == 1)
+    }
+
+    @Test func directPairRFC1918AndCGNATMultiAdmitsIntact() async throws {
+        // proto/pairing.md:117 admits 0x05 sets only when all candidates satisfy the direct allow-list.
+        let fixture = try TestCA.make()
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "100.64.0.5", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: try Self.pairResponseData(bundle: fixture)),
+        ])
+        let client = Self.client(transport: transport)
+
+        _ = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
+
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requestCount == 1)
+    }
+
+    @Test func directPairCGNATWithPublicRefusesWholeSetBeforeMaterialPrepareOrWrite() async throws {
+        // proto/pairing.md:117 refuses the whole 0x05 link unless all candidates satisfy the direct allow-list.
+        let cases = [
+            [
+                PairCandidate(address: "100.64.0.5", port: 7657),
+                PairCandidate(address: "192.0.2.42", port: 7657),
+            ],
+            [
+                PairCandidate(address: "192.0.2.42", port: 7657),
+                PairCandidate(address: "100.64.0.5", port: 7657),
+            ],
+            [
+                PairCandidate(address: "100.64.0.5", port: 7657),
+                PairCandidate(address: "100.64.0.5", port: 7657),
+                PairCandidate(address: "192.0.2.42", port: 7657),
+            ],
+            [
+                PairCandidate(address: "192.0.2.42", port: 7657),
+                PairCandidate(address: "100.64.0.5", port: 7657),
+                PairCandidate(address: "100.64.0.5", port: 7657),
+            ],
+        ]
+
+        for candidates in cases {
+            let material = PairingMaterialSpy()
+            let pairURL = try Self.directPairURL(candidates: candidates)
+            let transport = FakeLANPairTransport(outcomes: [])
+            let client = PairClient(
+                session: makeHTTPStubSession(host: pairingConformanceRelayHost) { _ in
+                    .http(status: 503, data: Data())
+                },
+                lanTransport: transport,
+                clientInfo: pairingConformanceClientInfo,
+                materialGenerator: material.generate
+            )
+
+            await Self.expectDirectAddressNotLocal {
+                _ = try await client.pair(
+                    pairURL: pairURL,
+                    deviceLabel: "test phone",
+                    relayEndpoint: Self.relayEndpoint
+                )
+            }
+
+            #expect(material.generationCount == 0)
+            #expect(await transport.prepares.isEmpty)
+            #expect(await transport.requests.isEmpty)
+        }
     }
 
     @Test func relayEnrollBodyContainsOnlyInstanceIDAndHomeAttestation() throws {

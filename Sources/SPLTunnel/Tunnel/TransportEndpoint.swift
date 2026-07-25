@@ -20,7 +20,7 @@ public enum TransportEndpoint: Sendable, Equatable {
             guard TunnelAddressClassifier.isRFC1918IPv4Literal(endpoint.host) else {
                 return [pinned]
             }
-            // RFC1918 names are ambiguous across networks. The pinned primary fails inner-TLS
+            // RFC1918 endpoints are ambiguous across networks. The pinned primary fails inner-TLS
             // handshake on a wrong host and falls through; this unpinned duplicate keeps VPN paths reachable.
             return [
                 pinned,

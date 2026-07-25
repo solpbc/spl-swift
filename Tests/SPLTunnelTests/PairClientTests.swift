@@ -18,7 +18,7 @@ struct PairClientDirectTests {
             PairCandidate(address: "192.168.0.20", port: 7657),
             PairCandidate(address: "192.168.0.30", port: 7657),
         ])
-        let transport = FakeLANPairTransport(outcomes: [
+        let transport = FakeLANPairTransport(prepareOutcomes: [
             .error(FakeLANPairError.unreachable),
             .error(InnerTLSError.caFingerprintMismatch),
             .error(FakeLANPairError.unreachable),
@@ -38,8 +38,310 @@ struct PairClientDirectTests {
             )
         }
 
-        let requests = await transport.requests
-        #expect(requests.map(\.host) == ["192.168.0.30", "192.168.0.20", "192.168.0.10"])
+        let prepares = await transport.prepares
+        #expect(prepares.map(\.host) == ["192.168.0.30", "192.168.0.20", "192.168.0.10"])
+        #expect(await transport.requests.isEmpty)
+    }
+
+    @Test func validPermutationControlsCandidateOrder() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let fixture = try TestCA.make()
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+            PairCandidate(address: "192.168.0.30", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: try Self.pairResponseData(bundle: fixture)),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        _ = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint,
+            orderCandidates: { Array($0.reversed()) }
+        )
+
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.30"])
+        #expect(await transport.requestCount == 1)
+        #expect(await transport.closeCount == 1)
+    }
+
+    @Test func invalidCandidateOrdersFallBackToCanonicalUniqueOrder() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let canonical = [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+        ]
+        let cases: [[PairCandidate]] = [
+            canonical + [PairCandidate(address: "192.168.0.30", port: 7657)],
+            [canonical[1]],
+            [canonical[1], canonical[1]],
+            [canonical[1], PairCandidate(address: "192.168.0.30", port: 7657)],
+        ]
+
+        for requestedOrder in cases {
+            let fixture = try TestCA.make()
+            let transport = FakeLANPairTransport(outcomes: [
+                .response(status: 200, body: try Self.pairResponseData(bundle: fixture)),
+            ])
+            let client = PairClient(
+                session: Self.relayFailureSession(status: 503),
+                lanTransport: transport,
+                clientInfo: pairClientInfo
+            )
+            let pairURL = try Self.directPairURL(candidates: canonical)
+
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint,
+                orderCandidates: { _ in requestedOrder }
+            )
+
+            #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+            #expect(await transport.requestCount == 1)
+            #expect(await transport.closeCount == 1)
+        }
+    }
+
+    @Test func duplicateCandidatesCoalesceBeforeOrdering() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let fixture = try TestCA.make()
+        let first = PairCandidate(address: "192.168.0.10", port: 7657)
+        let second = PairCandidate(address: "192.168.0.20", port: 7657)
+        let pairURL = try Self.directPairURL(candidates: [first, first, second])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: try Self.pairResponseData(bundle: fixture)),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        _ = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint,
+            orderCandidates: { candidates in
+                #expect(candidates == [first, second])
+                return Array(candidates.reversed())
+            }
+        )
+
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.20"])
+        #expect(await transport.requestCount == 1)
+    }
+
+    @Test func preRequestRetryReusesOneMaterialAndSerializedBody() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let fixture = try TestCA.make()
+        let material = PairingMaterialSpy()
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(prepareOutcomes: [
+            .error(FakeLANPairError.unreachable),
+            .attempt(.response(status: 200, body: try Self.pairResponseData(bundle: fixture))),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo,
+            materialGenerator: material.generate
+        )
+
+        _ = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
+
+        #expect(material.generationCount == 1)
+        #expect(material.generatedPrivateKeys == ["key-1"])
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10", "192.168.0.20"])
+        #expect(await transport.requestCount == 1)
+        let request = try #require(await transport.requests.first)
+        let parsed = try Self.parseRequest(request.requestBytes)
+        let expectedBody = try PairClient.encodePairRequestBody(csrPEM: "csr-1", deviceLabel: "test phone")
+        #expect(parsed.body == expectedBody)
+        let json = try #require(JSONSerialization.jsonObject(with: parsed.body) as? [String: String])
+        #expect(json["csr"] == "csr-1")
+    }
+
+    @Test func genericPreRequestFailurePreservesUnderlyingError() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(prepareOutcomes: [
+            .error(FakeLANPairError.unreachable),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        do {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+            Issue.record("Expected lanRequestFailed")
+        } catch let error as PairError {
+            guard case .lanRequestFailed(let underlying) = error else {
+                Issue.record("Expected lanRequestFailed, got \(error)")
+                return
+            }
+            guard let underlying else {
+                Issue.record("Expected underlying error")
+                return
+            }
+            #expect((underlying as? FakeLANPairError) == .unreachable)
+        } catch {
+            Issue.record("Expected PairError, got \(error)")
+        }
+
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requests.isEmpty)
+    }
+
+    @Test func immediateWriteThrowAfterRequestCommitIsTerminal() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .error(FakeLANPairError.unreachable),
+            .response(status: 200, body: Data()),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        await expectPairError(.lanRequestFailed(underlying: nil)) {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+        }
+
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requestCount == 1)
+        #expect(await transport.closeCount == 1)
+    }
+
+    @Test func genericCommittedSendFailurePreservesUnderlyingError() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .error(FakeLANPairError.unreachable),
+            .response(status: 200, body: Data()),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        do {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+            Issue.record("Expected lanRequestFailed")
+        } catch let error as PairError {
+            guard case .lanRequestFailed(let underlying) = error else {
+                Issue.record("Expected lanRequestFailed, got \(error)")
+                return
+            }
+            guard let underlying else {
+                Issue.record("Expected underlying error")
+                return
+            }
+            #expect((underlying as? FakeLANPairError) == .unreachable)
+        } catch {
+            Issue.record("Expected PairError, got \(error)")
+        }
+
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requestCount == 1)
+        #expect(await transport.closeCount == 1)
+    }
+
+    @Test func caFingerprintMismatchAfterRequestCommitIsTerminalWithMappedError() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .error(InnerTLSError.caFingerprintMismatch),
+            .response(status: 200, body: Data()),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        await expectPairError(.lanCAFingerprintMismatch) {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+        }
+
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requestCount == 1)
+        #expect(await transport.closeCount == 1)
+    }
+
+    @Test func cancellationAfterRequestCommitIsTerminal() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .error(CancellationError()),
+            .response(status: 200, body: Data()),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        await expectPairError(.lanRequestFailed(underlying: nil)) {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+        }
+
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requestCount == 1)
+        #expect(await transport.closeCount == 1)
     }
 
     @Test func singleCandidateExhaustionRethrowsRawError() async throws {
@@ -47,7 +349,7 @@ struct PairClientDirectTests {
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
         ])
-        let transport = FakeLANPairTransport(outcomes: [
+        let transport = FakeLANPairTransport(prepareOutcomes: [
             .error(InnerTLSError.caFingerprintMismatch),
         ])
         let client = PairClient(
@@ -92,7 +394,7 @@ struct PairClientDirectTests {
         #expect(await transport.requestCount == 1)
     }
 
-    @Test func closedBeforeStatusTriesNextCandidateAndPairs() async throws {
+    @Test func closedBeforeStatusAfterRequestIsTerminal() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let fixture = try TestCA.make()
         let responseBody = try Self.pairResponseData(bundle: fixture)
@@ -110,14 +412,17 @@ struct PairClientDirectTests {
             clientInfo: pairClientInfo
         )
 
-        let pairing = try await client.pair(
-            pairURL: pairURL,
-            deviceLabel: "test phone",
-            relayEndpoint: Self.relayEndpoint
-        )
+        await expectPairError(.lanClosedBeforeResponse) {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+        }
 
-        #expect(pairing.instanceID == "instance-1")
-        #expect(await transport.requestCount == 2)
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requestCount == 1)
+        #expect(await transport.closeCount == 1)
     }
 
     @Test func singleCandidateClosedBeforeStatusRethrowsLANClosedBeforeResponse() async throws {
@@ -151,7 +456,7 @@ struct PairClientDirectTests {
         #expect(await transport.requestCount == 1)
     }
 
-    @Test func allCandidatesClosedBeforeStatusExhaustsCandidates() async throws {
+    @Test func allCandidatesClosedBeforeStatusStopsAfterFirstCommittedRequest() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
@@ -167,7 +472,7 @@ struct PairClientDirectTests {
             clientInfo: pairClientInfo
         )
 
-        await expectPairError(.lanCandidatesExhausted(sawCAFingerprintMismatch: false)) {
+        await expectPairError(.lanClosedBeforeResponse) {
             _ = try await client.pair(
                 pairURL: pairURL,
                 deviceLabel: "test phone",
@@ -175,16 +480,20 @@ struct PairClientDirectTests {
             )
         }
 
-        #expect(await transport.requestCount == 2)
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requestCount == 1)
+        #expect(await transport.closeCount == 1)
     }
 
-    @Test func malformedCertlessPairResponseMapsLANResponseInvalid() async throws {
+    @Test func malformedCertlessPairResponseAfterRequestCommitIsTerminalWithMappedError() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
         ])
         let transport = FakeLANPairTransport(outcomes: [
             .error(CertlessPairError.malformedResponse),
+            .response(status: 200, body: Data()),
         ])
         let client = PairClient(
             session: Self.relayFailureSession(status: 503),
@@ -200,7 +509,46 @@ struct PairClientDirectTests {
             )
         }
 
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
         #expect(await transport.requestCount == 1)
+        #expect(await transport.closeCount == 1)
+    }
+
+    @Test func responseErrorAfterRequestCommitIsTerminalWithMappedError() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let cases: [(status: Int, body: Data, expected: PairError)] = [
+            (200, Data(), .lanResponseInvalid(status: 200)),
+            (400, Data(), .lanResponseInvalid(status: 400)),
+            (500, Data(), .lanRequestFailed(underlying: nil)),
+        ]
+
+        for testCase in cases {
+            let pairURL = try Self.directPairURL(candidates: [
+                PairCandidate(address: "192.168.0.10", port: 7657),
+                PairCandidate(address: "192.168.0.20", port: 7657),
+            ])
+            let transport = FakeLANPairTransport(outcomes: [
+                .response(status: testCase.status, body: testCase.body),
+                .response(status: 200, body: Data()),
+            ])
+            let client = PairClient(
+                session: Self.relayFailureSession(status: 503),
+                lanTransport: transport,
+                clientInfo: pairClientInfo
+            )
+
+            await expectPairError(testCase.expected) {
+                _ = try await client.pair(
+                    pairURL: pairURL,
+                    deviceLabel: "test phone",
+                    relayEndpoint: Self.relayEndpoint
+                )
+            }
+
+            #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+            #expect(await transport.requestCount == 1)
+            #expect(await transport.closeCount == 1)
+        }
     }
 
     @Test func pairingWindowClosed403BodyMapsPairingWindowClosed() async throws {
@@ -285,6 +633,7 @@ struct PairClientDirectTests {
         )
 
         let request = try #require(await transport.requests.first)
+        #expect(await transport.requestCount == 1)
         let parsed = try Self.parseRequest(request.requestBytes)
         let json = try #require(JSONSerialization.jsonObject(with: parsed.body) as? [String: String])
         #expect(parsed.requestLine == "POST /app/network/pair?token=000102030405060708090a0b0c0d0e0f HTTP/1.1")
@@ -344,6 +693,36 @@ struct PairClientDirectTests {
         )
 
         #expect(pairing.relayEnrollment == .unavailable)
+        #expect(HTTPStubProtocol.state.requests(forHost: pairClientRelayHost).count == 1)
+    }
+
+    @Test func enrollmentCancellationReturnsUnavailableOnValidPairing() async throws {
+        // proto/pairing.md:147-179 cert storage precedes relay enrollment, so enrollment failure preserves LAN pairing.
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let fixture = try TestCA.make()
+        let responseBody = try Self.pairResponseData(bundle: fixture)
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: responseBody),
+        ])
+        let client = PairClient(
+            session: makeHTTPStubSession(host: pairClientRelayHost) { _ in
+                .failure(CancellationError())
+            },
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        let pairing = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
+
+        #expect(pairing.relayEnrollment == .unavailable)
+        #expect(await transport.requestCount == 1)
         #expect(HTTPStubProtocol.state.requests(forHost: pairClientRelayHost).count == 1)
     }
 

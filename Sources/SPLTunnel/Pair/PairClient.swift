@@ -11,15 +11,22 @@ public struct PairClient: Sendable {
     private let session: URLSession
     private let lanTransport: any LANPairTransport
     private let clientInfo: SPLClientInfo
+    private let materialGenerator: @Sendable (String) throws -> PairingMaterial
 
     public init(clientInfo: SPLClientInfo) {
         self.init(session: .shared, lanTransport: CertlessPairExchange(), clientInfo: clientInfo)
     }
 
-    init(session: URLSession, lanTransport: any LANPairTransport = CertlessPairExchange(), clientInfo: SPLClientInfo) {
+    init(
+        session: URLSession,
+        lanTransport: any LANPairTransport = CertlessPairExchange(),
+        clientInfo: SPLClientInfo,
+        materialGenerator: @escaping @Sendable (String) throws -> PairingMaterial = Self.generatePairingMaterial
+    ) {
         self.session = session
         self.lanTransport = lanTransport
         self.clientInfo = clientInfo
+        self.materialGenerator = materialGenerator
     }
 
     public func pair(
@@ -28,17 +35,16 @@ public struct PairClient: Sendable {
         relayEndpoint: URL,
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate] = { $0 }
     ) async throws -> StoredPairing {
-        let generated = try Self.generatePairingMaterial(deviceLabel: deviceLabel)
         switch pairURL.kind {
         case .direct:
             return try await pairDirect(
                 pairURL: pairURL,
-                generated: generated,
                 deviceLabel: deviceLabel,
                 relayEndpoint: relayEndpoint,
                 orderCandidates: orderCandidates
             )
         case .relay:
+            let generated = try materialGenerator(deviceLabel)
             let validatedRelayEndpoint = try Self.validatedRelayEndpoint(relayEndpoint)
             return try await pairViaRelay(
                 pairURL: pairURL,
@@ -55,18 +61,17 @@ public struct PairClient: Sendable {
         relayEndpoint: RelayEndpoint,
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate] = { $0 }
     ) async throws -> StoredPairing {
-        let generated = try Self.generatePairingMaterial(deviceLabel: deviceLabel)
         switch pairURL.kind {
         case .direct:
             return try await pairDirect(
                 pairURL: pairURL,
-                generated: generated,
                 deviceLabel: deviceLabel,
                 relayEndpoint: relayEndpoint.url,
                 enrollmentEndpoint: relayEndpoint,
                 orderCandidates: orderCandidates
             )
         case .relay:
+            let generated = try materialGenerator(deviceLabel)
             return try await pairViaRelay(
                 pairURL: pairURL,
                 generated: generated,
@@ -78,7 +83,6 @@ public struct PairClient: Sendable {
 
     private func pairDirect(
         pairURL: PairURL,
-        generated: PairingMaterial,
         deviceLabel: String,
         relayEndpoint: URL,
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
@@ -86,7 +90,6 @@ public struct PairClient: Sendable {
         let enrollmentEndpoint = try? RelayEndpoint(relayEndpoint)
         return try await pairDirect(
             pairURL: pairURL,
-            generated: generated,
             deviceLabel: deviceLabel,
             relayEndpoint: relayEndpoint,
             enrollmentEndpoint: enrollmentEndpoint,
@@ -96,7 +99,6 @@ public struct PairClient: Sendable {
 
     private func pairDirect(
         pairURL: PairURL,
-        generated: PairingMaterial,
         deviceLabel: String,
         relayEndpoint: URL,
         enrollmentEndpoint: RelayEndpoint?,
@@ -106,21 +108,38 @@ public struct PairClient: Sendable {
             pairLog.notice("direct pair candidates rejected reason=\("non_local_candidate", privacy: .public) count=\(pairURL.candidates.count, privacy: .public)")
             throw PairError.directAddressNotLocal
         }
-        let ordered = orderCandidates(pairURL.candidates)
+        let canonical = Self.coalesceCandidates(pairURL.candidates)
+        let ordered = Self.validatedOrderedCandidates(
+            requested: orderCandidates(canonical),
+            canonical: canonical
+        )
+        let generated = try materialGenerator(deviceLabel)
+        let jsonBody = try Self.encodePairRequestBody(csrPEM: generated.csrPEM, deviceLabel: deviceLabel)
         var sawCAFingerprintMismatch = false
         var lastError: PairError?
 
         for (index, candidate) in ordered.enumerated() {
             let candidatePort = Int(candidate.port)
             pairLog.notice("dialing pair candidate index=\(index + 1, privacy: .public) count=\(ordered.count, privacy: .public) host=\(candidate.address, privacy: .public) port=\(candidatePort, privacy: .public)")
+            var attempt: (any LANPairAttempt)?
+            var requestCommitted = false
             do {
-                let lanResponse = try await postDirectPair(
-                    pairURL: pairURL,
+                let prepared = try await lanTransport.prepare(
                     host: candidate.address,
                     port: candidatePort,
-                    csrPEM: generated.csrPEM,
-                    deviceLabel: deviceLabel
+                    caFingerprintBytes: pairURL.caFingerprintBytes
                 )
+                attempt = prepared
+                let requestBytes = CertlessPairExchange.encodeRequest(
+                    host: candidate.address,
+                    path: "/app/network/pair?token=\(CertChain.hex(pairURL.nonceBytes))",
+                    jsonBody: jsonBody
+                )
+                requestCommitted = true
+                let response = try await prepared.send(requestBytes: requestBytes)
+                let lanResponse = try Self.decodePairResponse(status: response.status, body: response.body)
+                await attempt?.close()
+                attempt = nil
                 pairLog.notice("paired direct host=\(candidate.address, privacy: .public) port=\(candidatePort, privacy: .public)")
                 let relayEnrollment = await optionalRelayEnrollment(relayEndpoint: enrollmentEndpoint, lanResponse: lanResponse)
                 return try Self.makeStoredPairing(
@@ -130,16 +149,20 @@ public struct PairClient: Sendable {
                     relayEnrollment: relayEnrollment,
                     dialedEndpoint: LocalEndpoint(host: candidate.address, port: candidatePort, scope: "")
                 )
-            } catch let error as PairError {
-                switch error {
-                case .nonceExpired:
-                    throw error
+            } catch {
+                await attempt?.close()
+                let pairError = Self.mapDirectPairError(error)
+                if requestCommitted {
+                    throw pairError
+                }
+                try Task.checkCancellation()
+                switch pairError {
                 case .lanCAFingerprintMismatch:
                     sawCAFingerprintMismatch = true
-                    lastError = error
+                    lastError = pairError
                     pairLog.notice("pair candidate ca_mismatch host=\(candidate.address, privacy: .public) port=\(candidatePort, privacy: .public)")
                 default:
-                    lastError = error
+                    lastError = pairError
                 }
             }
         }
@@ -197,39 +220,67 @@ public struct PairClient: Sendable {
         )
     }
 
-    private func postDirectPair(
-        pairURL: PairURL,
-        host: String,
-        port: Int,
-        csrPEM: String,
-        deviceLabel: String
-    ) async throws -> LANPairResponse {
-        let jsonBody = try Self.encodePairRequestBody(csrPEM: csrPEM, deviceLabel: deviceLabel)
-        let response: (status: Int, body: Data)
-        do {
-            response = try await lanTransport.send(
-                host: host,
-                port: port,
-                caFingerprintBytes: pairURL.caFingerprintBytes,
-                requestBytes: CertlessPairExchange.encodeRequest(
-                    host: host,
-                    path: "/app/network/pair?token=\(CertChain.hex(pairURL.nonceBytes))",
-                    jsonBody: jsonBody
-                )
-            )
-        } catch InnerTLSError.caFingerprintMismatch {
-            throw PairError.lanCAFingerprintMismatch
-        } catch InnerTLSError.peerNotPinned {
-            throw PairError.lanCAFingerprintMismatch
-        } catch CertlessPairError.closedBeforeStatus {
-            throw PairError.lanClosedBeforeResponse
-        } catch CertlessPairError.malformedResponse {
-            throw PairError.lanResponseInvalid(status: nil)
-        } catch {
-            throw PairError.lanRequestFailed(underlying: error)
+    private static func coalesceCandidates(_ candidates: [PairCandidate]) -> [PairCandidate] {
+        var seen: Set<PairCandidate> = []
+        var result: [PairCandidate] = []
+        result.reserveCapacity(candidates.count)
+        for candidate in candidates where !seen.contains(candidate) {
+            seen.insert(candidate)
+            result.append(candidate)
         }
+        return result
+    }
 
-        return try Self.decodePairResponse(status: response.status, body: response.body)
+    private static func validatedOrderedCandidates(requested: [PairCandidate], canonical: [PairCandidate]) -> [PairCandidate] {
+        let canonicalCounts = candidateCounts(canonical)
+        let requestedCounts = candidateCounts(requested)
+        guard requestedCounts == canonicalCounts else {
+            let missingCount = canonicalCounts.reduce(0) { total, entry in
+                total + max(0, entry.value - (requestedCounts[entry.key] ?? 0))
+            }
+            let unknownCount = requestedCounts.reduce(0) { total, entry in
+                total + (canonicalCounts[entry.key] == nil ? entry.value : 0)
+            }
+            let duplicateCount = requestedCounts.reduce(0) { total, entry in
+                total + max(0, entry.value - 1)
+            }
+            pairLog.notice(
+                "direct pair candidate order rejected reason=\("invalid_permutation", privacy: .public) input_count=\(canonical.count, privacy: .public) output_count=\(requested.count, privacy: .public) missing_count=\(missingCount, privacy: .public) unknown_count=\(unknownCount, privacy: .public) duplicate_count=\(duplicateCount, privacy: .public) using=\("candidate_link_order", privacy: .public)"
+            )
+            return canonical
+        }
+        return requested
+    }
+
+    private static func candidateCounts(_ candidates: [PairCandidate]) -> [PairCandidate: Int] {
+        var counts: [PairCandidate: Int] = [:]
+        for candidate in candidates {
+            counts[candidate, default: 0] += 1
+        }
+        return counts
+    }
+
+    private static func mapDirectPairError(_ error: any Error) -> PairError {
+        if let pairError = error as? PairError {
+            return pairError
+        }
+        if let tlsError = error as? InnerTLSError {
+            switch tlsError {
+            case .caFingerprintMismatch, .peerNotPinned:
+                return .lanCAFingerprintMismatch
+            default:
+                return .lanRequestFailed(underlying: tlsError)
+            }
+        }
+        if let certlessError = error as? CertlessPairError {
+            switch certlessError {
+            case .closedBeforeStatus:
+                return .lanClosedBeforeResponse
+            case .malformedResponse:
+                return .lanResponseInvalid(status: nil)
+            }
+        }
+        return .lanRequestFailed(underlying: error)
     }
 
     private func postRelay(relayEndpoint: RelayEndpoint, lanResponse: LANPairResponse) async throws -> RelayEnrollResponse {

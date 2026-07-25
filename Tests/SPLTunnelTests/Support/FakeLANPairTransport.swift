@@ -14,6 +14,17 @@ enum FakeLANOutcome: Sendable {
     case error(any Error & Sendable)
 }
 
+enum FakeLANPrepareOutcome: Sendable {
+    case attempt(FakeLANOutcome)
+    case error(any Error & Sendable)
+}
+
+struct FakeLANPrepare: Sendable, Equatable {
+    let host: String
+    let port: Int
+    let caFingerprintBytes: [UInt8]
+}
+
 struct FakeLANRequest: Sendable, Equatable {
     let host: String
     let port: Int
@@ -21,39 +32,143 @@ struct FakeLANRequest: Sendable, Equatable {
     let requestBytes: Data
 }
 
+enum FakeLANEvent: Sendable, Equatable {
+    case prepare(host: String, port: Int)
+    case send(host: String, port: Int)
+    case close(host: String, port: Int)
+}
+
 actor FakeLANPairTransport: LANPairTransport {
-    private var outcomes: [FakeLANOutcome]
-    private(set) var requests: [FakeLANRequest] = []
+    private var prepareOutcomes: [FakeLANPrepareOutcome]
+    private let recorder = FakeLANRecorder()
 
     init(outcomes: [FakeLANOutcome]) {
-        self.outcomes = outcomes
+        self.prepareOutcomes = outcomes.map { .attempt($0) }
+    }
+
+    init(prepareOutcomes: [FakeLANPrepareOutcome]) {
+        self.prepareOutcomes = prepareOutcomes
+    }
+
+    var prepares: [FakeLANPrepare] {
+        get async {
+            await recorder.prepares
+        }
+    }
+
+    var requests: [FakeLANRequest] {
+        get async {
+            await recorder.requests
+        }
     }
 
     var requestCount: Int {
-        requests.count
+        get async {
+            await recorder.requestCount
+        }
     }
 
-    func send(
+    var closeCount: Int {
+        get async {
+            await recorder.closeCount
+        }
+    }
+
+    var events: [FakeLANEvent] {
+        get async {
+            await recorder.events
+        }
+    }
+
+    func prepare(
         host: String,
         port: Int,
-        caFingerprintBytes: [UInt8],
-        requestBytes: Data
-    ) async throws -> (status: Int, body: Data) {
-        requests.append(FakeLANRequest(
+        caFingerprintBytes: [UInt8]
+    ) async throws -> any LANPairAttempt {
+        let prepare = FakeLANPrepare(
             host: host,
             port: port,
-            caFingerprintBytes: caFingerprintBytes,
-            requestBytes: requestBytes
-        ))
-        guard !outcomes.isEmpty else {
+            caFingerprintBytes: caFingerprintBytes
+        )
+        await recorder.recordPrepare(prepare)
+        guard !prepareOutcomes.isEmpty else {
             throw FakeLANPairError.missingOutcome
         }
-        let outcome = outcomes.removeFirst()
+        let outcome = prepareOutcomes.removeFirst()
+        switch outcome {
+        case .error(let error):
+            throw error
+        case .attempt(let sendOutcome):
+            return FakeLANPairAttempt(prepare: prepare, outcome: sendOutcome, recorder: recorder)
+        }
+    }
+}
+
+private actor FakeLANPairAttempt: LANPairAttempt {
+    private let prepare: FakeLANPrepare
+    private let outcome: FakeLANOutcome
+    private let recorder: FakeLANRecorder
+    private var closed = false
+
+    init(prepare: FakeLANPrepare, outcome: FakeLANOutcome, recorder: FakeLANRecorder) {
+        self.prepare = prepare
+        self.outcome = outcome
+        self.recorder = recorder
+    }
+
+    func send(requestBytes: Data) async throws -> (status: Int, body: Data) {
+        await recorder.recordRequest(FakeLANRequest(
+            host: prepare.host,
+            port: prepare.port,
+            caFingerprintBytes: prepare.caFingerprintBytes,
+            requestBytes: requestBytes
+        ))
         switch outcome {
         case .response(let status, let body):
             return (status, body)
         case .error(let error):
             throw error
         }
+    }
+
+    func close() async {
+        guard !closed else {
+            return
+        }
+        closed = true
+        await recorder.recordClose(prepare)
+    }
+}
+
+private actor FakeLANRecorder {
+    private(set) var prepares: [FakeLANPrepare] = []
+    private(set) var requests: [FakeLANRequest] = []
+    private(set) var events: [FakeLANEvent] = []
+
+    var requestCount: Int {
+        requests.count
+    }
+
+    var closeCount: Int {
+        events.filter { event in
+            if case .close = event {
+                return true
+            }
+            return false
+        }.count
+    }
+
+    func recordPrepare(_ prepare: FakeLANPrepare) {
+        prepares.append(prepare)
+        events.append(.prepare(host: prepare.host, port: prepare.port))
+    }
+
+    func recordRequest(_ request: FakeLANRequest) {
+        requests.append(request)
+        events.append(.send(host: request.host, port: request.port))
+    }
+
+    func recordClose(_ prepare: FakeLANPrepare) {
+        events.append(.close(host: prepare.host, port: prepare.port))
     }
 }

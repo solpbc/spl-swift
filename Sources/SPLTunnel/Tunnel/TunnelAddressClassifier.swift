@@ -32,6 +32,13 @@ enum TunnelAddressClassifier {
         }
     }
 
+    static func isRFC6598IPv4Literal(_ host: String) -> Bool {
+        guard let octets = ipv4Octets(host) else {
+            return false
+        }
+        return octets[0] == 100 && 64...127 ~= octets[1]
+    }
+
     static func isIPv4LoopbackLiteral(_ host: String) -> Bool {
         guard let octets = ipv4Octets(host) else {
             return false
@@ -48,6 +55,7 @@ enum TunnelAddressClassifier {
 
     static func isLocalNetworkAddressLiteral(_ host: String) -> Bool {
         isRFC1918IPv4Literal(host) ||
+            isRFC6598IPv4Literal(host) ||
             isIPv4LoopbackLiteral(host) ||
             isIPv4LinkLocalLiteral(host) ||
             isIPv6ULA(host)

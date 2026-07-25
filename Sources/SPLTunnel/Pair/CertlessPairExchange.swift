@@ -4,12 +4,16 @@
 import Foundation
 
 protocol LANPairTransport: Sendable {
-    func send(
+    func prepare(
         host: String,
         port: Int,
-        caFingerprintBytes: [UInt8],
-        requestBytes: Data
-    ) async throws -> (status: Int, body: Data)
+        caFingerprintBytes: [UInt8]
+    ) async throws -> any LANPairAttempt
+}
+
+protocol LANPairAttempt: Sendable {
+    func send(requestBytes: Data) async throws -> (status: Int, body: Data)
+    func close() async
 }
 
 enum CertlessPairError: Error, Equatable, Sendable {
@@ -20,12 +24,11 @@ enum CertlessPairError: Error, Equatable, Sendable {
 struct CertlessPairExchange: LANPairTransport {
     init() {}
 
-    func send(
+    func prepare(
         host: String,
         port: Int,
-        caFingerprintBytes: [UInt8],
-        requestBytes: Data
-    ) async throws -> (status: Int, body: Data) {
+        caFingerprintBytes: [UInt8]
+    ) async throws -> any LANPairAttempt {
         let tls = try await InnerTLS.connectLANCertless(host: host, port: port, caFingerprintBytes: caFingerprintBytes)
         let mux = Multiplexer(sink: { data in
             try await tls.send(data)
@@ -43,16 +46,9 @@ struct CertlessPairExchange: LANPairTransport {
 
         do {
             let stream = try await mux.openStream()
-            try await stream.write(requestBytes)
-            let response = try await Self.readResponse(from: stream)
-            pump.cancel()
-            await tls.close()
-            await mux.tearDown(reason: .normalShutdown)
-            return response
+            return CertlessPairAttempt(tls: tls, mux: mux, pump: pump, stream: stream)
         } catch {
-            pump.cancel()
-            await tls.close()
-            await mux.tearDown(reason: .transportFailure)
+            await CertlessPairAttempt.cleanup(tls: tls, mux: mux, pump: pump, reason: .transportFailure)
             throw error
         }
     }
@@ -100,7 +96,7 @@ struct CertlessPairExchange: LANPairTransport {
         return (status: status, body: Data(data[bodyStart..<bodyEnd]))
     }
 
-    private static func readResponse(from stream: MuxStream) async throws -> (status: Int, body: Data) {
+    fileprivate static func readResponse(from stream: MuxStream) async throws -> (status: Int, body: Data) {
         var buffer = Data()
         do {
             for try await chunk in stream.inbound {
@@ -161,5 +157,43 @@ struct CertlessPairExchange: LANPairTransport {
             throw CertlessPairError.malformedResponse
         }
         return contentLength
+    }
+}
+
+private actor CertlessPairAttempt: LANPairAttempt {
+    private let tls: InnerTLS
+    private let mux: Multiplexer
+    private let pump: Task<Void, Never>
+    private let stream: MuxStream
+    private var closed = false
+
+    init(tls: InnerTLS, mux: Multiplexer, pump: Task<Void, Never>, stream: MuxStream) {
+        self.tls = tls
+        self.mux = mux
+        self.pump = pump
+        self.stream = stream
+    }
+
+    func send(requestBytes: Data) async throws -> (status: Int, body: Data) {
+        guard !closed else {
+            throw InnerTLSError.closed
+        }
+        try await stream.write(requestBytes)
+        return try await CertlessPairExchange.readResponse(from: stream)
+    }
+
+    func close() async {
+        guard !closed else {
+            return
+        }
+        closed = true
+        await Self.cleanup(tls: tls, mux: mux, pump: pump, reason: .normalShutdown)
+    }
+
+    static func cleanup(tls: InnerTLS, mux: Multiplexer, pump: Task<Void, Never>, reason: TearDownReason) async {
+        pump.cancel()
+        await mux.tearDown(reason: reason)
+        await tls.close()
+        await pump.value
     }
 }

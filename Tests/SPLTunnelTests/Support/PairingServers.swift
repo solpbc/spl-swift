@@ -35,6 +35,8 @@ actor PairingMuxServer {
     private var connections: [NWConnection] = []
     private var tasks: [Task<Void, Never>] = []
     private var boundPort: NWEndpoint.Port?
+    private var closedConnectionCount = 0
+    private var closeWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private(set) var lastRequest: PairingHTTPServerRequest?
     private(set) var requestCount = 0
 
@@ -71,6 +73,15 @@ actor PairingMuxServer {
 
     var port: Int {
         Int(boundPort?.rawValue ?? 0)
+    }
+
+    func waitForClosedConnectionCount(_ count: Int) async {
+        guard closedConnectionCount < count else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            closeWaiters.append((count: count, continuation: continuation))
+        }
     }
 
     func start() async throws {
@@ -110,6 +121,7 @@ actor PairingMuxServer {
 
         tasks.append(Task {
             await Self.pump(connection: connection, into: mux)
+            self.recordConnectionClosed()
         })
         tasks.append(Task {
             for await stream in mux.incomingStreams {
@@ -131,6 +143,15 @@ actor PairingMuxServer {
             let failure = PairingHTTPServerResponse(status: 500, body: Data())
             try? await stream.write(Self.encode(failure))
             try? await stream.close()
+        }
+    }
+
+    private func recordConnectionClosed() {
+        closedConnectionCount += 1
+        let ready = closeWaiters.filter { closedConnectionCount >= $0.count }
+        closeWaiters.removeAll { closedConnectionCount >= $0.count }
+        for waiter in ready {
+            waiter.continuation.resume()
         }
     }
 

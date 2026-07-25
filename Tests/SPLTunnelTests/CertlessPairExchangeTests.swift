@@ -30,12 +30,14 @@ struct CertlessPairExchangeTests {
         let port = await server.port
 
         let exchange = CertlessPairExchange()
-        let response = try await exchange.send(
+        let attempt = try await exchange.prepare(
             host: "127.0.0.1",
             port: port,
-            caFingerprintBytes: try Self.caCertificateFingerprintPrefix(bundle: fixture),
-            requestBytes: request
+            caFingerprintBytes: try Self.caCertificateFingerprintPrefix(bundle: fixture)
         )
+        let response = try await attempt.send(requestBytes: request)
+        await attempt.close()
+        await server.waitForClosedConnectionCount(1)
         let observed = try #require(await server.lastRequest)
         await server.stop()
 

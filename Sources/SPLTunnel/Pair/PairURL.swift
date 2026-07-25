@@ -117,7 +117,7 @@ public struct PairURL: Sendable, Equatable, Hashable {
             throw PairURLError.unsupportedAddrType(bytes[1])
         }
         let count = Int(bytes[2])
-        guard count != 0 else {
+        guard 1...4 ~= count else {
             throw PairURLError.invalidLength(bytes.count)
         }
         guard bytes.count == 5 + 4 * count + 32 else {
