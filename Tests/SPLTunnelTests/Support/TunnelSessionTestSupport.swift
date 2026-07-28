@@ -111,6 +111,40 @@ actor FakeTunnelTLS: TunnelTLSIO {
     }
 }
 
+actor PongingTunnelTLS: TunnelTLSIO {
+    nonisolated var inbound: AsyncThrowingStream<Data, Error> {
+        inboundStream
+    }
+
+    private let inboundStream: AsyncThrowingStream<Data, Error>
+    private let inboundContinuation: AsyncThrowingStream<Data, Error>.Continuation
+    private var decoder = FrameDecoder()
+    private(set) var applicationFrameCount = 0
+    private(set) var closeCount = 0
+
+    init() {
+        var continuation: AsyncThrowingStream<Data, Error>.Continuation!
+        self.inboundStream = AsyncThrowingStream<Data, Error> { continuation = $0 }
+        self.inboundContinuation = continuation
+    }
+
+    func send(_ data: Data) async throws {
+        decoder.feed(data)
+        while let frame = try decoder.next() {
+            if frame.streamID == 0, frame.flags == FrameFlags.ping.rawValue {
+                inboundContinuation.yield(try encodeFrame(buildPong(nonce: try parseControlNonce(from: frame.payload))))
+            } else {
+                applicationFrameCount += 1
+            }
+        }
+    }
+
+    func close() async {
+        closeCount += 1
+        inboundContinuation.finish()
+    }
+}
+
 func tunnelSessionAllowingPlaintextRelay(
     pairing: StoredPairing,
     clientInfo: SPLClientInfo,
@@ -254,7 +288,6 @@ func fastKeepalivePolicy(runsOnRelayPath: Bool) -> SessionPolicy {
     SessionPolicy(
         keepalive: KeepalivePolicy(
             interval: .milliseconds(20),
-            idleThreshold: .milliseconds(20),
             missedLimit: 1,
             runsOnRelayPath: runsOnRelayPath
         )

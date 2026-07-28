@@ -158,7 +158,7 @@ struct TunnelSupervisorTests {
         #expect(await waitUntil("healable failure connecting state") {
             await states.count(.connecting(candidates: [direct.connectedVia])) > connectingCount
         })
-        try await sleeper.waitForSleepCount(1)
+        await sleeper.waitForSleepCount(excluding: .seconds(60), target: 1)
         #expect(await factory.count() == 1)
         #expect(await supervisor.reconnectStatus == ReconnectStatus(
             reason: .inboundClosed(fault: nil),
@@ -167,11 +167,12 @@ struct TunnelSupervisorTests {
             terminalPause: false
         ))
 
-        await sleeper.releaseSleeps()
+        await sleeper.releaseFirstSleep(duration: .milliseconds(1))
         #expect(await waitUntil("healable failure retry connects") {
             await factory.count() == 2
         })
         await supervisor.disconnect()
+        await sleeper.releaseSleeps()
         await states.stop()
     }
 
@@ -257,12 +258,13 @@ struct TunnelSupervisorTests {
 
     @Test func requestReconnectCoalescesConnectedRequestsThroughExistingLoop() async throws {
         let direct = directEndpoint("10.0.0.5")
+        let sleeper = SleepProbe()
         let release = TestSignal()
         let factory = FakeGenerationFactory(scripts: [
             .success(direct),
             .success(direct, gate: release),
         ])
-        let supervisor = fakeSupervisor(factory: factory)
+        let supervisor = fakeSupervisor(factory: factory, sleeper: sleeper.sleep)
 
         _ = try await supervisor.connect(endpoints: [direct])
         await withTaskGroup(of: Void.self) { group in
@@ -273,19 +275,22 @@ struct TunnelSupervisorTests {
             }
         }
 
-        #expect(await waitUntil("coalesced manual reconnect") {
-            await factory.count() == 2
-        })
+        await sleeper.waitForSleepCount(excluding: .seconds(60), target: 1)
+        #expect(await factory.count() == 1)
         #expect(await supervisor.reconnectStatus == ReconnectStatus(
             reason: nil,
             attempt: 1,
-            retryAfter: nil,
+            retryAfter: .milliseconds(1),
             terminalPause: false
         ))
         #expect(await conditionObserved(timeout: .milliseconds(100)) {
-            await factory.count() > 2
+            await sleeper.observedDurations(excluding: .seconds(60)).count > 1
         } == false)
 
+        await sleeper.releaseFirstSleep(duration: .milliseconds(1))
+        #expect(await waitUntil("coalesced manual reconnect") {
+            await factory.count() == 2
+        })
         await release.signal()
         #expect(await waitUntil("manual reconnect completed") {
             await supervisor.connectionMode == .plDirect
@@ -293,6 +298,174 @@ struct TunnelSupervisorTests {
         #expect(await factory.count() == 2)
 
         await supervisor.disconnect()
+        await sleeper.releaseSleeps()
+    }
+
+    @Test func explicitConnectBypassesBackoffFloor() async throws {
+        let direct = directEndpoint("10.0.0.5")
+        let release = TestSignal()
+        let sleeper = SleepProbe()
+        let factory = FakeGenerationFactory(scripts: [
+            .success(direct, gate: release),
+        ])
+        let supervisor = fakeSupervisor(factory: factory, sleeper: sleeper.sleep)
+        let task = Task {
+            try await supervisor.connect(endpoints: [direct])
+        }
+
+        #expect(await waitUntil("user initiated generation starts immediately") {
+            await factory.count() == 1
+        })
+        #expect(await sleeper.observedDurations(excluding: .seconds(60)).isEmpty)
+        await release.signal()
+        #expect(try await task.value == direct.connectedVia)
+
+        await supervisor.disconnect()
+        await sleeper.releaseSleeps()
+    }
+
+    @Test func generationFailureDuringConnectedEndpointWindowDoesNotReturnSuccess() async throws {
+        let direct = directEndpoint("10.0.0.5")
+        let endpointLookupEntered = TestSignal()
+        let releaseEndpointLookup = TestSignal()
+        let sleeper = SleepProbe()
+        let factory = FakeGenerationFactory(scripts: [
+            .success(
+                direct,
+                connectedEndpointSignal: endpointLookupEntered,
+                connectedEndpointGate: releaseEndpointLookup
+            ),
+            .success(direct),
+        ])
+        let supervisor = fakeSupervisor(factory: factory, sleeper: sleeper.sleep)
+        let task = Task {
+            try await supervisor.connect(endpoints: [direct])
+        }
+
+        try await endpointLookupEntered.waitWithTimeout()
+        let first = try await factory.generation(at: 0)
+        await first.fail(.inboundClosed(fault: nil))
+        await releaseEndpointLookup.signal()
+
+        await sleeper.waitForSleepCount(excluding: .seconds(60), target: 1)
+        #expect(await factory.count() == 1)
+        await sleeper.releaseFirstSleep(duration: .milliseconds(1))
+        #expect(await waitUntil("replacement after post-await failure") {
+            await factory.count() == 2
+        })
+        #expect(try await task.value == direct.connectedVia)
+
+        await supervisor.disconnect()
+        await sleeper.releaseSleeps()
+    }
+
+    @Test func shortLivedGenerationsGrowReconnectDelayMonotonically() async throws {
+        let direct = directEndpoint("10.0.0.5")
+        let sleeper = SleepProbe()
+        let delays = (1...10).map { Duration.milliseconds($0) }
+        let factory = FakeGenerationFactory(scripts: Array(
+            repeating: .success(direct),
+            count: 11
+        ))
+        let supervisor = fakeSupervisor(
+            factory: factory,
+            reconnectBackoff: ReconnectBackoff(schedule: .table(delays), random: { _ in 1.0 }),
+            sleeper: sleeper.sleep
+        )
+
+        _ = try await supervisor.connect(endpoints: [direct])
+        for index in 0..<10 {
+            let generation = try await factory.generation(at: index)
+            await generation.fail(.inboundClosed(fault: nil))
+            await sleeper.waitForSleepCount(excluding: .seconds(60), target: index + 1)
+            await sleeper.releaseFirstSleep(duration: delays[index])
+            #expect(await waitUntil("short-lived replacement \(index)") {
+                await factory.count() == index + 2
+            })
+        }
+
+        #expect(await sleeper.observedDurations(excluding: .seconds(60)) == delays)
+        await supervisor.disconnect()
+        await sleeper.releaseSleeps()
+    }
+
+    @Test func generationSurvivingStabilityIntervalResetsReconnectDelay() async throws {
+        let direct = directEndpoint("10.0.0.5")
+        let sleeper = SleepProbe()
+        let factory = FakeGenerationFactory(scripts: Array(
+            repeating: .success(direct),
+            count: 3
+        ))
+        let supervisor = fakeSupervisor(
+            factory: factory,
+            reconnectBackoff: ReconnectBackoff(schedule: .table([.milliseconds(1), .milliseconds(2)]), random: { _ in 1.0 }),
+            sleeper: sleeper.sleep
+        )
+
+        _ = try await supervisor.connect(endpoints: [direct])
+        let first = try await factory.generation(at: 0)
+        await first.fail(.inboundClosed(fault: nil))
+        await sleeper.waitForSleepCount(excluding: .seconds(60), target: 1)
+        await sleeper.releaseFirstSleep(duration: .milliseconds(1))
+        #expect(await waitUntil("second generation connected") {
+            await factory.count() == 2
+        })
+        #expect(await waitUntil("stability timers armed") {
+            await sleeper.observedDurations().filter { $0 == .seconds(60) }.count >= 2
+        })
+        await sleeper.releaseAllSleeps(duration: .seconds(60))
+        for _ in 0..<3 {
+            await Task.yield()
+        }
+
+        let second = try await factory.generation(at: 1)
+        await second.fail(.inboundClosed(fault: nil))
+        await sleeper.waitForSleepCount(excluding: .seconds(60), target: 2)
+
+        #expect(await sleeper.observedDurations(excluding: .seconds(60)) == [
+            .milliseconds(1),
+            .milliseconds(1),
+        ])
+        await supervisor.disconnect()
+        await sleeper.releaseSleeps()
+    }
+
+    @Test func staleStabilityTokenCannotResetReplacementGeneration() async throws {
+        let direct = directEndpoint("10.0.0.5")
+        let sleeper = SleepProbe()
+        let factory = FakeGenerationFactory(scripts: Array(
+            repeating: .success(direct),
+            count: 3
+        ))
+        let supervisor = fakeSupervisor(
+            factory: factory,
+            reconnectBackoff: ReconnectBackoff(schedule: .table([.milliseconds(1), .milliseconds(2)]), random: { _ in 1.0 }),
+            sleeper: sleeper.sleep
+        )
+
+        _ = try await supervisor.connect(endpoints: [direct])
+        let first = try await factory.generation(at: 0)
+        await first.fail(.inboundClosed(fault: nil))
+        await sleeper.waitForSleepCount(excluding: .seconds(60), target: 1)
+        await sleeper.releaseFirstSleep(duration: .milliseconds(1))
+        #expect(await waitUntil("replacement generation connected") {
+            await factory.count() == 2
+        })
+        #expect(await waitUntil("replacement stability timer armed") {
+            await sleeper.observedDurations().filter { $0 == .seconds(60) }.count >= 2
+        })
+        await sleeper.releaseFirstSleep(duration: .seconds(60))
+
+        let second = try await factory.generation(at: 1)
+        await second.fail(.inboundClosed(fault: nil))
+        await sleeper.waitForSleepCount(excluding: .seconds(60), target: 2)
+
+        #expect(await sleeper.observedDurations(excluding: .seconds(60)) == [
+            .milliseconds(1),
+            .milliseconds(2),
+        ])
+        await supervisor.disconnect()
+        await sleeper.releaseSleeps()
     }
 
     @Test func replacementGenerationFailureDuringRedriveQueuesOneMoreGeneration() async throws {
@@ -421,12 +594,13 @@ struct TunnelSupervisorTests {
 
 private func fakeSupervisor(
     factory: FakeGenerationFactory,
+    reconnectBackoff: ReconnectBackoff = ReconnectBackoff(schedule: .table([.milliseconds(1)]), random: { _ in 1.0 }),
     sleeper: @escaping @Sendable (Duration) async throws -> Void = { _ in }
 ) -> TunnelSupervisor {
     TunnelSupervisor(
         pairing: fakePairing(),
         clientInfo: supervisorClientInfo,
-        reconnectBackoff: ReconnectBackoff(schedule: .table([.milliseconds(1)]), random: { _ in 1.0 }),
+        reconnectBackoff: reconnectBackoff,
         sleeper: sleeper,
         makeSession: { _, _, _ in
             await factory.makeSession()
@@ -494,6 +668,8 @@ private struct FakeGenerationScript: Sendable {
     let gate: TestSignal?
     let connectedSignal: TestSignal?
     let returnGate: TestSignal?
+    let connectedEndpointSignal: TestSignal?
+    let connectedEndpointGate: TestSignal?
     let openStreamFailure: SessionError?
 
     static func success(
@@ -501,6 +677,8 @@ private struct FakeGenerationScript: Sendable {
         gate: TestSignal? = nil,
         connectedSignal: TestSignal? = nil,
         returnGate: TestSignal? = nil,
+        connectedEndpointSignal: TestSignal? = nil,
+        connectedEndpointGate: TestSignal? = nil,
         openStreamFailure: SessionError? = nil
     ) -> FakeGenerationScript {
         FakeGenerationScript(
@@ -508,6 +686,8 @@ private struct FakeGenerationScript: Sendable {
             gate: gate,
             connectedSignal: connectedSignal,
             returnGate: returnGate,
+            connectedEndpointSignal: connectedEndpointSignal,
+            connectedEndpointGate: connectedEndpointGate,
             openStreamFailure: openStreamFailure
         )
     }
@@ -518,6 +698,8 @@ private struct FakeGenerationScript: Sendable {
             gate: nil,
             connectedSignal: nil,
             returnGate: nil,
+            connectedEndpointSignal: nil,
+            connectedEndpointGate: nil,
             openStreamFailure: nil
         )
     }
@@ -622,8 +804,10 @@ private actor FakeGeneration: TunnelGeneration {
         0
     }
 
-    func connectedEndpoint() -> TransportEndpoint? {
-        endpoint
+    func connectedEndpoint() async -> TransportEndpoint? {
+        await script.connectedEndpointSignal?.signal()
+        await script.connectedEndpointGate?.wait()
+        return endpoint
     }
 
     func fail(_ error: SessionError) {
@@ -648,13 +832,17 @@ private actor FakeGeneration: TunnelGeneration {
 
 private actor SleepProbe {
     private var count = 0
+    private var durations: [Duration] = []
     private var countWaiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
-    private let release = TestSignal()
+    private var sleepContinuations: [(duration: Duration, continuation: CheckedContinuation<Void, Never>)] = []
 
-    func sleep(_: Duration) async throws {
+    func sleep(_ duration: Duration) async throws {
         count += 1
+        durations.append(duration)
         resumeSatisfiedWaiters()
-        await release.wait()
+        await withCheckedContinuation { continuation in
+            sleepContinuations.append((duration: duration, continuation: continuation))
+        }
     }
 
     func waitForSleepCount(_ target: Int) async throws {
@@ -666,8 +854,42 @@ private actor SleepProbe {
         }
     }
 
+    func observedDurations() -> [Duration] {
+        durations
+    }
+
+    func observedDurations(excluding excluded: Duration) -> [Duration] {
+        durations.filter { $0 != excluded }
+    }
+
+    func waitForSleepCount(excluding excluded: Duration, target: Int) async {
+        await waitUntil("sleep count excluding \(excluded)") {
+            await self.observedDurations(excluding: excluded).count >= target
+        }
+    }
+
+    func releaseFirstSleep(duration: Duration) {
+        guard let index = sleepContinuations.firstIndex(where: { $0.duration == duration }) else {
+            return
+        }
+        let continuation = sleepContinuations.remove(at: index).continuation
+        continuation.resume()
+    }
+
+    func releaseAllSleeps(duration: Duration) {
+        let matches = sleepContinuations.filter { $0.duration == duration }
+        sleepContinuations.removeAll { $0.duration == duration }
+        for match in matches {
+            match.continuation.resume()
+        }
+    }
+
     func releaseSleeps() async {
-        await release.signal()
+        let continuations = sleepContinuations
+        sleepContinuations.removeAll()
+        for continuation in continuations {
+            continuation.continuation.resume()
+        }
     }
 
     private func resumeSatisfiedWaiters() {

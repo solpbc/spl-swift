@@ -117,6 +117,10 @@ struct TunnelSessionTests {
             .lan(host: "127.0.0.1", port: port, scope: "local"),
         ])
         #expect(await waitForFailure(.directKeepaliveMissed, in: states, timeout: .seconds(2)))
+        #expect(await states.count(.failed(.directKeepaliveMissed)) == 1)
+        await expectSessionError(.notConnected) {
+            _ = try await session.openStream()
+        }
         await session.disconnect()
         await states.stop()
         await server.stop()
@@ -150,6 +154,93 @@ struct TunnelSessionTests {
         await states.stop()
         await relay.stop()
         await tlsServer.stop()
+    }
+
+    @Test func continuousValidPongsKeepTransportConnectedWithoutApplicationRequests() async throws {
+        // Keepalive proves transport liveness, not application success.
+        let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: 443, scope: "local")
+        let tls = PongingTunnelTLS()
+        let gate = KeepaliveTickGate()
+        let connector = ConnectorProbe { _, _, _ in tls }
+        let session = TunnelSession(
+            pairing: fakePairing(),
+            policy: SessionPolicy(keepalive: KeepalivePolicy(
+                interval: .milliseconds(500),
+                missedLimit: 3,
+                runsOnRelayPath: false
+            )),
+            tlsConnector: connector.connector,
+            makeMultiplexer: { tls in
+                Multiplexer(
+                    sink: { data in try await tls.send(data) },
+                    sleeper: { duration in try await gate.sleep(duration) }
+                )
+            }
+        )
+        let states = await stateProbe(for: session)
+
+        _ = try await session.connect(endpoints: [endpoint])
+        for tick in 1...6 {
+            await gate.waitForObservedTick(count: tick)
+            await gate.releaseOne()
+            await gate.waitForObservedTick(count: tick + 1)
+        }
+
+        #expect(await states.contains(.connected(via: endpoint.connectedVia)))
+        #expect(await states.containsFailure { _ in true } == false)
+        #expect(await tls.applicationFrameCount == 0)
+        await session.disconnect()
+        await states.stop()
+        await gate.cancelAll()
+    }
+
+    @Test func keepaliveLossDuringInstallThrowsAndTearsDownWithoutDurableConnected() async throws {
+        let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: 443, scope: "local")
+        let tls = FakeTunnelTLS()
+        let gate = KeepaliveTickGate()
+        let latched = TestSignal()
+        let connector = ConnectorProbe { _, _, _ in tls }
+        let session = TunnelSession(
+            pairing: fakePairing(),
+            policy: SessionPolicy(keepalive: KeepalivePolicy(
+                interval: .milliseconds(500),
+                missedLimit: 1,
+                runsOnRelayPath: false
+            )),
+            tlsConnector: connector.connector,
+            makeMultiplexer: { _ in
+                Multiplexer(
+                    sink: { _ in },
+                    sleeper: { duration in try await gate.sleep(duration) }
+                )
+            },
+            afterInstallConnected: {
+                await gate.waitForObservedTick(count: 1)
+                await gate.releaseOne()
+                await gate.waitForObservedTick(count: 2)
+                await gate.releaseOne()
+                do {
+                    try await latched.waitWithTimeout()
+                } catch {
+                    Issue.record("keepalive loss did not latch before publishConnected")
+                }
+            },
+            onPendingInstallFailure: {
+                await latched.signal()
+            }
+        )
+        let states = await stateProbe(for: session)
+
+        await expectSessionError(.directKeepaliveMissed) {
+            try await session.connect(endpoints: [endpoint])
+        }
+
+        #expect(await states.count(.connected(via: endpoint.connectedVia)) == 0)
+        #expect(await states.count(.failed(.directKeepaliveMissed)) == 1)
+        #expect(await tls.closeCount == 1)
+        await session.disconnect()
+        await states.stop()
+        await gate.cancelAll()
     }
 
     @Test func relayKeepaliveDropControlPublishesRelayKeepaliveMissedWhenOptedIn() async throws {
@@ -285,6 +376,56 @@ struct TunnelSessionTests {
         _ = try await session.connect(endpoints: [endpoint])
         await tls.finishInbound()
         #expect(await waitForFailure(.inboundClosed(fault: nil), in: states))
+        #expect(await connector.invocationCount == 1)
+        await session.disconnect()
+        await states.stop()
+    }
+
+    @Test func inboundEndDuringDirectInstallThrowsInboundClosedWithoutDurableConnected() async throws {
+        let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: 443, scope: "local")
+        let tls = FakeTunnelTLS()
+        let connector = ConnectorProbe { _, _, _ in
+            await tls.finishInbound()
+            return tls
+        }
+        let session = TunnelSession(
+            pairing: fakePairing(),
+            policy: fastKeepalivePolicy(runsOnRelayPath: false),
+            tlsConnector: connector.connector
+        )
+        let states = await stateProbe(for: session)
+
+        await expectSessionError(.inboundClosed(fault: nil)) {
+            try await session.connect(endpoints: [endpoint])
+        }
+
+        #expect(await states.count(.connected(via: endpoint.connectedVia)) == 0)
+        #expect(await waitForFailure(.inboundClosed(fault: nil), in: states))
+        #expect(await connector.invocationCount == 1)
+        await session.disconnect()
+        await states.stop()
+    }
+
+    @Test func inboundFaultDuringDirectInstallThrowsInboundClosedFaultWithoutDurableConnected() async throws {
+        let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: 443, scope: "local")
+        let tls = FakeTunnelTLS()
+        let connector = ConnectorProbe { _, _, _ in
+            await tls.finishInbound(throwing: TunnelSessionTestError.fakePumpFault)
+            return tls
+        }
+        let session = TunnelSession(
+            pairing: fakePairing(),
+            policy: fastKeepalivePolicy(runsOnRelayPath: false),
+            tlsConnector: connector.connector
+        )
+        let states = await stateProbe(for: session)
+
+        await expectSessionError(.inboundClosed(fault: "fakePumpFault")) {
+            try await session.connect(endpoints: [endpoint])
+        }
+
+        #expect(await states.count(.connected(via: endpoint.connectedVia)) == 0)
+        #expect(await waitForFailure(.inboundClosed(fault: "fakePumpFault"), in: states))
         #expect(await connector.invocationCount == 1)
         await session.disconnect()
         await states.stop()

@@ -34,6 +34,11 @@ private enum PingNonceError: Error, Sendable {
     case generationFailed(OSStatus)
 }
 
+private struct OutstandingPing: Sendable {
+    let nonce: Data
+    let issuedTick: UInt64
+}
+
 public actor Multiplexer {
     public nonisolated var keepaliveLost: AsyncStream<Void> {
         keepaliveLostStream
@@ -43,7 +48,6 @@ public actor Multiplexer {
 
     private let sink: @Sendable (Data) async throws -> Void
     private let sleeper: @Sendable (Duration) async throws -> Void
-    private let now: @Sendable () -> ContinuousClock.Instant
     private let role: Role
     private let incomingContinuation: AsyncStream<MuxStream>.Continuation
     private let keepaliveLostStream: AsyncStream<Void>
@@ -53,32 +57,28 @@ public actor Multiplexer {
     private var tornDown = false
     private var decoder = FrameDecoder()
     private var keepaliveTask: Task<Void, Never>?
-    private var pendingPingNonce: Data?
-    private var missedPings = 0
-    private var lastInboundActivity: ContinuousClock.Instant?
+    private var outstandingPings: [OutstandingPing] = []
+    private var keepaliveTickIndex: UInt64 = 0
     private var inboundActivityCounter: UInt64 = 0
 
     public init(sink: @escaping @Sendable (Data) async throws -> Void, role: Role = .dialer) {
         self.init(
             sink: sink,
             role: role,
-            sleeper: { interval in try await Task.sleep(for: interval) },
-            now: { ContinuousClock.now }
+            sleeper: { interval in try await Task.sleep(for: interval) }
         )
     }
 
     internal init(
         sink: @escaping @Sendable (Data) async throws -> Void,
         role: Role = .dialer,
-        sleeper: @escaping @Sendable (Duration) async throws -> Void,
-        now: @escaping @Sendable () -> ContinuousClock.Instant
+        sleeper: @escaping @Sendable (Duration) async throws -> Void
     ) {
         let incoming = AsyncStream<MuxStream>.makeStream()
         let keepalive = AsyncStream<Void>.makeStream()
         self.sink = sink
         self.role = role
         self.sleeper = sleeper
-        self.now = now
         self.incomingStreams = incoming.stream
         self.incomingContinuation = incoming.continuation
         self.keepaliveLostStream = keepalive.stream
@@ -127,16 +127,16 @@ public actor Multiplexer {
 
     public func startKeepalive(
         interval: Duration = .milliseconds(500),
-        idleThreshold: Duration = .seconds(2),
         missedLimit: Int = 3
     ) {
         guard keepaliveTask == nil else {
             return
         }
 
-        lastInboundActivity = now()
+        outstandingPings.removeAll(keepingCapacity: true)
+        keepaliveTickIndex = 0
         keepaliveTask = Task {
-            await runKeepalive(interval: interval, idleThreshold: idleThreshold, missedLimit: missedLimit)
+            await runKeepalive(interval: interval, missedLimit: missedLimit)
         }
     }
 
@@ -149,6 +149,7 @@ public actor Multiplexer {
         keepaliveTask?.cancel()
         keepaliveTask = nil
         keepaliveLostContinuation.finish()
+        outstandingPings.removeAll(keepingCapacity: true)
         incomingContinuation.finish()
         let openStreams = streams.values
         streams.removeAll()
@@ -170,7 +171,6 @@ public actor Multiplexer {
     }
 
     private func dispatch(_ frame: Frame) async throws {
-        lastInboundActivity = now()
         inboundActivityCounter &+= 1
 
         let isOpen = frame.flags & FrameFlags.open.rawValue != 0
@@ -336,9 +336,8 @@ public actor Multiplexer {
             try await sink(try encodeFrame(buildPong(nonce: nonce)))
         case (false, true):
             let nonce = try parseControlNonce(from: frame.payload)
-            if nonce == pendingPingNonce {
-                pendingPingNonce = nil
-                missedPings = 0
+            if let matched = outstandingPings.first(where: { $0.nonce == nonce }) {
+                outstandingPings.removeAll { $0.issuedTick <= matched.issuedTick }
             }
         default:
             throw FramingError.unknownControlFrame
@@ -372,15 +371,16 @@ public actor Multiplexer {
         streams.removeValue(forKey: id)
     }
 
-    private func runKeepalive(interval: Duration, idleThreshold: Duration, missedLimit: Int) async {
+    private func runKeepalive(interval: Duration, missedLimit: Int) async {
         while !Task.isCancelled {
             do {
                 try await sleeper(interval)
+                let tick = keepaliveTickIndex
                 try await performKeepaliveTick(
-                    now: now(),
-                    idleThreshold: idleThreshold,
+                    currentTick: tick,
                     missedLimit: missedLimit
                 )
+                keepaliveTickIndex = tick &+ 1
             } catch {
                 guard !Task.isCancelled, !(error is CancellationError) else {
                     return
@@ -395,39 +395,28 @@ public actor Multiplexer {
     }
 
     private func performKeepaliveTick(
-        now: ContinuousClock.Instant,
-        idleThreshold: Duration,
+        currentTick: UInt64,
         missedLimit: Int
     ) async throws {
         guard !tornDown else {
             throw MuxError.transportClosed
         }
 
-        // LAN-direct mux is currently dialer-initiated only: the phone OPENs streams and
-        // PUSHes data, and every inbound frame is a response to outbound work. Treat any
-        // inbound frame as proof the outbound path is healthy (an outbound black-hole also
-        // stalls inbound, so we still escalate). Revisit this gate if server-push/download
-        // streams are ever added.
-        if let last = lastInboundActivity, last.duration(to: now) < idleThreshold {
-            missedPings = 0
-            pendingPingNonce = nil
+        let effectiveMissedLimit = max(missedLimit, 1)
+        let missedLimitTicks = UInt64(effectiveMissedLimit)
+        if currentTick >= missedLimitTicks,
+           let oldest = outstandingPings.first,
+           oldest.issuedTick <= currentTick - missedLimitTicks {
+            // Missed PONGs are session policy: signal and let the session decide whether to tear down.
+            logger.notice("mux keepalive lost missed_pings=\(effectiveMissedLimit, privacy: .public)")
+            keepaliveLostContinuation.yield(())
+            keepaliveTask?.cancel()
+            keepaliveTask = nil
             return
         }
 
-        if pendingPingNonce != nil {
-            missedPings += 1
-            if missedPings >= missedLimit {
-                // Missed PONGs are session policy: signal and let the session decide whether to tear down.
-                logger.notice("mux keepalive lost missed_pings=\(self.missedPings, privacy: .public)")
-                keepaliveLostContinuation.yield(())
-                keepaliveTask?.cancel()
-                keepaliveTask = nil
-                return
-            }
-        }
-
         let nonce = try randomNonce()
-        pendingPingNonce = nonce
+        outstandingPings.append(OutstandingPing(nonce: nonce, issuedTick: currentTick))
         try await sink(try encodeFrame(buildPing(nonce: nonce)))
     }
 

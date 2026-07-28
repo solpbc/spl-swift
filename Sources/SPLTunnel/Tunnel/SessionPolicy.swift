@@ -5,19 +5,16 @@ import Foundation
 
 public struct KeepalivePolicy: Sendable, Equatable {
     public let interval: Duration
-    public let idleThreshold: Duration
     public let missedLimit: Int
     public let runsOnRelayPath: Bool
 
     public init(
         interval: Duration = .milliseconds(500),
-        idleThreshold: Duration = .seconds(2),
         missedLimit: Int = 3,
         // why: proto/framing.md:163-169 defines keepalive cadence as direct-mode dialer policy.
         runsOnRelayPath: Bool = false
     ) {
         self.interval = interval
-        self.idleThreshold = idleThreshold
         self.missedLimit = missedLimit
         self.runsOnRelayPath = runsOnRelayPath
     }

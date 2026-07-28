@@ -21,6 +21,14 @@ typealias TunnelTLSConnector = @Sendable (
     @Sendable (ConnectedVia) async -> Void
 ) async throws -> any TunnelTLSIO
 
+typealias TunnelMuxFactory = @Sendable (any TunnelTLSIO) -> Multiplexer
+
+private struct PendingInstallFailure: Sendable {
+    let pumpID: UUID
+    let error: SessionError
+    let tearDownReason: TearDownReason
+}
+
 public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     public nonisolated var stateUpdates: AsyncStream<TunnelState> {
         stateStream
@@ -35,6 +43,9 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private let pairing: StoredPairing
     private let policy: SessionPolicy
     private let tlsConnector: TunnelTLSConnector
+    private let makeMultiplexer: TunnelMuxFactory
+    private let afterInstallConnected: @Sendable () async -> Void
+    private let onPendingInstallFailure: @Sendable () async -> Void
     private let stateStream: AsyncStream<TunnelState>
     private let stateContinuation: AsyncStream<TunnelState>.Continuation
     private let connectionModeStream: AsyncStream<ConnectionMode?>
@@ -46,6 +57,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private var innerTLS: (any TunnelTLSIO)?
     private var multiplexer: Multiplexer?
     private var activeEndpoint: TransportEndpoint?
+    private var pendingInstallFailure: PendingInstallFailure?
     private var isTerminated = false
 
     public init(
@@ -63,11 +75,23 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     init(
         pairing: StoredPairing,
         policy: SessionPolicy = SessionPolicy(),
-        tlsConnector: @escaping TunnelTLSConnector
+        tlsConnector: @escaping TunnelTLSConnector,
+        makeMultiplexer: @escaping TunnelMuxFactory = { tls in
+            Multiplexer { data in
+                try await tls.send(data)
+            }
+        },
+        afterInstallConnected: @escaping @Sendable () async -> Void = {
+            await Task.yield()
+        },
+        onPendingInstallFailure: @escaping @Sendable () async -> Void = {}
     ) {
         self.pairing = pairing
         self.policy = policy
         self.tlsConnector = tlsConnector
+        self.makeMultiplexer = makeMultiplexer
+        self.afterInstallConnected = afterInstallConnected
+        self.onPendingInstallFailure = onPendingInstallFailure
 
         let state = AsyncStream<TunnelState>.makeStream()
         self.stateStream = state.stream
@@ -107,7 +131,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
 
         let connected = try await connectOnce(endpoints: endpoints, preferredEndpoint: preferredEndpoint)
         await installConnected(connected)
-        publishConnected(connected)
+        try await publishConnected(connected)
         return connected.via
     }
 
@@ -199,7 +223,14 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         return ConnectedAttempt(endpoint: endpoint, via: via, tls: tls)
     }
 
-    private func publishConnected(_ connected: ConnectedAttempt) {
+    private func publishConnected(_ connected: ConnectedAttempt) async throws {
+        if let pending = pendingInstallFailure, pending.pumpID == inboundPumpID {
+            pendingInstallFailure = nil
+            publish(.failed(pending.error))
+            await tearDownCurrent(reason: pending.tearDownReason)
+            throw pending.error
+        }
+        pendingInstallFailure = nil
         activeEndpoint = connected.endpoint
         if connected.endpoint.isDirect {
             setConnectionMode(.plDirect)
@@ -214,9 +245,8 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         innerTLS = tls
         let pumpID = UUID()
         inboundPumpID = pumpID
-        let mux = Multiplexer { data in
-            try await tls.send(data)
-        }
+        pendingInstallFailure = nil
+        let mux = makeMultiplexer(tls)
         multiplexer = mux
 
         inboundPumpTask = Task {
@@ -231,47 +261,64 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         }
 
         if shouldRunKeepalive(via: connected.via) {
-            await mux.startKeepalive(
-                interval: policy.keepalive.interval,
-                idleThreshold: policy.keepalive.idleThreshold,
-                missedLimit: policy.keepalive.missedLimit
-            )
-            keepaliveWatchTask = Task { [mux] in
+            let keepaliveError = Self.keepaliveError(for: connected.via)
+            keepaliveWatchTask = Task { [mux, pumpID, keepaliveError] in
                 for await _ in mux.keepaliveLost {
-                    await self.handleKeepaliveLost()
-                    break
+                    await self.handleKeepaliveLost(id: pumpID, error: keepaliveError)
                 }
             }
+            await mux.startKeepalive(
+                interval: policy.keepalive.interval,
+                missedLimit: policy.keepalive.missedLimit
+            )
         }
+        // Let already-ended pump/loss tasks latch against this install epoch before publishing connected.
+        await afterInstallConnected()
     }
 
     private func handlePumpEnded(id: UUID, error: (any Error)?) async {
-        guard inboundPumpID == id, case .connected = state else {
+        guard inboundPumpID == id else {
             return
         }
         let fault = error.map { String(describing: $0) }
+        let sessionError = SessionError.inboundClosed(fault: fault)
+        guard case .connected = state else {
+            await recordPendingInstallFailure(
+                id: id,
+                error: sessionError,
+                tearDownReason: .transportFailure
+            )
+            return
+        }
         if let fault {
             sessionLog.error("inbound pump failed fault=\(fault, privacy: .public)")
         } else {
             sessionLog.warning("inbound pump closed")
         }
-        await failConnectedSession(.inboundClosed(fault: fault), tearDownReason: .transportFailure)
+        await failConnectedSession(sessionError, tearDownReason: .transportFailure)
     }
 
-    private func handleKeepaliveLost() async {
+    private func handleKeepaliveLost(id: UUID, error: SessionError) async {
+        guard inboundPumpID == id else {
+            return
+        }
         guard case .connected = state else {
+            await recordPendingInstallFailure(
+                id: id,
+                error: error,
+                tearDownReason: .transportFailure
+            )
             return
         }
-        switch connectionMode {
-        case .plDirect:
+        switch error {
+        case .directKeepaliveMissed:
             sessionLog.warning("keepalive lost route=\("direct", privacy: .public)")
-            await failConnectedSession(.directKeepaliveMissed, tearDownReason: .transportFailure)
-        case .plViaSpl:
+        case .relayKeepaliveMissed:
             sessionLog.warning("keepalive lost route=\("relay", privacy: .public)")
-            await failConnectedSession(.relayKeepaliveMissed, tearDownReason: .transportFailure)
-        case nil:
-            return
+        default:
+            break
         }
+        await failConnectedSession(error, tearDownReason: .transportFailure)
     }
 
     private func failConnectedSession(_ error: SessionError, tearDownReason: TearDownReason) async {
@@ -284,6 +331,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
 
     private func tearDownCurrent(reason: TearDownReason) async {
         inboundPumpID = nil
+        pendingInstallFailure = nil
         keepaliveWatchTask?.cancel()
         keepaliveWatchTask = nil
         inboundPumpTask?.cancel()
@@ -304,6 +352,31 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
             return true
         case .relay:
             return policy.keepalive.runsOnRelayPath
+        }
+    }
+
+    private func recordPendingInstallFailure(
+        id: UUID,
+        error: SessionError,
+        tearDownReason: TearDownReason
+    ) async {
+        guard pendingInstallFailure == nil else {
+            return
+        }
+        pendingInstallFailure = PendingInstallFailure(
+            pumpID: id,
+            error: error,
+            tearDownReason: tearDownReason
+        )
+        await onPendingInstallFailure()
+    }
+
+    private static func keepaliveError(for via: ConnectedVia) -> SessionError {
+        switch via {
+        case .lanDirect:
+            return .directKeepaliveMissed
+        case .relay:
+            return .relayKeepaliveMissed
         }
     }
 
