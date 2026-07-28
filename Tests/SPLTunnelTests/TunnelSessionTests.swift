@@ -214,7 +214,7 @@ struct TunnelSessionTests {
                     sleeper: { duration in try await gate.sleep(duration) }
                 )
             },
-            afterInstallConnected: {
+            installWindowTestGate: {
                 await gate.waitForObservedTick(count: 1)
                 await gate.releaseOne()
                 await gate.waitForObservedTick(count: 2)
@@ -225,7 +225,7 @@ struct TunnelSessionTests {
                     Issue.record("keepalive loss did not latch before publishConnected")
                 }
             },
-            onPendingInstallFailure: {
+            pendingInstallFailureTestObserver: {
                 await latched.signal()
             }
         )

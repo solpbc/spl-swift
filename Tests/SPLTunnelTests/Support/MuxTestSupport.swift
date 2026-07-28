@@ -184,33 +184,6 @@ actor KeepaliveTickGate {
     }
 }
 
-final class ManualMuxClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var current: ContinuousClock.Instant
-
-    init(_ current: ContinuousClock.Instant = ContinuousClock.now) {
-        self.current = current
-    }
-
-    func now() -> ContinuousClock.Instant {
-        lock.lock()
-        defer { lock.unlock() }
-        return current
-    }
-
-    func advance(by duration: Duration) {
-        lock.lock()
-        current = current.advanced(by: duration)
-        lock.unlock()
-    }
-
-    func set(_ instant: ContinuousClock.Instant) {
-        lock.lock()
-        current = instant
-        lock.unlock()
-    }
-}
-
 actor AsyncResultBox<Value: Sendable> {
     private var value: Value?
 

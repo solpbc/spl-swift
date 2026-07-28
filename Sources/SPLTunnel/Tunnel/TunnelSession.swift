@@ -44,8 +44,8 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private let policy: SessionPolicy
     private let tlsConnector: TunnelTLSConnector
     private let makeMultiplexer: TunnelMuxFactory
-    private let afterInstallConnected: @Sendable () async -> Void
-    private let onPendingInstallFailure: @Sendable () async -> Void
+    private let installWindowTestGate: @Sendable () async -> Void
+    private let pendingInstallFailureTestObserver: @Sendable () async -> Void
     private let stateStream: AsyncStream<TunnelState>
     private let stateContinuation: AsyncStream<TunnelState>.Continuation
     private let connectionModeStream: AsyncStream<ConnectionMode?>
@@ -81,17 +81,19 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
                 try await tls.send(data)
             }
         },
-        afterInstallConnected: @escaping @Sendable () async -> Void = {
-            await Task.yield()
-        },
-        onPendingInstallFailure: @escaping @Sendable () async -> Void = {}
+        // Internal test seam for holding the pre-publish install window open.
+        // Default no-op; production draining is the unconditional Task.yield() below.
+        installWindowTestGate: @escaping @Sendable () async -> Void = {},
+        // Internal test observation point for the pending install-failure latch.
+        // The default has no production effect.
+        pendingInstallFailureTestObserver: @escaping @Sendable () async -> Void = {}
     ) {
         self.pairing = pairing
         self.policy = policy
         self.tlsConnector = tlsConnector
         self.makeMultiplexer = makeMultiplexer
-        self.afterInstallConnected = afterInstallConnected
-        self.onPendingInstallFailure = onPendingInstallFailure
+        self.installWindowTestGate = installWindowTestGate
+        self.pendingInstallFailureTestObserver = pendingInstallFailureTestObserver
 
         let state = AsyncStream<TunnelState>.makeStream()
         self.stateStream = state.stream
@@ -272,8 +274,10 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
                 missedLimit: policy.keepalive.missedLimit
             )
         }
-        // Let already-ended pump/loss tasks latch against this install epoch before publishing connected.
-        await afterInstallConnected()
+        // Let already-ended pump/loss tasks run and latch against this install epoch
+        // before publishConnected can publish a durable connected state.
+        await Task.yield()
+        await installWindowTestGate()
     }
 
     private func handlePumpEnded(id: UUID, error: (any Error)?) async {
@@ -368,7 +372,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
             error: error,
             tearDownReason: tearDownReason
         )
-        await onPendingInstallFailure()
+        await pendingInstallFailureTestObserver()
     }
 
     private static func keepaliveError(for via: ConnectedVia) -> SessionError {
