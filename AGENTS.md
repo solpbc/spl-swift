@@ -24,4 +24,5 @@ This repo is the SPL (solstone private link) client library for Apple platforms 
 - **Never retag or force-push a tag.** Consumers cache by tag hash; a moved tag silently serves stale or wrong code. New content = new tag, always.
 - **No GitHub workflows.** CI is operator-run locally; do not add `.github/workflows/`.
 - **No pushes to consumer repos from here.** Migrating the apps is separate, operator-driven work.
+- **Before tagging a release, run the full-circle integration gate on every platform that has one.** Running a consumer's gate is validation, not a push to its repository. A change to wire behavior is not validated by this repository's own tests — they run against mocks of the peer, and the defects that have actually shipped were disagreements between real implementations.
 - Releases (tags) are operator approval only.
