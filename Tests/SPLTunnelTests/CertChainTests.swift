@@ -143,13 +143,13 @@ struct CertChainTests {
     }
 
     @Test func jidFromSPKIRefusesMalformedStructureAndTrailingBytes() {
-        expectThrows(.malformedSPKI) {
+        expectThrows(.nonCanonicalP256SPKI) {
             _ = try CertChain.jidFromSPKI([0x01, 0x02, 0x03])
         }
 
         var trailing = Self.canonicalJIDSPKI
         trailing.append(0x00)
-        expectThrows(.malformedSPKI) {
+        expectThrows(.nonCanonicalP256SPKI) {
             _ = try CertChain.jidFromSPKI(trailing)
         }
     }
@@ -158,14 +158,14 @@ struct CertChainTests {
         let truncatedAlgorithmOID = Self.bytes(
             "3053300d06018006082a8648ce3d030107034200046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
         )
-        expectThrows(.malformedSPKI) {
+        expectThrows(.nonCanonicalP256SPKI) {
             _ = try CertChain.jidFromSPKI(truncatedAlgorithmOID)
         }
     }
 
     @Test func jidFromSPKIRefusesAbsentP256Parameters() {
         let absentParameters = Self.bytes("304f300906072a8648ce3d0201034200046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
-        expectThrows(.notP256) {
+        expectThrows(.nonCanonicalP256SPKI) {
             _ = try CertChain.jidFromSPKI(absentParameters)
         }
     }
@@ -173,18 +173,18 @@ struct CertChainTests {
     @Test func jidFromSPKIRefusesInvalidPointEncodings() {
         var nonzeroUnusedBits = Self.canonicalJIDSPKI
         nonzeroUnusedBits[25] = 0x01
-        expectThrows(.invalidPoint) {
+        expectThrows(.nonCanonicalP256SPKI) {
             _ = try CertChain.jidFromSPKI(nonzeroUnusedBits)
         }
 
         var badPrefix = Self.canonicalJIDSPKI
         badPrefix[26] = 0x05
-        expectThrows(.invalidPoint) {
+        expectThrows(.nonCanonicalP256SPKI) {
             _ = try CertChain.jidFromSPKI(badPrefix)
         }
 
         let badLength = Self.bytes("3058301306072a8648ce3d020106082a8648ce3d030107034100046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51")
-        expectThrows(.invalidPoint) {
+        expectThrows(.nonCanonicalP256SPKI) {
             _ = try CertChain.jidFromSPKI(badLength)
         }
     }

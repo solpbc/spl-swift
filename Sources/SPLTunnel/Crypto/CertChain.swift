@@ -25,6 +25,35 @@ public struct PairingCAPin: Sendable, Equatable, Hashable {
 /// hash prefix. Established sessions anchor trust to the stored private CA
 /// chain.
 public enum CertChain {
+    private struct JIDSPKITemplate {
+        let prefix: [UInt8]
+        let totalLength: Int
+        let compressed: Bool
+    }
+
+    private static let jidSPKITemplates: [JIDSPKITemplate] = [
+        JIDSPKITemplate(
+            prefix: [
+                0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
+                0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+                0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
+                0x42, 0x00,
+            ],
+            totalLength: 91,
+            compressed: false
+        ),
+        JIDSPKITemplate(
+            prefix: [
+                0x30, 0x39, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
+                0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+                0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
+                0x22, 0x00,
+            ],
+            totalLength: 59,
+            compressed: true
+        ),
+    ]
+
     public static func certificates(fromPEM pem: String) throws -> [SecCertificate] {
         let blocks = try pemBlocks(from: pem, label: "CERTIFICATE")
         guard !blocks.isEmpty else {
@@ -130,35 +159,20 @@ public enum CertChain {
     }
 
     public static func jidFromSPKI(_ spkiDER: [UInt8]) throws -> String {
-        let spki: SubjectPublicKeyInfo
-        do {
-            spki = try SubjectPublicKeyInfo.parse(spkiDER)
-        } catch {
-            throw CertChainError.malformedSPKI
+        guard let template = jidSPKITemplates.first(where: {
+            spkiDER.count == $0.totalLength && spkiDER.starts(with: $0.prefix)
+        }) else {
+            throw CertChainError.nonCanonicalP256SPKI
         }
 
-        guard spki.algorithmOID == [1, 2, 840, 10045, 2, 1],
-              spki.parameterOID == [1, 2, 840, 10045, 3, 1, 7] else {
-            throw CertChainError.notP256
-        }
-        guard spki.unusedBitCount == 0 else {
-            throw CertChainError.invalidPoint
-        }
-
+        let point = Array(spkiDER[template.prefix.count...])
         let publicKey: P256.Signing.PublicKey
         do {
-            switch (spki.publicKeyBytes.first, spki.publicKeyBytes.count) {
-            case (0x02, 33), (0x03, 33):
-                publicKey = try P256.Signing.PublicKey(compressedRepresentation: spki.publicKeyBytes)
-            case (0x04, 65):
-                publicKey = try P256.Signing.PublicKey(x963Representation: spki.publicKeyBytes)
-            default:
-                throw CertChainError.invalidPoint
-            }
-        } catch let error as CertChainError {
-            throw error
+            publicKey = try template.compressed
+                ? P256.Signing.PublicKey(compressedRepresentation: point)
+                : P256.Signing.PublicKey(x963Representation: point)
         } catch {
-            throw CertChainError.invalidPoint
+            throw CertChainError.nonCanonicalP256SPKI
         }
 
         return jid(for: publicKey)
@@ -171,7 +185,5 @@ public enum CertChainError: Error, Equatable, Sendable {
     case emptyChain
     case invalidCertificate
     case invalidPublicKey
-    case notP256
-    case invalidPoint
-    case malformedSPKI
+    case nonCanonicalP256SPKI
 }

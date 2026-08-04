@@ -15,11 +15,15 @@ struct JournalIdentityConformanceTests {
     }
 
     @Test func deriveJIDVectorsMatchAuthorityCorpus() throws {
-        // proto/identity.md:18-22 requires parsed P-256 SPKI validation and canonical DER derivation.
-        // proto/identity.md:28-31 pins the HKDF labels, UUIDv8 version, and RFC 9562 variant bits.
-        // proto/identity.md:37-45 requires distinct not_p256, invalid_point, and malformed_spki refusals.
-        // proto/identity.md:65-67 requires all five published jid vectors to reproduce exactly.
-        #expect(corpus.vectors.count == 5)
+        // proto/identity.md:18-30 requires the canonical P-256 SPKI form, with a
+        // compressed point as the sole normalised input difference.
+        // proto/identity.md:20,34-43 requires HKDF over canonical DER and the UUIDv8
+        // version and RFC 9562 variant stamps.
+        // proto/identity.md:47-53 requires one refusal outcome and forbids signalling
+        // a refusal in-band as a jid.
+        // proto/identity.md:69-71 requires all nine published jid vectors to reproduce
+        // exactly.
+        #expect(corpus.vectors.count == 9)
 
         var derivedJIDs: [String: String] = [:]
         for vector in corpus.vectors {
@@ -29,15 +33,13 @@ struct JournalIdentityConformanceTests {
                 let actual = try CertChain.jidFromSPKI(spki)
                 #expect(actual == expected, "vector \(vector.id)")
                 derivedJIDs[vector.id] = actual
-            case .error(let kind):
-                let expected = try Self.certChainError(for: kind)
+            case .error:
                 do {
                     _ = try CertChain.jidFromSPKI(spki)
-                    Issue.record("vector \(vector.id) expected \(expected)")
-                } catch let actual as CertChainError {
-                    #expect(actual == expected, "vector \(vector.id)")
+                    Issue.record("vector \(vector.id) expected a refusal")
+                } catch is CertChainError {
                 } catch {
-                    Issue.record("vector \(vector.id) expected \(expected), got \(error)")
+                    Issue.record("vector \(vector.id) expected a refusal, got \(error)")
                 }
             }
         }
@@ -45,19 +47,6 @@ struct JournalIdentityConformanceTests {
         let canonical = try #require(derivedJIDs["identity.jid.canonical"])
         let compressed = try #require(derivedJIDs["identity.jid.compressed-point"])
         #expect(canonical == compressed)
-    }
-
-    private static func certChainError(for kind: String) throws -> CertChainError {
-        switch kind {
-        case "not_p256":
-            .notP256
-        case "invalid_point":
-            .invalidPoint
-        case "malformed_spki":
-            .malformedSPKI
-        default:
-            throw JournalIdentityCorpusError.unrecognizedErrorKind(kind)
-        }
     }
 
     private static func bytes(_ hex: String) throws -> [UInt8] {
@@ -102,7 +91,7 @@ private struct JournalIdentityCorpus {
         let jidVectors = try document.vectors
             .filter { $0.operation == "derive_jid" }
             .map(JournalIdentityVector.init)
-        guard jidVectors.count == 5 else {
+        guard jidVectors.count == 9 else {
             throw JournalIdentityCorpusError.unexpectedVectorCount(jidVectors.count)
         }
         return JournalIdentityCorpus(vectors: jidVectors)
@@ -169,9 +158,9 @@ private struct JournalIdentityCorpus {
 
 private extension JournalIdentityCorpus {
     enum Constants {
-        static let authorityCommit = "ddfe13b2abce2fd40acbe2e18d0551727e7ef757"
-        static let authorityManifestSHA256 = "0d78abe38a2cf23af3b98c9a496bb3c6f1c94bc7c0467eafa43726af3a3603ea"
-        static let bundleSemver = "2.0.0"
+        static let authorityCommit = "e639605b692577700648af470ee27da898c6df75"
+        static let authorityManifestSHA256 = "bd3fcd1f6c7bc4eddeb35eb8981be47dc738a603e16064ad52adbda75867e7b1"
+        static let bundleSemver = "5.0.0"
         static let bundleSchemaIdentity = "spl.pair-link-definition-bundle.schema.v1"
         static let adoptionSchemaVersion = 1
         static let consumerIdentifier = "solpbc/spl-swift"
@@ -216,18 +205,13 @@ private extension JournalIdentityCorpus {
     struct RawExpected: Decodable {
         let result: String
         let jid: String?
-        let error: RawError?
-    }
-
-    struct RawError: Decodable {
-        let kind: String
     }
 }
 
 private struct JournalIdentityVector {
     enum Expected {
         case jid(String)
-        case error(String)
+        case error
     }
 
     let id: String
@@ -247,12 +231,9 @@ private struct JournalIdentityVector {
             }
             self.expected = .jid(jid)
         case "error":
-            guard let kind = expected.error?.kind else {
-                throw JournalIdentityCorpusError.invalidJIDVector(raw.id)
-            }
-            self.expected = .error(kind)
+            self.expected = .error
         default:
-            throw JournalIdentityCorpusError.invalidJIDVector(raw.id)
+            throw JournalIdentityCorpusError.unrecognizedJIDResult(expected.result)
         }
     }
 }
@@ -267,7 +248,7 @@ private enum JournalIdentityCorpusError: Error {
     case invalidBundlePath(String)
     case unexpectedVectorCount(Int)
     case invalidJIDVector(String)
-    case unrecognizedErrorKind(String)
+    case unrecognizedJIDResult(String)
     case invalidHex(String)
 }
 
