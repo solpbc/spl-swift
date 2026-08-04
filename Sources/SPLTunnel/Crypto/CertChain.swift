@@ -109,9 +109,9 @@ public enum CertChain {
         }
     }
 
-    public static func jidFromSPKI(_ spkiDER: [UInt8]) -> String {
+    static func jid(for publicKey: P256.Signing.PublicKey) -> String {
         let key = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: SymmetricKey(data: Data(spkiDER)),
+            inputKeyMaterial: SymmetricKey(data: publicKey.derRepresentation),
             salt: Data("solstone/journal/v1".utf8),
             info: Data("solstone/jid/uuidv8/v1".utf8),
             outputByteCount: 16
@@ -129,6 +129,41 @@ public enum CertChain {
         return uuid.uuidString.lowercased()
     }
 
+    public static func jidFromSPKI(_ spkiDER: [UInt8]) throws -> String {
+        let spki: SubjectPublicKeyInfo
+        do {
+            spki = try SubjectPublicKeyInfo.parse(spkiDER)
+        } catch {
+            throw CertChainError.malformedSPKI
+        }
+
+        guard spki.algorithmOID == [1, 2, 840, 10045, 2, 1],
+              spki.parameterOID == [1, 2, 840, 10045, 3, 1, 7] else {
+            throw CertChainError.notP256
+        }
+        guard spki.unusedBitCount == 0 else {
+            throw CertChainError.invalidPoint
+        }
+
+        let publicKey: P256.Signing.PublicKey
+        do {
+            switch (spki.publicKeyBytes.first, spki.publicKeyBytes.count) {
+            case (0x02, 33), (0x03, 33):
+                publicKey = try P256.Signing.PublicKey(compressedRepresentation: spki.publicKeyBytes)
+            case (0x04, 65):
+                publicKey = try P256.Signing.PublicKey(x963Representation: spki.publicKeyBytes)
+            default:
+                throw CertChainError.invalidPoint
+            }
+        } catch let error as CertChainError {
+            throw error
+        } catch {
+            throw CertChainError.invalidPoint
+        }
+
+        return jid(for: publicKey)
+    }
+
 }
 
 public enum CertChainError: Error, Equatable, Sendable {
@@ -136,4 +171,7 @@ public enum CertChainError: Error, Equatable, Sendable {
     case emptyChain
     case invalidCertificate
     case invalidPublicKey
+    case notP256
+    case invalidPoint
+    case malformedSPKI
 }

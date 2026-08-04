@@ -420,7 +420,13 @@ public struct PairClient: Sendable {
         guard responseCAP256SPKI == caSPKIDER else {
             throw PairError.relayInstanceMismatch
         }
-        let expected = CertChain.jidFromSPKI(caSPKIDER)
+        let expected: String
+        do {
+            expected = try CertChain.jidFromSPKI(caSPKIDER)
+        } catch {
+            // The byte-matched pinned CA is unusable, so the response must fail closed.
+            throw PairError.relayInstanceMismatch
+        }
         guard response.instanceID == expected else {
             throw PairError.relayInstanceMismatch
         }

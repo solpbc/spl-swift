@@ -29,6 +29,9 @@ let package = Package(
         .testTarget(
             name: "SPLTunnelTests",
             dependencies: ["SPLTunnel"],
+            resources: [
+                .copy("Conformance/Corpus")
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]

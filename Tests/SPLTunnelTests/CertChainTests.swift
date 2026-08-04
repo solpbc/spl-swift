@@ -37,6 +37,7 @@ struct CertChainTests {
 
     private let cert1Fingerprint = "005a64c08d69da268c62971466aca5324eaba7ead27e3d4e33ddaa244535e168"
     private static let cert1CanonicalSPKIHex = "3059301306072a8648ce3d020106082a8648ce3d03010703420004f8a17468f44dbcc10175fab8b4edfeb2a9c1deedf03a213852d9e388bd2a57df292acc1efa360ee7cffe851507e57f8c9cbdd0f42e09cfbf8f636b4ed1ce877c"
+    private static let canonicalJIDSPKI = bytes("3059301306072a8648ce3d020106082a8648ce3d030107034200046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
 
     @Test func parseSingleCertificate() throws {
         let certificates = try CertChain.certificates(fromPEM: cert1)
@@ -141,14 +142,42 @@ struct CertChainTests {
         ))
     }
 
-    @Test func jidFromSPKIMatchesMarkVector() {
-        let spki = Self.bytes("3059301306072a8648ce3d020106082a8648ce3d030107034200046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
-        #expect(CertChain.jidFromSPKI(spki) == "5620bab1-476a-88df-93d4-f4f525b991dd")
+    @Test func jidFromSPKIRefusesMalformedStructureAndTrailingBytes() {
+        expectThrows(.malformedSPKI) {
+            _ = try CertChain.jidFromSPKI([0x01, 0x02, 0x03])
+        }
+
+        var trailing = Self.canonicalJIDSPKI
+        trailing.append(0x00)
+        expectThrows(.malformedSPKI) {
+            _ = try CertChain.jidFromSPKI(trailing)
+        }
     }
 
-    @Test func jidFromSPKIMatchesIOSReferenceVector() {
-        let spki = Self.bytes("3059301306072a8648ce3d020106082a8648ce3d03010703420004471c3e758c4904285bba7e53118ed0f524adeb0757d25bd2f8e7b0d76dfa714cdd520f7aca8a8b917acc37f51de8f0c9bbe3ad858382e702dc25a12d09f7a858")
-        #expect(CertChain.jidFromSPKI(spki) == "f30ed159-ef46-8e9c-913f-e49f0fe7d201")
+    @Test func jidFromSPKIRefusesAbsentP256Parameters() {
+        let absentParameters = Self.bytes("304f300906072a8648ce3d0201034200046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+        expectThrows(.notP256) {
+            _ = try CertChain.jidFromSPKI(absentParameters)
+        }
+    }
+
+    @Test func jidFromSPKIRefusesInvalidPointEncodings() {
+        var nonzeroUnusedBits = Self.canonicalJIDSPKI
+        nonzeroUnusedBits[25] = 0x01
+        expectThrows(.invalidPoint) {
+            _ = try CertChain.jidFromSPKI(nonzeroUnusedBits)
+        }
+
+        var badPrefix = Self.canonicalJIDSPKI
+        badPrefix[26] = 0x05
+        expectThrows(.invalidPoint) {
+            _ = try CertChain.jidFromSPKI(badPrefix)
+        }
+
+        let badLength = Self.bytes("3058301306072a8648ce3d020106082a8648ce3d030107034100046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51")
+        expectThrows(.invalidPoint) {
+            _ = try CertChain.jidFromSPKI(badLength)
+        }
     }
 
     @Test func invalidPEMThrows() {
