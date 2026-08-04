@@ -86,43 +86,49 @@ private struct DERReader {
     }
 
     static func objectIdentifier(from bytes: [UInt8]) throws -> [UInt64] {
-        guard let first = bytes.first else {
+        guard !bytes.isEmpty else {
             throw SubjectPublicKeyInfoError.malformed
         }
+
+        var index = 0
+        let firstSubidentifier = try readBase128(from: bytes, index: &index)
         var arcs: [UInt64]
-        switch first {
+        switch firstSubidentifier {
         case 0...39:
-            arcs = [0, UInt64(first)]
+            arcs = [0, firstSubidentifier]
         case 40...79:
-            arcs = [1, UInt64(first - 40)]
+            arcs = [1, firstSubidentifier - 40]
         default:
-            arcs = [2, UInt64(first - 80)]
+            arcs = [2, firstSubidentifier - 80]
         }
 
-        var index = 1
         while index < bytes.count {
-            let start = index
-            var value: UInt64 = 0
-            while true {
-                guard index < bytes.count else {
-                    throw SubjectPublicKeyInfoError.malformed
-                }
-                let byte = bytes[index]
-                index += 1
-                guard value <= (UInt64.max - UInt64(byte & 0x7f)) / 128 else {
-                    throw SubjectPublicKeyInfoError.malformed
-                }
-                value = value * 128 + UInt64(byte & 0x7f)
-                if byte & 0x80 == 0 {
-                    break
-                }
-            }
-            guard index - start == 1 || bytes[start] != 0x80 else {
-                throw SubjectPublicKeyInfoError.malformed
-            }
-            arcs.append(value)
+            arcs.append(try readBase128(from: bytes, index: &index))
         }
         return arcs
+    }
+
+    private static func readBase128(from bytes: [UInt8], index: inout Int) throws -> UInt64 {
+        let start = index
+        var value: UInt64 = 0
+        while true {
+            guard index < bytes.count else {
+                throw SubjectPublicKeyInfoError.malformed
+            }
+            let byte = bytes[index]
+            index += 1
+            guard value <= (UInt64.max - UInt64(byte & 0x7f)) / 128 else {
+                throw SubjectPublicKeyInfoError.malformed
+            }
+            value = value * 128 + UInt64(byte & 0x7f)
+            if byte & 0x80 == 0 {
+                break
+            }
+        }
+        guard index - start == 1 || bytes[start] != 0x80 else {
+            throw SubjectPublicKeyInfoError.malformed
+        }
+        return value
     }
 
     private mutating func readByte() throws -> UInt8 {
