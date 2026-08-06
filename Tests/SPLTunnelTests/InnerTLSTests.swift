@@ -3,6 +3,7 @@
 
 import Crypto
 import Foundation
+import Network
 import Security
 import Testing
 @testable import SPLTunnel
@@ -16,6 +17,24 @@ private let innerTLSClientInfo = SPLClientInfo(userAgent: "spl-swift-tests/1")
     .enabled(if: IdentityAssemblyCapability.isAvailable, "\(IdentityAssemblyCapability.reason)")
 )
 struct InnerTLSTests {
+    @Test func stateErrorMappingClassifiesPeerAccessDeniedForFailedAndWaiting() {
+        // Security/SecBase.h: errSSLPeerAccessDenied is -9832 on Apple platforms.
+        for state in [NWConnection.State.failed(.tls(-9832)), .waiting(.tls(-9832))] {
+            guard let error = preReadyNetworkError(from: state) else {
+                Issue.record("Expected a pre-ready Network.framework error")
+                continue
+            }
+            #expect(innerTLSError(for: error) == .peerAccessDenied)
+        }
+
+        for error in [NWError.tls(-9838), NWError.tls(-9800), NWError.posix(.ECONNREFUSED)] {
+            guard case .handshakeFailed = innerTLSError(for: error) else {
+                Issue.record("Expected generic handshake failure")
+                continue
+            }
+        }
+    }
+
     @Test func lanOneKiBPlaintextBytesRoundTripByteEqualAgainstInProcessTLSEcho() async throws {
         let fixture = try TestCA.make()
         let server = TLSEchoServer(bundle: fixture)
@@ -219,5 +238,16 @@ struct InnerTLSTests {
         } catch {
             Issue.record("Expected handshakeFailed or receiveFailed, got \(error)")
         }
+    }
+}
+
+private func preReadyNetworkError(from state: NWConnection.State) -> NWError? {
+    switch state {
+    case .failed(let error), .waiting(let error):
+        return error
+    case .setup, .preparing, .ready, .cancelled:
+        return nil
+    @unknown default:
+        return nil
     }
 }

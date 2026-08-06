@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+import Network
 import Testing
 @testable import SPLTunnel
 
@@ -31,30 +32,36 @@ struct ErrorMappingTests {
         #expect(message == "peerNotPinned")
     }
 
+    @Test func peerAccessDeniedClassifierRecognizesOnlyAccessDenied() {
+        // Security/SecBase.h: errSSLPeerAccessDenied is the sole terminal TLS status.
+        #expect(isPeerAccessDenied(NWError.tls(-9832)))
+        #expect(isPeerAccessDenied(InnerTLSError.peerAccessDenied))
+        #expect(isPeerAccessDenied(NWError.tls(-9838)) == false)
+        #expect(isPeerAccessDenied(NWError.tls(-9800)) == false)
+        #expect(isPeerAccessDenied(NWError.posix(.ECONNREFUSED)) == false)
+    }
+
+    @Test func peerAccessDeniedMapsToRevoked() {
+        // Security/SecBase.h: access denied is a terminal session revocation signal.
+        #expect(RaceCoordinator<Int>.sessionError(from: InnerTLSError.peerAccessDenied) == .revoked)
+    }
+
     @Test func otherDialErrorMapsToUnreachable() {
         // Other dial errors must fall back to unreachable session errors.
         #expect(RaceCoordinator<Int>.sessionError(from: DialError.connectTimeout) == .unreachable)
     }
 
     @Test func aggregateFailurePrecedence() {
-        // Aggregate failure precedence is revoked, not-entitled, auth-refresh-required, then unreachable.
+        // Revocation short-circuits before aggregation; aggregate preserves remaining precedence.
         #expect(RaceCoordinator<Int>.aggregateFailure(
-            sawRevocation: true,
-            sawNotEntitled: true,
-            sawAuthRefreshRequired: true
-        ) == .revoked)
-        #expect(RaceCoordinator<Int>.aggregateFailure(
-            sawRevocation: false,
             sawNotEntitled: true,
             sawAuthRefreshRequired: true
         ) == .notEntitled)
         #expect(RaceCoordinator<Int>.aggregateFailure(
-            sawRevocation: false,
             sawNotEntitled: false,
             sawAuthRefreshRequired: true
         ) == .authRefreshRequired)
         #expect(RaceCoordinator<Int>.aggregateFailure(
-            sawRevocation: false,
             sawNotEntitled: false,
             sawAuthRefreshRequired: false
         ) == .unreachable)

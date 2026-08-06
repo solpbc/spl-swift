@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 import Foundation
+import Network
 import Testing
 @testable import SPLTunnel
 
@@ -231,6 +232,117 @@ struct TunnelSupervisorTests {
         await supervisor.disconnect()
         await states.stop()
         await reconnects.stop()
+    }
+
+    @Test func terminalPeerAccessDeniedPauseRearmsOnConnectSameSupervisor() async throws {
+        // Security/SecBase.h: peer access denied pauses once and an explicit connect re-arms the supervisor.
+        let relay = relayEndpoint()
+        let factory = FakeGenerationFactory(scripts: [
+            .failure(.revoked),
+            .success(relay),
+        ])
+        let supervisor = fakeSupervisor(factory: factory)
+        let states = await stateProbe(for: supervisor)
+        let reconnects = await reconnectProbe(for: supervisor)
+        let terminalStatus = ReconnectStatus(
+            reason: .revoked,
+            attempt: 1,
+            retryAfter: nil,
+            terminalPause: true
+        )
+
+        await expectSessionError(.revoked) {
+            try await supervisor.connect(endpoints: [relay])
+        }
+        #expect(await waitForFailure(.revoked, in: states))
+        #expect(await states.count(.failed(.revoked)) == 1)
+        #expect(await reconnects.count(terminalStatus) == 1)
+        #expect(await conditionObserved(timeout: .milliseconds(100)) {
+            await factory.count() > 1
+        } == false)
+
+        _ = try await supervisor.connect(endpoints: [relay])
+        #expect(await factory.count() == 2)
+        await supervisor.disconnect()
+        await states.stop()
+        await reconnects.stop()
+    }
+
+    @Test func preReadyPeerAccessDeniedPausesDirectAndRelayForFailedAndWaiting() async throws {
+        // Security/SecBase.h: access denied before ready pauses without fallback or autonomous redrive.
+        let direct = directEndpoint("10.0.0.5")
+        let relay = relayEndpoint()
+        let terminalStatus = ReconnectStatus(
+            reason: .revoked,
+            attempt: 1,
+            retryAfter: nil,
+            terminalPause: true
+        )
+
+        for state in [
+            NWConnection.State.failed(.tls(-9832)),
+            NWConnection.State.waiting(.tls(-9832)),
+        ] {
+            for endpoint in [direct, relay] {
+                let error = innerTLSError(for: try #require(preReadyNetworkError(from: state)))
+                let connector = ConnectorProbe { _, _, _ in
+                    throw error
+                }
+                let supervisor = supervisorWithConnector(connector, racePolicy: allCandidatesRacePolicy())
+                let states = await stateProbe(for: supervisor)
+                let reconnects = await reconnectProbe(for: supervisor)
+
+                await expectSessionError(.revoked) {
+                    try await supervisor.connect(endpoints: [endpoint])
+                }
+                #expect(await waitForFailure(.revoked, in: states))
+                #expect(await reconnects.count(terminalStatus) == 1)
+                #expect(await connector.invocationCount == 1)
+                #expect(await conditionObserved(timeout: .milliseconds(100)) {
+                    await connector.invocationCount > 1
+                } == false)
+                await supervisor.disconnect()
+                await states.stop()
+                await reconnects.stop()
+            }
+        }
+    }
+
+    @Test func preReadyPeerInternalErrorKeepsReadyCompetitorAndDoesNotPause() async throws {
+        // Security/SecBase.h: peer internal error remains nonterminal and does not suppress a ready competitor.
+        let direct = directEndpoint("10.0.0.5")
+        let relay = relayEndpoint()
+        let terminalStatus = ReconnectStatus(
+            reason: .revoked,
+            attempt: 1,
+            retryAfter: nil,
+            terminalPause: true
+        )
+
+        for state in [
+            NWConnection.State.failed(.tls(-9838)),
+            NWConnection.State.waiting(.tls(-9838)),
+        ] {
+            let generic = innerTLSError(for: try #require(preReadyNetworkError(from: state)))
+            let connector = ConnectorProbe { endpoint, _, _ in
+                if endpoint == direct {
+                    throw generic
+                }
+                return FakeTunnelTLS()
+            }
+            let supervisor = supervisorWithConnector(connector, racePolicy: allCandidatesRacePolicy())
+            let states = await stateProbe(for: supervisor)
+            let reconnects = await reconnectProbe(for: supervisor)
+
+            #expect(try await supervisor.connect(endpoints: [direct, relay]) == relay.connectedVia)
+            #expect(await connector.invocationCount == 2)
+            #expect(await waitForState(.connected(via: relay.connectedVia), in: states))
+            #expect(await states.containsFailure { $0 == .revoked } == false)
+            #expect(await reconnects.count(terminalStatus) == 0)
+            await supervisor.disconnect()
+            await states.stop()
+            await reconnects.stop()
+        }
     }
 
     @Test func requestReconnectWhilePausedDoesNotUnpause() async throws {
@@ -938,6 +1050,17 @@ private func reconnectProbe(for supervisor: TunnelSupervisor) async -> Reconnect
     let probe = ReconnectProbe()
     await probe.start(stream: supervisor.reconnectUpdates)
     return probe
+}
+
+private func preReadyNetworkError(from state: NWConnection.State) -> NWError? {
+    switch state {
+    case .failed(let error), .waiting(let error):
+        return error
+    case .setup, .preparing, .ready, .cancelled:
+        return nil
+    @unknown default:
+        return nil
+    }
 }
 
 private func expectSameEndpoints(_ actual: [TransportEndpoint], _ expected: [TransportEndpoint]) {

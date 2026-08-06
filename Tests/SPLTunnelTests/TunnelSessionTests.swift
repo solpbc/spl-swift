@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 import Foundation
+import Network
 import Testing
 @testable import SPLTunnel
 
@@ -474,7 +475,7 @@ struct TunnelSessionTests {
     @Test func openStreamTransportClosedPublishesMuxClosedTearsDownOnceAndServesNoOpen() async throws {
         // Dead mux handling must coalesce caller failure, terminal state, teardown, and open rejection.
         let endpoint = relayEndpoint()
-        let tls = FakeTunnelTLS(sendError: .transportClosed)
+        let tls = FakeTunnelTLS(sendError: MuxError.transportClosed)
         let connector = ConnectorProbe { _, _, _ in tls }
         let session = TunnelSession(pairing: fakePairing(), tlsConnector: connector.connector)
         let states = await stateProbe(for: session)
@@ -497,6 +498,284 @@ struct TunnelSessionTests {
         #expect(await connector.invocationCount == 1)
         await session.disconnect()
         await states.stop()
+    }
+
+    @Test(arguments: PostReadyTerminalCase.allCases)
+    func peerAccessDeniedPostReadyIngressesFailOnce(_ testCase: PostReadyTerminalCase) async throws {
+        // Security/SecBase.h: errSSLPeerAccessDenied reaches terminal session handling from every mux write ingress.
+        let tls = FakeTunnelTLS()
+        let connector = ConnectorProbe { _, _, _ in tls }
+        let gate = KeepaliveTickGate()
+        let session: TunnelSession
+        let policy = fastKeepalivePolicy(runsOnRelayPath: true)
+        if testCase.ingress == .keepalive {
+            session = TunnelSession(
+                pairing: fakePairing(),
+                policy: policy,
+                tlsConnector: connector.connector,
+                makeMultiplexer: { tls in
+                    Multiplexer(
+                        sink: { data in try await tls.send(data) },
+                        sleeper: { duration in try await gate.sleep(duration) }
+                    )
+                }
+            )
+        } else {
+            session = TunnelSession(pairing: fakePairing(), policy: policy, tlsConnector: connector.connector)
+        }
+        let states = await stateProbe(for: session)
+
+        _ = try await session.connect(endpoints: [testCase.endpoint])
+        await tls.setSendError(NWError.tls(-9832))
+        try await trigger(
+            testCase.ingress,
+            tlsStatus: -9832,
+            session: session,
+            tls: tls,
+            keepaliveGate: gate
+        )
+
+        #expect(await waitForFailure(.revoked, in: states))
+        #expect(await states.count(.failed(.revoked)) == 1)
+        #expect(await tls.closeCount == 1)
+        await session.disconnect()
+        await states.stop()
+        await gate.cancelAll()
+    }
+
+    @Test(arguments: PostReadyTerminalCase.allCases)
+    func peerInternalErrorPostReadyIngressesRetainCurrentBehavior(_ testCase: PostReadyTerminalCase) async throws {
+        // Security/SecBase.h: errSSLPeerInternalError is nonterminal at every post-ready ingress.
+        let tls = FakeTunnelTLS()
+        let connector = ConnectorProbe { _, _, _ in tls }
+        let gate = KeepaliveTickGate()
+        let policy = fastKeepalivePolicy(runsOnRelayPath: true)
+        let session: TunnelSession
+        if testCase.ingress == .keepalive {
+            session = TunnelSession(
+                pairing: fakePairing(),
+                policy: policy,
+                tlsConnector: connector.connector,
+                makeMultiplexer: { tls in
+                    Multiplexer(
+                        sink: { data in try await tls.send(data) },
+                        sleeper: { duration in try await gate.sleep(duration) }
+                    )
+                }
+            )
+        } else {
+            session = TunnelSession(pairing: fakePairing(), policy: policy, tlsConnector: connector.connector)
+        }
+        let states = await stateProbe(for: session)
+
+        _ = try await session.connect(endpoints: [testCase.endpoint])
+        await tls.setSendError(NWError.tls(-9838))
+        try await trigger(
+            testCase.ingress,
+            tlsStatus: -9838,
+            session: session,
+            tls: tls,
+            keepaliveGate: gate
+        )
+
+        switch testCase.ingress {
+        case .receive, .pong, .unknownStreamReset, .isolateReset:
+            // The inbound pump still classifies ordinary mux and receive failures as inbound closure.
+            #expect(await waitForFailure(in: states) { error in
+                if case .inboundClosed = error {
+                    return true
+                }
+                return false
+            })
+        case .open, .write, .close, .window:
+            // trigger observes the original raw Network.framework error at the propagating boundary.
+            break
+        case .reset:
+            // reset suppresses its send error; a second stream write proves the session remains usable.
+            await tls.setSendError(nil)
+            let stream = try await session.openStream()
+            try await stream.write(Data([0x01]))
+        case .keepalive:
+            let expected: SessionError
+            switch testCase.endpoint {
+            case .lan:
+                expected = .directKeepaliveMissed
+            case .relay:
+                expected = .relayKeepaliveMissed
+            }
+            #expect(await waitForFailure(expected, in: states))
+        }
+
+        #expect(await states.count(.failed(.revoked)) == 0)
+        await session.disconnect()
+        await states.stop()
+        await gate.cancelAll()
+    }
+
+    @Test func terminalInstallFailureOverridesGenericAndGenericCannotReplaceTerminal() async throws {
+        // A terminal peer denial must win the pre-publish failure latch in either arrival order.
+        let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: 443, scope: "local")
+        let tls = FakeTunnelTLS(sendError: NWError.tls(-9832))
+        let gate = KeepaliveTickGate()
+        let latches = InstallFailureLatchProbe()
+        let session = TunnelSession(
+            pairing: fakePairing(),
+            policy: fastKeepalivePolicy(runsOnRelayPath: false),
+            tlsConnector: ConnectorProbe { _, _, _ in
+                await tls.finishInbound(throwing: TunnelSessionTestError.fakePumpFault)
+                return tls
+            }.connector,
+            makeMultiplexer: { tls in
+                Multiplexer(
+                    sink: { data in try await tls.send(data) },
+                    sleeper: { duration in try await gate.sleep(duration) }
+                )
+            },
+            installWindowTestGate: {
+                await latches.waitForCount(1)
+                await gate.waitForObservedTick()
+                await gate.releaseOne()
+                await latches.waitForCount(2)
+            },
+            pendingInstallFailureTestObserver: {
+                await latches.record()
+            }
+        )
+        let states = await stateProbe(for: session)
+
+        await expectSessionError(.revoked) {
+            try await session.connect(endpoints: [endpoint])
+        }
+        #expect(await states.count(.failed(.revoked)) == 1)
+        #expect(await states.containsFailure { $0 == .inboundClosed(fault: "fakePumpFault") } == false)
+        await session.disconnect()
+        await states.stop()
+        await gate.cancelAll()
+    }
+}
+
+enum PostReadyTerminalIngress: CaseIterable, Sendable {
+    case receive
+    case open
+    case write
+    case close
+    case reset
+    case pong
+    case unknownStreamReset
+    case isolateReset
+    case window
+    case keepalive
+}
+
+struct PostReadyTerminalCase: Sendable {
+    let ingress: PostReadyTerminalIngress
+    let endpoint: TransportEndpoint
+
+    static let allCases = PostReadyTerminalIngress.allCases.flatMap { ingress in
+        [
+            PostReadyTerminalCase(
+                ingress: ingress,
+                endpoint: .lan(host: "127.0.0.1", port: 443, scope: "local")
+            ),
+            PostReadyTerminalCase(ingress: ingress, endpoint: relayEndpoint()),
+        ]
+    }
+}
+
+private func trigger(
+    _ ingress: PostReadyTerminalIngress,
+    tlsStatus: Int32,
+    session: TunnelSession,
+    tls: FakeTunnelTLS,
+    keepaliveGate: KeepaliveTickGate
+) async throws {
+    switch ingress {
+    case .receive:
+        await tls.finishInbound(throwing: NWError.tls(tlsStatus))
+    case .open:
+        await expectRawTLSError(tlsStatus) {
+            _ = try await session.openStream()
+        }
+    case .write:
+        await tls.setSendError(nil)
+        let stream = try await session.openStream()
+        await tls.setSendError(NWError.tls(tlsStatus))
+        await expectRawTLSError(tlsStatus) {
+            try await stream.write(Data([0x01]))
+        }
+    case .close:
+        await tls.setSendError(nil)
+        let stream = try await session.openStream()
+        await tls.setSendError(NWError.tls(tlsStatus))
+        await expectRawTLSError(tlsStatus) {
+            try await stream.close()
+        }
+    case .reset:
+        await tls.setSendError(nil)
+        let stream = try await session.openStream()
+        await tls.setSendError(NWError.tls(tlsStatus))
+        await stream.reset(reason: .internalError)
+    case .pong:
+        await tls.yieldInbound(try encodeFrame(buildPing(nonce: Data(repeating: 0, count: 8))))
+    case .unknownStreamReset:
+        await tls.yieldInbound(rawMuxFrame(streamID: 99, flags: FrameFlags.data.rawValue, payload: Data([0x01])))
+    case .isolateReset:
+        await tls.setSendError(nil)
+        let stream = try await session.openStream()
+        await tls.setSendError(NWError.tls(tlsStatus))
+        await tls.yieldInbound(rawMuxFrame(
+            streamID: stream.id,
+            flags: FrameFlags.data.rawValue | FrameFlags.window.rawValue
+        ))
+    case .window:
+        await tls.setSendError(nil)
+        let stream = try await session.openStream()
+        try await tls.yieldInbound(encodeFrame(buildData(
+            streamID: stream.id,
+            payload: Data(repeating: 0, count: MuxConstants.windowGrantThreshold)
+        )))
+        await tls.setSendError(NWError.tls(tlsStatus))
+        var iterator = stream.inbound.makeAsyncIterator()
+        await expectRawTLSError(tlsStatus) {
+            _ = try await iterator.next()
+        }
+    case .keepalive:
+        await keepaliveGate.waitForObservedTick()
+        await keepaliveGate.releaseOne()
+    }
+}
+
+private func expectRawTLSError(_ expectedStatus: Int32, operation: () async throws -> Void) async {
+    do {
+        try await operation()
+        Issue.record("Expected NWError.tls(\(expectedStatus))")
+    } catch let error as NWError {
+        #expect(error == .tls(expectedStatus))
+    } catch {
+        Issue.record("Expected NWError.tls(\(expectedStatus)), got \(error)")
+    }
+}
+
+private actor InstallFailureLatchProbe {
+    private var count = 0
+    private var waiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func record() {
+        count += 1
+        let ready = waiters.filter { count >= $0.count }
+        waiters.removeAll { count >= $0.count }
+        for waiter in ready {
+            waiter.continuation.resume()
+        }
+    }
+
+    func waitForCount(_ expected: Int) async {
+        guard count < expected else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append((count: expected, continuation: continuation))
+        }
     }
 }
 

@@ -420,6 +420,45 @@ struct RaceCoordinatorTests {
         }
     }
 
+    @Test(arguments: [false, true])
+    func peerAccessDeniedShortCircuitDrainsCollectedSuccesses(terminalIsRelay: Bool) async {
+        // Security/SecBase.h: access denied terminates the race and closes an already-ready competitor.
+        let direct = TransportEndpoint.lan(host: "10.0.0.5", port: 443, scope: "local")
+        let relay = TransportEndpoint.relay(
+            endpoint: URL(string: "wss://relay.example/session")!,
+            instanceID: "instance",
+            deviceToken: "token"
+        )
+        let terminal = terminalIsRelay ? relay : direct
+        let successful = terminalIsRelay ? direct : relay
+        let successReady = TestSignal()
+        let releaseTerminal = TestSignal()
+        let closeLog = CloseLog()
+        let coordinator = RaceCoordinator<DiscardValue>(
+            stagger: .milliseconds(0),
+            loserGrace: .seconds(1),
+            budget: .seconds(1),
+            close: { value in await closeLog.record(value.id) }
+        ) { endpoint, _ in
+            if endpoint == terminal {
+                await releaseTerminal.wait()
+                throw InnerTLSError.peerAccessDenied
+            }
+            await successReady.signal()
+            return DiscardValue(id: endpoint == direct ? 1 : 2)
+        }
+
+        let task = Task {
+            try await coordinator.connect(endpoints: [direct, relay])
+        }
+        await successReady.wait()
+        await releaseTerminal.signal()
+        await expectSessionError(.revoked) {
+            _ = try await task.value
+        }
+        #expect(await closeLog.count(successful == direct ? 1 : 2) == 1)
+    }
+
     @Test func relayCloseUnauthorizedWinsAllFailSurfaceAsAuthRefreshRequired() async {
         let direct = TransportEndpoint.lan(host: "10.0.0.5", port: 443, scope: "local")
         let relay = TransportEndpoint.relay(

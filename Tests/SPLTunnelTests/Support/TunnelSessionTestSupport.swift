@@ -79,11 +79,11 @@ actor FakeTunnelTLS: TunnelTLSIO {
 
     private let inboundStream: AsyncThrowingStream<Data, Error>
     private let inboundContinuation: AsyncThrowingStream<Data, Error>.Continuation
-    private let sendError: MuxError?
+    private var sendError: (any Error)?
     private(set) var sendCount = 0
     private(set) var closeCount = 0
 
-    init(sendError: MuxError? = nil) {
+    init(sendError: (any Error)? = nil) {
         self.sendError = sendError
         var continuation: AsyncThrowingStream<Data, Error>.Continuation!
         self.inboundStream = AsyncThrowingStream<Data, Error> { continuation = $0 }
@@ -95,6 +95,14 @@ actor FakeTunnelTLS: TunnelTLSIO {
         if let sendError {
             throw sendError
         }
+    }
+
+    func setSendError(_ error: (any Error)?) {
+        sendError = error
+    }
+
+    func yieldInbound(_ data: Data) {
+        inboundContinuation.yield(data)
     }
 
     func close() async {

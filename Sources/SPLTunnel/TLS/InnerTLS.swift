@@ -22,6 +22,7 @@ public enum InnerTLSError: Error, Equatable, Sendable {
     case invalidPrivateKey
     case peerNotPinned
     case caFingerprintMismatch
+    case peerAccessDenied
     case handshakeFailed(String)
     case sendFailed(String)
     case receiveFailed(String)
@@ -311,7 +312,10 @@ public actor InnerTLS {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 connection.send(content: plaintext, completion: .contentProcessed { error in
                     if let error {
-                        continuation.resume(throwing: InnerTLSError.sendFailed(error.localizedDescription))
+                        let mapped: InnerTLSError = isPeerAccessDenied(error)
+                            ? .peerAccessDenied
+                            : .sendFailed(error.localizedDescription)
+                        continuation.resume(throwing: mapped)
                     } else {
                         continuation.resume()
                     }
@@ -351,7 +355,10 @@ public actor InnerTLS {
                 }
                 inboundContinuation.finish()
             } catch {
-                inboundContinuation.finish(throwing: InnerTLSError.receiveFailed(error.localizedDescription))
+                let mapped: InnerTLSError = isPeerAccessDenied(error)
+                    ? .peerAccessDenied
+                    : .receiveFailed(error.localizedDescription)
+                inboundContinuation.finish(throwing: mapped)
             }
         }
     }
@@ -682,12 +689,10 @@ func startAndReturnReadyWaiter(_ connection: NWConnection) -> InnerTLSConnection
         switch state {
         case .ready:
             waiter.complete(.success(()))
-        case .failed(let error):
-            waiter.complete(.failure(InnerTLSError.handshakeFailed(error.localizedDescription)))
+        case .failed(let error), .waiting(let error):
+            waiter.complete(.failure(innerTLSError(for: error)))
         case .cancelled:
             waiter.complete(.failure(InnerTLSError.closed))
-        case .waiting(let error):
-            waiter.complete(.failure(InnerTLSError.handshakeFailed(error.localizedDescription)))
         case .setup, .preparing:
             break
         @unknown default:
@@ -696,6 +701,27 @@ func startAndReturnReadyWaiter(_ connection: NWConnection) -> InnerTLSConnection
     }
     connection.start(queue: tlsQueue)
     return waiter
+}
+
+func innerTLSError(for error: any Error) -> InnerTLSError {
+    if isPeerAccessDenied(error) {
+        return .peerAccessDenied
+    }
+    return .handshakeFailed(error.localizedDescription)
+}
+
+func isPeerAccessDenied(_ error: any Error) -> Bool {
+    // InnerTLS carries the production mapping; raw NWError remains accepted so post-ready tests can inject it.
+    if let tlsError = error as? InnerTLSError, tlsError == .peerAccessDenied {
+        return true
+    }
+    guard let networkError = error as? NWError else {
+        return false
+    }
+    if case let .tls(status) = networkError {
+        return status == errSSLPeerAccessDenied
+    }
+    return false
 }
 
 private func startAndWaitReady(_ listener: NWListener) async throws {

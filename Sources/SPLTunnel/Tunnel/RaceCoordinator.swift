@@ -135,7 +135,6 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
             var successes: [(order: Int, endpoint: TransportEndpoint, value: Value)] = []
             var closedOrders = Set<Int>()
             var graceStarted = false
-            var sawRevocation = false
             var sawNotEntitled = false
             var sawAuthRefreshRequired = false
 
@@ -188,7 +187,8 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                         await waitingTracker.clearWaiting(order: order)
                         failures += 1
                         if error == .revoked {
-                            sawRevocation = true
+                            await cancelAndDrain(winnerOrder: nil)
+                            throw SessionError.revoked
                         }
                         if error == .notEntitled {
                             sawNotEntitled = true
@@ -198,7 +198,6 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                         }
                         if failures == sorted.count, successes.isEmpty {
                             let aggregate = Self.aggregateFailure(
-                                sawRevocation: sawRevocation,
                                 sawNotEntitled: sawNotEntitled,
                                 sawAuthRefreshRequired: sawAuthRefreshRequired
                             )
@@ -216,7 +215,6 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                             return RaceResult(endpoint: winner.endpoint, value: winner.value)
                         }
                         let aggregate = Self.aggregateFailure(
-                            sawRevocation: sawRevocation,
                             sawNotEntitled: sawNotEntitled,
                             sawAuthRefreshRequired: sawAuthRefreshRequired
                         )
@@ -226,7 +224,6 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                     case .graceExpired:
                         guard let winner = successes.min(by: { $0.order < $1.order }) else {
                             let aggregate = Self.aggregateFailure(
-                                sawRevocation: sawRevocation,
                                 sawNotEntitled: sawNotEntitled,
                                 sawAuthRefreshRequired: sawAuthRefreshRequired
                             )
@@ -245,7 +242,6 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
 
             guard let winner = successes.min(by: { $0.order < $1.order }) else {
                 throw Self.aggregateFailure(
-                    sawRevocation: sawRevocation,
                     sawNotEntitled: sawNotEntitled,
                     sawAuthRefreshRequired: sawAuthRefreshRequired
                 )
@@ -315,6 +311,9 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
            dialError == .relayNotEntitled {
             return .notEntitled
         }
+        if isPeerAccessDenied(error) {
+            return .revoked
+        }
         if let tlsError = error as? InnerTLSError {
             return .tlsFailed(String(describing: tlsError))
         }
@@ -322,13 +321,9 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
     }
 
     static func aggregateFailure(
-        sawRevocation: Bool,
         sawNotEntitled: Bool,
         sawAuthRefreshRequired: Bool
     ) -> SessionError {
-        if sawRevocation {
-            return .revoked
-        }
         if sawNotEntitled {
             return .notEntitled
         }

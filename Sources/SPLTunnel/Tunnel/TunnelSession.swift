@@ -15,6 +15,30 @@ protocol TunnelTLSIO: Sendable {
 
 extension InnerTLS: TunnelTLSIO {}
 
+private struct RevocationReportingTunnelTLS: TunnelTLSIO {
+    let base: any TunnelTLSIO
+    let report: @Sendable () async -> Void
+
+    var inbound: AsyncThrowingStream<Data, Error> {
+        base.inbound
+    }
+
+    func send(_ data: Data) async throws {
+        do {
+            try await base.send(data)
+        } catch {
+            if isPeerAccessDenied(error) {
+                await report()
+            }
+            throw error
+        }
+    }
+
+    func close() async {
+        await base.close()
+    }
+}
+
 typealias TunnelTLSConnector = @Sendable (
     TransportEndpoint,
     StoredPairing,
@@ -248,7 +272,10 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         let pumpID = UUID()
         inboundPumpID = pumpID
         pendingInstallFailure = nil
-        let mux = makeMultiplexer(tls)
+        let reportingTLS = RevocationReportingTunnelTLS(base: tls) { [weak self, pumpID] in
+            await self?.handlePeerAccessDenied(id: pumpID)
+        }
+        let mux = makeMultiplexer(reportingTLS)
         multiplexer = mux
 
         inboundPumpTask = Task {
@@ -282,6 +309,10 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
 
     private func handlePumpEnded(id: UUID, error: (any Error)?) async {
         guard inboundPumpID == id else {
+            return
+        }
+        if let error, isPeerAccessDenied(error) {
+            await handlePeerAccessDenied(id: id)
             return
         }
         let fault = error.map { String(describing: $0) }
@@ -333,6 +364,34 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         await tearDownCurrent(reason: tearDownReason)
     }
 
+    private func handlePeerAccessDenied(id: UUID) async {
+        guard inboundPumpID == id else {
+            return
+        }
+        guard !isTerminated else {
+            return
+        }
+        let isConnected: Bool
+        if case .connected = state {
+            isConnected = true
+        } else {
+            isConnected = false
+        }
+        guard isConnected || pendingInstallFailure?.error != .revoked else {
+            return
+        }
+        sessionLog.notice("terminal peer access denied")
+        if isConnected {
+            await failConnectedSession(.revoked, tearDownReason: .transportFailure)
+            return
+        }
+        await recordPendingInstallFailure(
+            id: id,
+            error: .revoked,
+            tearDownReason: .transportFailure
+        )
+    }
+
     private func tearDownCurrent(reason: TearDownReason) async {
         inboundPumpID = nil
         pendingInstallFailure = nil
@@ -364,7 +423,9 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         error: SessionError,
         tearDownReason: TearDownReason
     ) async {
-        guard pendingInstallFailure == nil else {
+        guard pendingInstallFailure == nil || (
+            pendingInstallFailure?.error != .revoked && error == .revoked
+        ) else {
             return
         }
         pendingInstallFailure = PendingInstallFailure(
