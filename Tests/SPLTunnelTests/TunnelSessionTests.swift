@@ -530,6 +530,7 @@ struct TunnelSessionTests {
         try await trigger(
             testCase.ingress,
             tlsStatus: -9832,
+            expectation: .sessionError(.revoked),
             session: session,
             tls: tls,
             keepaliveGate: gate
@@ -537,6 +538,7 @@ struct TunnelSessionTests {
 
         #expect(await waitForFailure(.revoked, in: states))
         #expect(await states.count(.failed(.revoked)) == 1)
+        #expect(await states.containsFailure { $0 != .revoked } == false)
         #expect(await tls.closeCount == 1)
         await session.disconnect()
         await states.stop()
@@ -573,6 +575,7 @@ struct TunnelSessionTests {
         try await trigger(
             testCase.ingress,
             tlsStatus: -9838,
+            expectation: .rawTLS(-9838),
             session: session,
             tls: tls,
             keepaliveGate: gate
@@ -685,6 +688,7 @@ struct PostReadyTerminalCase: Sendable {
 private func trigger(
     _ ingress: PostReadyTerminalIngress,
     tlsStatus: Int32,
+    expectation: PostReadyThrowExpectation,
     session: TunnelSession,
     tls: FakeTunnelTLS,
     keepaliveGate: KeepaliveTickGate
@@ -693,21 +697,21 @@ private func trigger(
     case .receive:
         await tls.finishInbound(throwing: NWError.tls(tlsStatus))
     case .open:
-        await expectRawTLSError(tlsStatus) {
+        await expectPostReadyThrow(expectation) {
             _ = try await session.openStream()
         }
     case .write:
         await tls.setSendError(nil)
         let stream = try await session.openStream()
         await tls.setSendError(NWError.tls(tlsStatus))
-        await expectRawTLSError(tlsStatus) {
+        await expectPostReadyThrow(expectation) {
             try await stream.write(Data([0x01]))
         }
     case .close:
         await tls.setSendError(nil)
         let stream = try await session.openStream()
         await tls.setSendError(NWError.tls(tlsStatus))
-        await expectRawTLSError(tlsStatus) {
+        await expectPostReadyThrow(expectation) {
             try await stream.close()
         }
     case .reset:
@@ -736,7 +740,7 @@ private func trigger(
         )))
         await tls.setSendError(NWError.tls(tlsStatus))
         var iterator = stream.inbound.makeAsyncIterator()
-        await expectRawTLSError(tlsStatus) {
+        await expectPostReadyThrow(expectation) {
             _ = try await iterator.next()
         }
     case .keepalive:
@@ -745,9 +749,29 @@ private func trigger(
     }
 }
 
-private func expectRawTLSError(_ expectedStatus: Int32, operation: () async throws -> Void) async {
+private enum PostReadyThrowExpectation: Sendable {
+    case rawTLS(Int32)
+    case sessionError(SessionError)
+}
+
+private func expectPostReadyThrow<T: Sendable>(
+    _ expectation: PostReadyThrowExpectation,
+    operation: () async throws -> T
+) async {
+    switch expectation {
+    case .rawTLS(let status):
+        await expectRawTLSError(status, operation: operation)
+    case .sessionError(let error):
+        await expectSessionError(error, operation: operation)
+    }
+}
+
+private func expectRawTLSError<T: Sendable>(
+    _ expectedStatus: Int32,
+    operation: () async throws -> T
+) async {
     do {
-        try await operation()
+        _ = try await operation()
         Issue.record("Expected NWError.tls(\(expectedStatus))")
     } catch let error as NWError {
         #expect(error == .tls(expectedStatus))

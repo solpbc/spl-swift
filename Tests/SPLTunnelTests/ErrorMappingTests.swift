@@ -35,7 +35,6 @@ struct ErrorMappingTests {
     @Test func peerAccessDeniedClassifierRecognizesOnlyAccessDenied() {
         // Security/SecBase.h: errSSLPeerAccessDenied is the sole terminal TLS status.
         #expect(isPeerAccessDenied(NWError.tls(-9832)))
-        #expect(isPeerAccessDenied(InnerTLSError.peerAccessDenied))
         #expect(isPeerAccessDenied(NWError.tls(-9838)) == false)
         #expect(isPeerAccessDenied(NWError.tls(-9800)) == false)
         #expect(isPeerAccessDenied(NWError.posix(.ECONNREFUSED)) == false)
@@ -43,7 +42,7 @@ struct ErrorMappingTests {
 
     @Test func peerAccessDeniedMapsToRevoked() {
         // Security/SecBase.h: access denied is a terminal session revocation signal.
-        #expect(RaceCoordinator<Int>.sessionError(from: InnerTLSError.peerAccessDenied) == .revoked)
+        #expect(RaceCoordinator<Int>.sessionError(from: NWError.tls(-9832)) == .revoked)
     }
 
     @Test func otherDialErrorMapsToUnreachable() {

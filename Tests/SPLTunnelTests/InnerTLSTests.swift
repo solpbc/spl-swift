@@ -24,11 +24,12 @@ struct InnerTLSTests {
                 Issue.record("Expected a pre-ready Network.framework error")
                 continue
             }
-            #expect(innerTLSError(for: error) == .peerAccessDenied)
+            #expect(RaceCoordinator<Int>.sessionError(from: innerTLSError(for: error)) == .revoked)
         }
 
         for error in [NWError.tls(-9838), NWError.tls(-9800), NWError.posix(.ECONNREFUSED)] {
-            guard case .handshakeFailed = innerTLSError(for: error) else {
+            guard let tlsError = innerTLSError(for: error) as? InnerTLSError,
+                  case .handshakeFailed = tlsError else {
                 Issue.record("Expected generic handshake failure")
                 continue
             }

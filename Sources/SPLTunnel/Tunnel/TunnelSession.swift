@@ -29,6 +29,7 @@ private struct RevocationReportingTunnelTLS: TunnelTLSIO {
         } catch {
             if isPeerAccessDenied(error) {
                 await report()
+                throw SessionError.revoked
             }
             throw error
         }
@@ -70,6 +71,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private let makeMultiplexer: TunnelMuxFactory
     private let installWindowTestGate: @Sendable () async -> Void
     private let pendingInstallFailureTestObserver: @Sendable () async -> Void
+    private let postReadyFailureTestGate: @Sendable (SessionError) async -> Void
     private let stateStream: AsyncStream<TunnelState>
     private let stateContinuation: AsyncStream<TunnelState>.Continuation
     private let connectionModeStream: AsyncStream<ConnectionMode?>
@@ -82,6 +84,9 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private var multiplexer: Multiplexer?
     private var activeEndpoint: TransportEndpoint?
     private var pendingInstallFailure: PendingInstallFailure?
+    // why: A generic post-ready failure may publish before a concurrent terminal TLS callback;
+    // retain its epoch through teardown so .revoked can win, then close on terminal, disconnect, or successor install.
+    private var terminalEligiblePumpID: UUID?
     private var isTerminated = false
 
     public init(
@@ -110,7 +115,10 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         installWindowTestGate: @escaping @Sendable () async -> Void = {},
         // Internal test observation point for the pending install-failure latch.
         // The default has no production effect.
-        pendingInstallFailureTestObserver: @escaping @Sendable () async -> Void = {}
+        pendingInstallFailureTestObserver: @escaping @Sendable () async -> Void = {},
+        // Internal test seam for holding a post-ready failure before teardown clears its epoch.
+        // The default has no production effect.
+        postReadyFailureTestGate: @escaping @Sendable (SessionError) async -> Void = { _ in }
     ) {
         self.pairing = pairing
         self.policy = policy
@@ -118,6 +126,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         self.makeMultiplexer = makeMultiplexer
         self.installWindowTestGate = installWindowTestGate
         self.pendingInstallFailureTestObserver = pendingInstallFailureTestObserver
+        self.postReadyFailureTestGate = postReadyFailureTestGate
 
         let state = AsyncStream<TunnelState>.makeStream()
         self.stateStream = state.stream
@@ -163,6 +172,8 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
 
     public func disconnect() async {
         isTerminated = true
+        // A user disconnect closes the terminal eligibility window.
+        terminalEligiblePumpID = nil
         await tearDownCurrent(reason: .normalShutdown)
         setConnectionMode(nil)
         publish(.disconnected)
@@ -271,6 +282,8 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         innerTLS = tls
         let pumpID = UUID()
         inboundPumpID = pumpID
+        // Replacing the value closes the previous terminal eligibility window.
+        terminalEligiblePumpID = pumpID
         pendingInstallFailure = nil
         let reportingTLS = RevocationReportingTunnelTLS(base: tls) { [weak self, pumpID] in
             await self?.handlePeerAccessDenied(id: pumpID)
@@ -308,10 +321,11 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     }
 
     private func handlePumpEnded(id: UUID, error: (any Error)?) async {
-        guard inboundPumpID == id else {
+        let isTerminalError = error.map(isTerminalPeerAccessDenied) ?? false
+        guard inboundPumpID == id || (isTerminalError && terminalEligiblePumpID == id) else {
             return
         }
-        if let error, isPeerAccessDenied(error) {
+        if isTerminalError {
             await handlePeerAccessDenied(id: id)
             return
         }
@@ -361,30 +375,35 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
             return
         }
         publish(.failed(error))
+        await postReadyFailureTestGate(error)
         await tearDownCurrent(reason: tearDownReason)
     }
 
     private func handlePeerAccessDenied(id: UUID) async {
-        guard inboundPumpID == id else {
+        guard terminalEligiblePumpID == id else {
             return
         }
-        guard !isTerminated else {
+        if case .disconnected = state {
+            // A disconnected session cannot be revived by a stale terminal callback.
+            terminalEligiblePumpID = nil
             return
         }
+        // Consuming the epoch makes a second terminal callback for it a no-op.
+        terminalEligiblePumpID = nil
         let isConnected: Bool
         if case .connected = state {
             isConnected = true
         } else {
             isConnected = false
         }
-        // A terminal .revoked may replace a generic latch; a generic cannot replace it, and a second .revoked is a no-op.
-        let terminalLatchAlreadyHeld = pendingInstallFailure?.error == .revoked
-        guard isConnected || !terminalLatchAlreadyHeld else {
-            return
-        }
         sessionLog.notice("terminal peer access denied")
         if isConnected {
             await failConnectedSession(.revoked, tearDownReason: .transportFailure)
+            return
+        }
+        if case .failed = state {
+            publish(.failed(.revoked))
+            await tearDownCurrent(reason: .transportFailure)
             return
         }
         await recordPendingInstallFailure(
@@ -445,6 +464,13 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         case .relay:
             return .relayKeepaliveMissed
         }
+    }
+
+    private func isTerminalPeerAccessDenied(_ error: any Error) -> Bool {
+        if let sessionError = error as? SessionError, sessionError == .revoked {
+            return true
+        }
+        return isPeerAccessDenied(error)
     }
 
     private func publish(_ newState: TunnelState) {

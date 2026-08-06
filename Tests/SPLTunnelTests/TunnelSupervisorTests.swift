@@ -7,6 +7,7 @@ import Testing
 @testable import SPLTunnel
 
 private let supervisorClientInfo = SPLClientInfo(userAgent: "spl-swift-supervisor-tests/1")
+private struct PostReadyRaceTestError: Error, Sendable {}
 
 @Suite(
     "TunnelSupervisor",
@@ -264,6 +265,121 @@ struct TunnelSupervisorTests {
         _ = try await supervisor.connect(endpoints: [relay])
         #expect(await factory.count() == 2)
         await supervisor.disconnect()
+        await states.stop()
+        await reconnects.stop()
+    }
+
+    @Test func genericPostReadyFailureThenPeerAccessDeniedPausesWithoutSuccessor() async throws {
+        // Security/SecBase.h: access denied must override an already-published generic child failure.
+        let endpoint = directEndpoint("10.0.0.5")
+        let tls = FakeTunnelTLS()
+        let connector = ConnectorProbe { _, _, _ in tls }
+        let genericFailureEntered = TestSignal()
+        let releaseGenericFailure = TestSignal()
+        let sleeper = SleepProbe()
+        let supervisor = supervisorWithConnector(
+            connector,
+            racePolicy: allCandidatesRacePolicy(),
+            sleeper: sleeper.sleep,
+            postReadyFailureTestGate: { error in
+                guard case .inboundClosed = error else {
+                    return
+                }
+                await genericFailureEntered.signal()
+                await releaseGenericFailure.wait()
+            }
+        )
+        let states = await stateProbe(for: supervisor)
+        let reconnects = await reconnectProbe(for: supervisor)
+        let terminalStatus = ReconnectStatus(
+            reason: .revoked,
+            attempt: 1,
+            retryAfter: nil,
+            terminalPause: true
+        )
+
+        _ = try await supervisor.connect(endpoints: [endpoint])
+        let stream = try await supervisor.openStream()
+        await tls.finishInbound(throwing: PostReadyRaceTestError())
+        await genericFailureEntered.wait()
+        await sleeper.waitForSleepCount(excluding: .seconds(60), target: 1)
+
+        await tls.setSendError(NWError.tls(-9832))
+        await expectSessionError(.revoked) {
+            try await stream.write(Data([0x01]))
+        }
+
+        #expect(await waitForFailure(.revoked, in: states))
+        #expect(await states.count(.failed(.revoked)) == 1)
+        #expect(await reconnects.count(terminalStatus) == 1)
+        #expect(await conditionObserved(timeout: .milliseconds(100)) {
+            await connector.invocationCount > 1
+        } == false)
+
+        await releaseGenericFailure.signal()
+        await supervisor.disconnect()
+        await sleeper.releaseSleeps()
+        await states.stop()
+        await reconnects.stop()
+    }
+
+    @Test func peerAccessDeniedThenGenericPostReadyFailurePausesOnceAndRearms() async throws {
+        // Security/SecBase.h: a later generic callback cannot displace a terminal access denial.
+        let endpoint = directEndpoint("10.0.0.5")
+        let tls = FakeTunnelTLS()
+        let replacementTLS = FakeTunnelTLS()
+        let tlsSequence = TunnelTLSSequence([tls, replacementTLS])
+        let connector = ConnectorProbe { _, _, _ in
+            await tlsSequence.next()
+        }
+        let terminalFailureEntered = TestSignal()
+        let releaseTerminalFailure = TestSignal()
+        let sleeper = SleepProbe()
+        let supervisor = supervisorWithConnector(
+            connector,
+            racePolicy: allCandidatesRacePolicy(),
+            sleeper: sleeper.sleep,
+            postReadyFailureTestGate: { error in
+                guard error == .revoked else {
+                    return
+                }
+                await terminalFailureEntered.signal()
+                await releaseTerminalFailure.wait()
+            }
+        )
+        let states = await stateProbe(for: supervisor)
+        let reconnects = await reconnectProbe(for: supervisor)
+        let terminalStatus = ReconnectStatus(
+            reason: .revoked,
+            attempt: 1,
+            retryAfter: nil,
+            terminalPause: true
+        )
+
+        _ = try await supervisor.connect(endpoints: [endpoint])
+        let stream = try await supervisor.openStream()
+        await tls.setSendError(NWError.tls(-9832))
+        let deniedWrite = Task {
+            try await stream.write(Data([0x01]))
+        }
+        await terminalFailureEntered.wait()
+        await tls.finishInbound(throwing: PostReadyRaceTestError())
+        await releaseTerminalFailure.signal()
+
+        await expectSessionError(.revoked) {
+            try await deniedWrite.value
+        }
+        #expect(await waitForFailure(.revoked, in: states))
+        #expect(await states.count(.failed(.revoked)) == 1)
+        #expect(await reconnects.count(terminalStatus) == 1)
+        #expect(await conditionObserved(timeout: .milliseconds(100)) {
+            await connector.invocationCount > 1
+        } == false)
+
+        _ = try await supervisor.connect(endpoints: [endpoint])
+        #expect(await connector.invocationCount == 2)
+        await supervisor.disconnect()
+        await sleeper.releaseSleeps()
         await states.stop()
         await reconnects.stop()
     }
@@ -722,18 +838,37 @@ private func fakeSupervisor(
 
 private func supervisorWithConnector(
     _ connector: ConnectorProbe,
-    racePolicy: RacePolicy
+    racePolicy: RacePolicy,
+    sleeper: @escaping @Sendable (Duration) async throws -> Void = { _ in },
+    postReadyFailureTestGate: @escaping @Sendable (SessionError) async -> Void = { _ in }
 ) -> TunnelSupervisor {
     TunnelSupervisor(
         pairing: fakePairing(),
         clientInfo: supervisorClientInfo,
         policy: SessionPolicy(race: racePolicy),
         reconnectBackoff: ReconnectBackoff(schedule: .table([.milliseconds(1)]), random: { _ in 1.0 }),
-        sleeper: { _ in },
+        sleeper: sleeper,
         makeSession: { pairing, _, policy in
-            TunnelSession(pairing: pairing, policy: policy, tlsConnector: connector.connector)
+            TunnelSession(
+                pairing: pairing,
+                policy: policy,
+                tlsConnector: connector.connector,
+                postReadyFailureTestGate: postReadyFailureTestGate
+            )
         }
     )
+}
+
+private actor TunnelTLSSequence {
+    private var values: [any TunnelTLSIO]
+
+    init(_ values: [any TunnelTLSIO]) {
+        self.values = values
+    }
+
+    func next() -> any TunnelTLSIO {
+        values.removeFirst()
+    }
 }
 
 private func allCandidatesRacePolicy() -> RacePolicy {

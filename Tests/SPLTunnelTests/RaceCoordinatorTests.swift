@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 import Foundation
+import Network
 import Testing
 @testable import SPLTunnel
 
@@ -442,7 +443,7 @@ struct RaceCoordinatorTests {
         ) { endpoint, _ in
             if endpoint == terminal {
                 await releaseTerminal.wait()
-                throw InnerTLSError.peerAccessDenied
+                throw NWError.tls(-9832)
             }
             await successReady.signal()
             return DiscardValue(id: endpoint == direct ? 1 : 2)

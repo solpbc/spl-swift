@@ -233,6 +233,9 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         do {
             return try await current.session.openStream()
         } catch {
+            if let sessionError = error as? SessionError, sessionError == .revoked {
+                throw sessionError
+            }
             if generation?.token == current.token, connectingToken != current.token {
                 requestRedrive(
                     reason: .transportFailed("mux closed"),
