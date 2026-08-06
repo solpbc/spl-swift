@@ -377,7 +377,9 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         } else {
             isConnected = false
         }
-        guard isConnected || pendingInstallFailure?.error != .revoked else {
+        // A terminal .revoked may replace a generic latch; a generic cannot replace it, and a second .revoked is a no-op.
+        let terminalLatchAlreadyHeld = pendingInstallFailure?.error == .revoked
+        guard isConnected || !terminalLatchAlreadyHeld else {
             return
         }
         sessionLog.notice("terminal peer access denied")

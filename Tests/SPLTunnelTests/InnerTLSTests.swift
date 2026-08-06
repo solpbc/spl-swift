@@ -240,14 +240,3 @@ struct InnerTLSTests {
         }
     }
 }
-
-private func preReadyNetworkError(from state: NWConnection.State) -> NWError? {
-    switch state {
-    case .failed(let error), .waiting(let error):
-        return error
-    case .setup, .preparing, .ready, .cancelled:
-        return nil
-    @unknown default:
-        return nil
-    }
-}
