@@ -1105,6 +1105,12 @@ private func assertSingleTerminalRevocation(
         #expect(Bool(false))
         return false
     }
+    guard await waitUntil("terminal reconnect status", condition: {
+        await reconnects.count(terminalRevocationStatus) >= 1
+    }) else {
+        #expect(Bool(false))
+        return false
+    }
     let singleFailure = await states.count(.failed(.revoked)) == 1
     let singlePause = await reconnects.count(terminalRevocationStatus) == 1
     #expect(singleFailure)
