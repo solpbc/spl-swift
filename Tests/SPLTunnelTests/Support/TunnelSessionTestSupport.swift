@@ -80,6 +80,7 @@ actor FakeTunnelTLS: TunnelTLSIO {
     private let inboundStream: AsyncThrowingStream<Data, Error>
     private let inboundContinuation: AsyncThrowingStream<Data, Error>.Continuation
     private var sendError: (any Error)?
+    private var sendGates: [FakeTunnelTLSSendGate] = []
     private(set) var sendCount = 0
     private(set) var closeCount = 0
 
@@ -92,6 +93,8 @@ actor FakeTunnelTLS: TunnelTLSIO {
 
     func send(_ data: Data) async throws {
         sendCount += 1
+        let gate = sendGates.isEmpty ? nil : sendGates.removeFirst()
+        await gate?.waitForRelease()
         if let sendError {
             throw sendError
         }
@@ -99,6 +102,10 @@ actor FakeTunnelTLS: TunnelTLSIO {
 
     func setSendError(_ error: (any Error)?) {
         sendError = error
+    }
+
+    func enqueueSendGate(_ gate: FakeTunnelTLSSendGate) {
+        sendGates.append(gate)
     }
 
     func yieldInbound(_ data: Data) {
@@ -116,6 +123,24 @@ actor FakeTunnelTLS: TunnelTLSIO {
         } else {
             inboundContinuation.finish()
         }
+    }
+}
+
+actor FakeTunnelTLSSendGate {
+    private let entered = TestSignal()
+    private let released = TestSignal()
+
+    func waitForEntry() async {
+        await entered.wait()
+    }
+
+    func release() async {
+        await released.signal()
+    }
+
+    func waitForRelease() async {
+        await entered.signal()
+        await released.wait()
     }
 }
 

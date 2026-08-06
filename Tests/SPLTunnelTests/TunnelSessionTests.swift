@@ -237,6 +237,7 @@ struct TunnelSessionTests {
         }
 
         #expect(await states.count(.connected(via: endpoint.connectedVia)) == 0)
+        #expect(await waitForFailure(.directKeepaliveMissed, in: states))
         #expect(await states.count(.failed(.directKeepaliveMissed)) == 1)
         #expect(await tls.closeCount == 1)
         await session.disconnect()
@@ -649,6 +650,7 @@ struct TunnelSessionTests {
         await expectSessionError(.revoked) {
             try await session.connect(endpoints: [endpoint])
         }
+        #expect(await waitForFailure(.revoked, in: states))
         #expect(await states.count(.failed(.revoked)) == 1)
         #expect(await states.containsFailure { $0 == .inboundClosed(fault: "fakePumpFault") } == false)
         await session.disconnect()

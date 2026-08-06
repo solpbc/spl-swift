@@ -65,6 +65,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         let session: any TunnelGeneration
     }
 
+    private struct RetiringGeneration: Sendable {
+        let generation: Generation
+        let stateTask: Task<Void, Never>?
+    }
+
     private struct Establishment: Sendable {
         let token: UInt64
         let task: Task<ConnectedVia, Error>
@@ -107,6 +112,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
 
     private var lifecycle: Lifecycle = .idle
     private var generation: Generation?
+    private var retiringGeneration: RetiringGeneration?
     private var nextGenerationToken: UInt64 = 0
     private var connectingToken: UInt64?
     private var establishment: Establishment?
@@ -360,6 +366,10 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             }
             connectingToken = nil
             currentVia = via
+            await commitRetiringGeneration()
+            guard generation?.token == token, lifecycle == .running else {
+                throw SessionError.notConnected
+            }
             planner.noteConnected(endpoint: endpoint, now: now())
             armStabilityTimer(for: token)
             supervisorLog.notice("supervisor connected generation=\(token, privacy: .public)")
@@ -376,7 +386,14 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     }
 
     private func installGeneration(_ session: any TunnelGeneration, token: UInt64) async {
-        await clearGeneration(disconnect: true)
+        cancelStabilityTimer()
+        let outgoing = generation
+        let shouldRetireOutgoing = outgoing.map { generationFailure?.token == $0.token } ?? false
+        if shouldRetireOutgoing, retiringGeneration == nil, let outgoing {
+            retireActiveGeneration(outgoing)
+        } else {
+            await clearActiveGeneration(disconnect: true)
+        }
         generation = Generation(token: token, session: session)
         currentVia = nil
         generationFailure = nil
@@ -394,6 +411,21 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
 
     private func clearGeneration(disconnect: Bool) async {
         cancelStabilityTimer()
+        await clearActiveGeneration(disconnect: disconnect)
+        await clearRetiringGeneration(disconnect: disconnect)
+    }
+
+    private func retireActiveGeneration(_ outgoing: Generation) {
+        let outgoingStateTask = stateTask
+        stateTask = nil
+        modeTask?.cancel()
+        modeTask = nil
+        generation = nil
+        generationFailure = nil
+        retiringGeneration = RetiringGeneration(generation: outgoing, stateTask: outgoingStateTask)
+    }
+
+    private func clearActiveGeneration(disconnect: Bool) async {
         stateTask?.cancel()
         stateTask = nil
         modeTask?.cancel()
@@ -403,6 +435,26 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         generationFailure = nil
         if disconnect {
             await session?.disconnect()
+        }
+    }
+
+    private func commitRetiringGeneration() async {
+        guard let retiringGeneration else {
+            return
+        }
+        self.retiringGeneration = nil
+        retiringGeneration.stateTask?.cancel()
+        await retiringGeneration.generation.session.disconnect()
+    }
+
+    private func clearRetiringGeneration(disconnect: Bool) async {
+        guard let retiringGeneration else {
+            return
+        }
+        self.retiringGeneration = nil
+        retiringGeneration.stateTask?.cancel()
+        if disconnect {
+            await retiringGeneration.generation.session.disconnect()
         }
     }
 
@@ -446,10 +498,19 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     }
 
     private func handleChildState(_ childState: TunnelState, token: UInt64) async {
-        guard generation?.token == token else {
+        if generation?.token == token {
+            await handleActiveChildState(childState, token: token)
             return
         }
 
+        guard retiringGeneration?.generation.token == token,
+              case .failed(.revoked) = childState else {
+            return
+        }
+        await pause(.revoked)
+    }
+
+    private func handleActiveChildState(_ childState: TunnelState, token: UInt64) async {
         switch childState {
         case .disconnected:
             break

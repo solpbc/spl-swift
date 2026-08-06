@@ -71,7 +71,6 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private let makeMultiplexer: TunnelMuxFactory
     private let installWindowTestGate: @Sendable () async -> Void
     private let pendingInstallFailureTestObserver: @Sendable () async -> Void
-    private let postReadyFailureTestGate: @Sendable (SessionError) async -> Void
     private let stateStream: AsyncStream<TunnelState>
     private let stateContinuation: AsyncStream<TunnelState>.Continuation
     private let connectionModeStream: AsyncStream<ConnectionMode?>
@@ -84,9 +83,10 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private var multiplexer: Multiplexer?
     private var activeEndpoint: TransportEndpoint?
     private var pendingInstallFailure: PendingInstallFailure?
-    // why: A generic post-ready failure may publish before a concurrent terminal TLS callback;
-    // retain its epoch through teardown so .revoked can win, then close on terminal, disconnect, or successor install.
+    // why: A generically failed session stays eligible for a peer-denial callback until its
+    // supervisor retires or disconnects it; this ID consumes that terminal callback once.
     private var terminalEligiblePumpID: UUID?
+    private var connectAttemptID: UUID?
     private var isTerminated = false
 
     public init(
@@ -116,9 +116,6 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         // Internal test observation point for the pending install-failure latch.
         // The default has no production effect.
         pendingInstallFailureTestObserver: @escaping @Sendable () async -> Void = {},
-        // Internal test seam for holding a post-ready failure before teardown clears its epoch.
-        // The default has no production effect.
-        postReadyFailureTestGate: @escaping @Sendable (SessionError) async -> Void = { _ in }
     ) {
         self.pairing = pairing
         self.policy = policy
@@ -126,7 +123,6 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         self.makeMultiplexer = makeMultiplexer
         self.installWindowTestGate = installWindowTestGate
         self.pendingInstallFailureTestObserver = pendingInstallFailureTestObserver
-        self.postReadyFailureTestGate = postReadyFailureTestGate
 
         let state = AsyncStream<TunnelState>.makeStream()
         self.stateStream = state.stream
@@ -164,14 +160,21 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
             throw SessionError.notConnected
         }
 
+        let attemptID = UUID()
+        connectAttemptID = attemptID
         let connected = try await connectOnce(endpoints: endpoints, preferredEndpoint: preferredEndpoint)
+        guard isCurrentConnectAttempt(attemptID) else {
+            await connected.tls.close()
+            throw SessionError.notConnected
+        }
         await installConnected(connected)
-        try await publishConnected(connected)
+        try await publishConnected(connected, attemptID: attemptID)
         return connected.via
     }
 
     public func disconnect() async {
         isTerminated = true
+        connectAttemptID = nil
         // A user disconnect closes the terminal eligibility window.
         terminalEligiblePumpID = nil
         await tearDownCurrent(reason: .normalShutdown)
@@ -260,7 +263,11 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         return ConnectedAttempt(endpoint: endpoint, via: via, tls: tls)
     }
 
-    private func publishConnected(_ connected: ConnectedAttempt) async throws {
+    private func publishConnected(_ connected: ConnectedAttempt, attemptID: UUID) async throws {
+        guard isCurrentConnectAttempt(attemptID) else {
+            await tearDownCurrent(reason: .normalShutdown)
+            throw SessionError.notConnected
+        }
         if let pending = pendingInstallFailure, pending.pumpID == inboundPumpID {
             pendingInstallFailure = nil
             publish(.failed(pending.error))
@@ -282,7 +289,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         innerTLS = tls
         let pumpID = UUID()
         inboundPumpID = pumpID
-        // Replacing the value closes the previous terminal eligibility window.
+        // This pump ID owns the session's one terminal peer-denial callback.
         terminalEligiblePumpID = pumpID
         pendingInstallFailure = nil
         let reportingTLS = RevocationReportingTunnelTLS(base: tls) { [weak self, pumpID] in
@@ -375,7 +382,6 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
             return
         }
         publish(.failed(error))
-        await postReadyFailureTestGate(error)
         await tearDownCurrent(reason: tearDownReason)
     }
 
@@ -455,6 +461,10 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
             tearDownReason: tearDownReason
         )
         await pendingInstallFailureTestObserver()
+    }
+
+    private func isCurrentConnectAttempt(_ attemptID: UUID) -> Bool {
+        !isTerminated && connectAttemptID == attemptID
     }
 
     private static func keepaliveError(for via: ConnectedVia) -> SessionError {
