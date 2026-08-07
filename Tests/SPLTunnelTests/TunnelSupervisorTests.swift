@@ -508,6 +508,56 @@ struct TunnelSupervisorTests {
     }
 
     @Test(arguments: supervisorRaceEndpoints)
+    func currentOpenRejectsWhenFailureRegistersDuringLowerLevelOpen(
+        _ endpoint: TransportEndpoint
+    ) async throws {
+        let tls = FakeTunnelTLS()
+        let connector = ConnectorProbe { _, _, _ in tls }
+        let failureRegistered = TestSignal()
+        let observeFailure = Mutex(false)
+        let supervisor = supervisorWithConnector(
+            connector,
+            racePolicy: controlledRacePolicy(),
+            reconnectBackoff: longFirstBackoff(),
+            stateEmissionTestObserver: { state in
+                guard observeFailure.withLock({ $0 }), case .connecting = state else {
+                    return
+                }
+                Task {
+                    await failureRegistered.signal()
+                }
+            }
+        )
+        let openGate = FakeTunnelTLSSendGate()
+
+        _ = try await supervisor.connect(endpoints: [endpoint])
+        await tls.enqueueSendGate(openGate)
+        let opening = Task { try await supervisor.openStream() }
+        await openGate.waitForEntry()
+        observeFailure.withLock { $0 = true }
+        await tls.finishInbound(throwing: PostReadyRaceTestError())
+
+        let didRegisterFailure: Bool
+        do {
+            try await failureRegistered.waitWithTimeout()
+            didRegisterFailure = true
+        } catch {
+            didRegisterFailure = false
+        }
+        guard didRegisterFailure else {
+            #expect(Bool(false))
+            await openGate.release()
+            _ = await opening.result
+            await supervisor.disconnect()
+            return
+        }
+
+        await openGate.release()
+        await expectSessionError(.notConnected) { _ = try await opening.value }
+        await supervisor.disconnect()
+    }
+
+    @Test(arguments: supervisorRaceEndpoints)
     func stalePublicOpenPreservesRetiringPeerDenialEligibility(_ endpoint: TransportEndpoint) async throws {
         let tls = FakeTunnelTLS()
         let replacementTLS = FakeTunnelTLS()
@@ -1518,7 +1568,6 @@ private actor RetirementCommitGate {
         case count(Int)
         case caller(TunnelSupervisor.RetirementCommitCaller)
         case exact(token: UInt64, caller: TunnelSupervisor.RetirementCommitCaller)
-        case after(id: UUID, caller: TunnelSupervisor.RetirementCommitCaller)
     }
 
     private struct EntryWaiter {
@@ -1561,13 +1610,6 @@ private actor RetirementCommitGate {
 
     func waitForEntry(caller: TunnelSupervisor.RetirementCommitCaller) async -> Entry? {
         await waitForEntry(condition: .caller(caller))
-    }
-
-    func waitForEntry(
-        after entry: Entry,
-        caller: TunnelSupervisor.RetirementCommitCaller
-    ) async -> Entry? {
-        await waitForEntry(condition: .after(id: entry.id, caller: caller))
     }
 
     func recordedEntries() -> [Entry] {
@@ -1659,13 +1701,6 @@ private actor RetirementCommitGate {
             return entries.first { $0.caller == caller }
         case let .exact(token, caller):
             return entries.first { $0.token == token && $0.caller == caller }
-        case let .after(id, caller):
-            guard let index = entries.firstIndex(where: { $0.id == id }) else {
-                return nil
-            }
-            return entries.dropFirst(index + 1).first {
-                $0.caller == caller && $0.token != entries[index].token
-            }
         }
     }
 }
