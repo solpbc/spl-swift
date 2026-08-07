@@ -307,7 +307,7 @@ struct TunnelSupervisorTests {
         await tls.setSendError(NWError.tls(-9832))
         await writeGate.release()
         await expectSessionError(.revoked) { try await deniedWrite.value }
-        await assertSingleTerminalRevocation(states: states, reconnects: reconnects)
+        _ = await assertSingleTerminalRevocation(states: states, reconnects: reconnects)
         #expect(await conditionObserved(timeout: .milliseconds(100)) {
             await connector.invocationCount > 1
         } == false)
@@ -341,7 +341,7 @@ struct TunnelSupervisorTests {
         await tls.setSendError(NWError.tls(-9832))
         await writeGate.release()
         await expectSessionError(.revoked) { try await deniedWrite.value }
-        await assertSingleTerminalRevocation(states: states, reconnects: reconnects)
+        _ = await assertSingleTerminalRevocation(states: states, reconnects: reconnects)
 
         await candidateGate.release()
         await expectSessionError(.notConnected) { _ = try await supervisor.openStream() }
@@ -426,7 +426,7 @@ struct TunnelSupervisorTests {
         await tls.setSendError(NWError.tls(-9832))
         await deniedGate.release()
         await expectSessionError(.revoked) { try await deniedWrite.value }
-        await assertSingleTerminalRevocation(states: states, reconnects: reconnects)
+        _ = await assertSingleTerminalRevocation(states: states, reconnects: reconnects)
 
         await tls.setSendError(MuxError.transportClosed)
         await genericGate.release()
@@ -508,6 +508,245 @@ struct TunnelSupervisorTests {
     }
 
     @Test(arguments: supervisorRaceEndpoints)
+    func stalePublicOpenPreservesRetiringPeerDenialEligibility(_ endpoint: TransportEndpoint) async throws {
+        let tls = FakeTunnelTLS()
+        let replacementTLS = FakeTunnelTLS()
+        let tlsSequence = TunnelTLSSequence([tls, replacementTLS])
+        let connector = ConnectorProbe { _, _, _ in await tlsSequence.next() }
+        let commitGate = RetirementCommitGate(holdFrom: 1)
+        let emissions = StateEmissionProbe()
+        let redrives = RedriveRequestProbe()
+        let openReturnGate = OpenReturnGate()
+        let generations = SessionGenerationCounter()
+        let supervisor = TunnelSupervisor(
+            pairing: fakePairing(),
+            clientInfo: supervisorClientInfo,
+            policy: SessionPolicy(race: controlledRacePolicy()),
+            reconnectBackoff: ReconnectBackoff(
+                schedule: .table([.milliseconds(1)]),
+                random: { _ in 1.0 }
+            ),
+            makeSession: { pairing, _, policy in
+                let session = TunnelSession(pairing: pairing, policy: policy, tlsConnector: connector.connector)
+                if await generations.isSuccessor() {
+                    return session
+                }
+                return GatedOpenGeneration(base: session, gate: openReturnGate)
+            },
+            retirementCommitTestGate: { token, caller in
+                await commitGate.waitAtCommit(token: token, caller: caller)
+            },
+            stateEmissionTestObserver: { emissions.record($0) },
+            redriveRequestTestObserver: { redrives.record() }
+        )
+        let states = await stateProbe(for: supervisor)
+        let reconnects = await reconnectProbe(for: supervisor)
+        let deniedGate = FakeTunnelTLSSendGate()
+
+        _ = try await supervisor.connect(endpoints: [endpoint])
+        let oldStream = try await supervisor.openStream()
+        await tls.enqueueSendGate(deniedGate)
+        let deniedWrite = Task { try await oldStream.write(Data([0x01])) }
+        await deniedGate.waitForEntry()
+        await openReturnGate.arm()
+        let staleOpen = Task { try await supervisor.openStream() }
+        try await openReturnGate.waitForEntry()
+        await tls.finishInbound(throwing: PostReadyRaceTestError())
+
+        guard await commitGate.waitForEntry(caller: .establishment) != nil else {
+            #expect(Bool(false))
+            await commitGate.release()
+            await openReturnGate.release()
+            await tls.setSendError(NWError.tls(-9832))
+            await deniedGate.release()
+            _ = await staleOpen.result
+            _ = await deniedWrite.result
+            await supervisor.disconnect()
+            await states.stop()
+            await reconnects.stop()
+            return
+        }
+        let emissionBaseline = emissions.totalCount()
+        let reconnectBaseline = await supervisor.reconnectStatus
+        let redriveBaseline = redrives.count()
+        let connectorBaseline = await connector.invocationCount
+
+        await openReturnGate.release()
+        await expectSessionError(.notConnected) { _ = try await staleOpen.value }
+        #expect(emissions.totalCount() == emissionBaseline)
+        #expect(await supervisor.reconnectStatus == reconnectBaseline)
+        #expect(redrives.count() == redriveBaseline)
+        #expect(await connector.invocationCount == connectorBaseline)
+
+        await tls.setSendError(NWError.tls(-9832))
+        await deniedGate.release()
+        _ = await expectSessionError(.revoked) { try await deniedWrite.value }
+        _ = await assertSingleTerminalRevocation(states: states, reconnects: reconnects)
+
+        await commitGate.release()
+        await supervisor.disconnect()
+        await states.stop()
+        await reconnects.stop()
+    }
+
+    @Test(arguments: supervisorRaceEndpoints)
+    func disconnectMakesHeldOldOpenAndLaterPeerDenialStale(_ endpoint: TransportEndpoint) async throws {
+        let tls = FakeTunnelTLS()
+        let connector = ConnectorProbe { _, _, _ in tls }
+        let openReturnGate = OpenReturnGate()
+        let generations = SessionGenerationCounter()
+        let emissions = StateEmissionProbe()
+        let redrives = RedriveRequestProbe()
+        let supervisor = TunnelSupervisor(
+            pairing: fakePairing(),
+            clientInfo: supervisorClientInfo,
+            policy: SessionPolicy(race: controlledRacePolicy()),
+            makeSession: { pairing, _, policy in
+                let session = TunnelSession(pairing: pairing, policy: policy, tlsConnector: connector.connector)
+                if await generations.isSuccessor() { return session }
+                return GatedOpenGeneration(base: session, gate: openReturnGate)
+            },
+            stateEmissionTestObserver: { emissions.record($0) },
+            redriveRequestTestObserver: { redrives.record() }
+        )
+        let reconnects = await reconnectProbe(for: supervisor)
+        let deniedGate = FakeTunnelTLSSendGate()
+
+        _ = try await supervisor.connect(endpoints: [endpoint])
+        let oldStream = try await supervisor.openStream()
+        await tls.enqueueSendGate(deniedGate)
+        let deniedWrite = Task { try await oldStream.write(Data([0x01])) }
+        await deniedGate.waitForEntry()
+        await openReturnGate.arm()
+        let heldOpen = Task { try await supervisor.openStream() }
+        try await openReturnGate.waitForEntry()
+
+        await supervisor.disconnect()
+        let emissionBaseline = emissions.totalCount()
+        let reconnectBaseline = await supervisor.reconnectStatus
+        let redriveBaseline = redrives.count()
+        let connectorBaseline = await connector.invocationCount
+
+        await openReturnGate.release()
+        await expectSessionError(.notConnected) { _ = try await heldOpen.value }
+        await tls.setSendError(NWError.tls(-9832))
+        await deniedGate.release()
+        _ = await expectSessionError(.revoked) { try await deniedWrite.value }
+        #expect(emissions.totalCount() == emissionBaseline)
+        #expect(await supervisor.reconnectStatus == reconnectBaseline)
+        #expect(redrives.count() == redriveBaseline)
+        #expect(await connector.invocationCount == connectorBaseline)
+        #expect(await reconnects.count(terminalRevocationStatus) == 0)
+        await reconnects.stop()
+    }
+
+    @Test(arguments: supervisorRaceEndpoints)
+    func publicSuccessorOpenCommitsRetirementAndMakesLaterPeerDenialStale(
+        _ endpoint: TransportEndpoint
+    ) async throws {
+        let tls = FakeTunnelTLS()
+        let replacementTLS = FakeTunnelTLS()
+        let tlsSequence = TunnelTLSSequence([tls, replacementTLS])
+        let connector = ConnectorProbe { _, _, _ in await tlsSequence.next() }
+        let successorInstallGate = SuccessorInstallGate()
+        let commitGate = RetirementCommitGate(holdFrom: 1)
+        let emissions = StateEmissionProbe()
+        let redrives = RedriveRequestProbe()
+        let initialConnected = TestSignal()
+        let supervisor = supervisorWithConnector(
+            connector,
+            racePolicy: controlledRacePolicy(),
+            successorInstallGate: successorInstallGate,
+            retirementCommitTestGate: { token, caller in
+                await commitGate.waitAtCommit(token: token, caller: caller)
+            },
+            stateEmissionTestObserver: { state in
+                emissions.record(state)
+                if state == .connected(via: endpoint.connectedVia),
+                   emissions.count(.connected(via: endpoint.connectedVia)) == 1 {
+                    Task {
+                        await initialConnected.signal()
+                    }
+                }
+            },
+            redriveRequestTestObserver: { redrives.record() }
+        )
+        let reconnects = await reconnectProbe(for: supervisor)
+        let deniedGate = FakeTunnelTLSSendGate()
+
+        _ = try await supervisor.connect(endpoints: [endpoint])
+        try await initialConnected.waitWithTimeout()
+        let oldStream = try await supervisor.openStream()
+        await tls.enqueueSendGate(deniedGate)
+        let deniedWrite = Task { try await oldStream.write(Data([0x01])) }
+        await deniedGate.waitForEntry()
+        await tls.finishInbound(throwing: PostReadyRaceTestError())
+        try await successorInstallGate.waitForEntry()
+        await successorInstallGate.release()
+
+        guard await commitGate.waitForEntry(1) else {
+            #expect(Bool(false))
+            await commitGate.release()
+            await tls.setSendError(NWError.tls(-9832))
+            await deniedGate.release()
+            _ = await deniedWrite.result
+            await supervisor.disconnect()
+            await reconnects.stop()
+            return
+        }
+
+        guard let firstCommit = await commitGate.recordedEntries().first else {
+            #expect(Bool(false))
+            await commitGate.release()
+            await tls.setSendError(NWError.tls(-9832))
+            await deniedGate.release()
+            _ = await deniedWrite.result
+            await supervisor.disconnect()
+            await reconnects.stop()
+            return
+        }
+        let successorToken = firstCommit.token
+        let successorOpen = Task { try await supervisor.openStream() }
+        guard let publicOpenEntry = await commitGate.waitForEntry(
+            token: successorToken,
+            caller: .publicOpenStream
+        ) else {
+            #expect(Bool(false))
+            await commitGate.release()
+            await tls.setSendError(NWError.tls(-9832))
+            await deniedGate.release()
+            _ = await successorOpen.result
+            _ = await deniedWrite.result
+            await supervisor.disconnect()
+            await reconnects.stop()
+            return
+        }
+
+        await commitGate.release(publicOpenEntry)
+        let successorStream = try await successorOpen.value
+        try await successorStream.write(Data([0x02]))
+        let laterStream = try await supervisor.openStream()
+        try await laterStream.write(Data([0x03]))
+
+        let emissionBaseline = emissions.totalCount()
+        let reconnectBaseline = await supervisor.reconnectStatus
+        let redriveBaseline = redrives.count()
+        let connectorBaseline = await connector.invocationCount
+        await tls.setSendError(NWError.tls(-9832))
+        await deniedGate.release()
+        _ = await expectSessionError(.revoked) { try await deniedWrite.value }
+        #expect(emissions.totalCount() == emissionBaseline)
+        #expect(await supervisor.reconnectStatus == reconnectBaseline)
+        #expect(redrives.count() == redriveBaseline)
+        #expect(await connector.invocationCount == connectorBaseline)
+        #expect(await reconnects.count(terminalRevocationStatus) == 0)
+
+        await commitGate.release()
+        await supervisor.disconnect()
+        await reconnects.stop()
+    }
+
+    @Test(arguments: supervisorRaceEndpoints)
     func oldPeerDenialAfterSharedCommitStaysStaleAndSuccessorRemainsUsable(_ endpoint: TransportEndpoint) async throws {
         let tls = FakeTunnelTLS()
         let replacementTLS = FakeTunnelTLS()
@@ -521,8 +760,8 @@ struct TunnelSupervisorTests {
             connector,
             racePolicy: controlledRacePolicy(),
             successorInstallGate: successorInstallGate,
-            retirementCommitTestGate: {
-                await commitGate.waitAtCommit()
+            retirementCommitTestGate: { token, caller in
+                await commitGate.waitAtCommit(token: token, caller: caller)
             },
             stateEmissionTestObserver: { state in
                 emissions.record(state)
@@ -610,8 +849,8 @@ struct TunnelSupervisorTests {
             connector,
             racePolicy: controlledRacePolicy(),
             successorInstallGate: successorInstallGate,
-            retirementCommitTestGate: {
-                await commitGate.waitAtCommit()
+            retirementCommitTestGate: { token, caller in
+                await commitGate.waitAtCommit(token: token, caller: caller)
             },
             stateEmissionTestObserver: { state in
                 emissions.record(state)
@@ -1136,8 +1375,9 @@ private func supervisorWithConnector(
         random: { _ in 1.0 }
     ),
     successorInstallGate: SuccessorInstallGate? = nil,
-    retirementCommitTestGate: (@Sendable () async -> Void)? = nil,
-    stateEmissionTestObserver: @escaping @Sendable (TunnelState) -> Void = { _ in }
+    retirementCommitTestGate: (@Sendable (UInt64, TunnelSupervisor.RetirementCommitCaller) async -> Void)? = nil,
+    stateEmissionTestObserver: @escaping @Sendable (TunnelState) -> Void = { _ in },
+    redriveRequestTestObserver: @escaping @Sendable () -> Void = {}
 ) -> TunnelSupervisor {
     let generations = SessionGenerationCounter()
     return TunnelSupervisor(
@@ -1163,7 +1403,8 @@ private func supervisorWithConnector(
             )
         },
         retirementCommitTestGate: retirementCommitTestGate,
-        stateEmissionTestObserver: stateEmissionTestObserver
+        stateEmissionTestObserver: stateEmissionTestObserver,
+        redriveRequestTestObserver: redriveRequestTestObserver
     )
 }
 
@@ -1194,66 +1435,200 @@ private actor SuccessorInstallGate {
     }
 }
 
-private actor RetirementCommitGate {
-    private struct EntryWaiter {
-        let target: Int
-        let continuation: CheckedContinuation<Void, Never>
-    }
-
-    private let holdFrom: Int
+private actor OpenReturnGate {
+    private let entered = TestSignal()
     private let released = TestSignal()
-    private var entries = 0
-    private var entryWaiters: [UUID: EntryWaiter] = [:]
+    private var armed = false
 
-    init(holdFrom: Int) {
-        self.holdFrom = holdFrom
+    func arm() {
+        armed = true
     }
 
-    func waitAtCommit() async {
-        entries += 1
-        resumeEntryWaiters()
-        guard entries >= holdFrom else {
-            return
-        }
-        await released.wait()
-    }
-
-    func waitForEntry(_ target: Int) async -> Bool {
-        guard entries < target else {
-            return true
-        }
-
-        let waiterID = UUID()
-        do {
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    await self.waitForEntrySignal(target, waiterID: waiterID)
-                }
-                group.addTask {
-                    try await Task<Never, Never>.sleep(for: .seconds(1))
-                    throw TestTimeout()
-                }
-                try await group.next()!
-                group.cancelAll()
-            }
-            return true
-        } catch {
-            return false
-        }
+    func waitForEntry() async throws {
+        try await entered.waitWithTimeout()
     }
 
     func release() async {
         await released.signal()
     }
 
-    private func waitForEntrySignal(_ target: Int, waiterID: UUID) async {
+    func waitForRelease() async {
+        guard armed else {
+            return
+        }
+        await entered.signal()
+        await released.wait()
+    }
+}
+
+private actor GatedOpenGeneration: TunnelGeneration {
+    nonisolated var stateUpdates: AsyncStream<TunnelState> { base.stateUpdates }
+    nonisolated var connectionModeUpdates: AsyncStream<ConnectionMode?> { base.connectionModeUpdates }
+
+    private let base: TunnelSession
+    private let gate: OpenReturnGate
+
+    init(base: TunnelSession, gate: OpenReturnGate) {
+        self.base = base
+        self.gate = gate
+    }
+
+    var connectionMode: ConnectionMode? {
+        get async { await base.connectionMode }
+    }
+
+    func connect(endpoints: [TransportEndpoint]) async throws -> ConnectedVia {
+        try await base.connect(endpoints: endpoints)
+    }
+
+    func connect(
+        endpoints: [TransportEndpoint],
+        preferredEndpoint: TransportEndpoint?
+    ) async throws -> ConnectedVia {
+        try await base.connect(endpoints: endpoints, preferredEndpoint: preferredEndpoint)
+    }
+
+    func connectedEndpoint() async -> TransportEndpoint? {
+        await base.connectedEndpoint()
+    }
+
+    func disconnect() async {
+        await base.disconnect()
+    }
+
+    func openStream() async throws -> MuxStream {
+        let stream = try await base.openStream()
+        await gate.waitForRelease()
+        return stream
+    }
+
+    func inboundActivitySnapshot() async -> UInt64 {
+        await base.inboundActivitySnapshot()
+    }
+}
+
+private actor RetirementCommitGate {
+    struct Entry: Sendable, Equatable {
+        let id: UUID
+        let token: UInt64
+        let caller: TunnelSupervisor.RetirementCommitCaller
+    }
+
+    private enum EntryCondition {
+        case count(Int)
+        case caller(TunnelSupervisor.RetirementCommitCaller)
+        case exact(token: UInt64, caller: TunnelSupervisor.RetirementCommitCaller)
+        case after(id: UUID, caller: TunnelSupervisor.RetirementCommitCaller)
+    }
+
+    private struct EntryWaiter {
+        let condition: EntryCondition
+        let continuation: CheckedContinuation<Entry?, Never>
+    }
+
+    private let holdFrom: Int
+    private var entries: [Entry] = []
+    private var entryWaiters: [UUID: EntryWaiter] = [:]
+    private var blockedEntries: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var releasedAll = false
+
+    init(holdFrom: Int) {
+        self.holdFrom = holdFrom
+    }
+
+    func waitAtCommit(token: UInt64, caller: TunnelSupervisor.RetirementCommitCaller) async {
+        let entry = Entry(id: UUID(), token: token, caller: caller)
+        entries.append(entry)
+        resumeEntryWaiters()
+        guard entries.count >= holdFrom, !releasedAll else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            blockedEntries[entry.id] = continuation
+        }
+    }
+
+    func waitForEntry(_ target: Int) async -> Bool {
+        await waitForEntry(condition: .count(target)) != nil
+    }
+
+    func waitForEntry(
+        token: UInt64,
+        caller: TunnelSupervisor.RetirementCommitCaller
+    ) async -> Entry? {
+        await waitForEntry(condition: .exact(token: token, caller: caller))
+    }
+
+    func waitForEntry(caller: TunnelSupervisor.RetirementCommitCaller) async -> Entry? {
+        await waitForEntry(condition: .caller(caller))
+    }
+
+    func waitForEntry(
+        after entry: Entry,
+        caller: TunnelSupervisor.RetirementCommitCaller
+    ) async -> Entry? {
+        await waitForEntry(condition: .after(id: entry.id, caller: caller))
+    }
+
+    func recordedEntries() -> [Entry] {
+        entries
+    }
+
+    func release(_ entry: Entry) {
+        blockedEntries.removeValue(forKey: entry.id)?.resume()
+    }
+
+    func release() {
+        releasedAll = true
+        let blockedEntries = blockedEntries
+        self.blockedEntries.removeAll()
+        for (_, continuation) in blockedEntries {
+            continuation.resume()
+        }
+    }
+
+    private func waitForEntry(condition: EntryCondition) async -> Entry? {
+        if let entry = matchingEntry(for: condition) {
+            return entry
+        }
+
+        let waiterID = UUID()
+        do {
+            return try await withThrowingTaskGroup(of: Entry.self) { group in
+                group.addTask {
+                    guard let entry = await self.waitForEntrySignal(condition, waiterID: waiterID) else {
+                        throw CancellationError()
+                    }
+                    return entry
+                }
+                group.addTask {
+                    try await Task<Never, Never>.sleep(for: .seconds(1))
+                    throw TestTimeout()
+                }
+                let entry = try await group.next()!
+                group.cancelAll()
+                return entry
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    private func waitForEntrySignal(
+        _ condition: EntryCondition,
+        waiterID: UUID
+    ) async -> Entry? {
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                guard entries < target, !Task.isCancelled else {
-                    continuation.resume()
+                if let entry = matchingEntry(for: condition) {
+                    continuation.resume(returning: entry)
                     return
                 }
-                entryWaiters[waiterID] = EntryWaiter(target: target, continuation: continuation)
+                if Task.isCancelled {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                entryWaiters[waiterID] = EntryWaiter(condition: condition, continuation: continuation)
             }
         } onCancel: {
             Task {
@@ -1264,15 +1639,34 @@ private actor RetirementCommitGate {
 
     private func resumeEntryWaiters() {
         let satisfiedWaiters = entryWaiters.compactMap { waiterID, waiter in
-            entries >= waiter.target ? waiterID : nil
+            matchingEntry(for: waiter.condition).map { (waiterID, $0) }
         }
-        for waiterID in satisfiedWaiters {
-            entryWaiters.removeValue(forKey: waiterID)?.continuation.resume()
+        for (waiterID, entry) in satisfiedWaiters {
+            entryWaiters.removeValue(forKey: waiterID)?.continuation.resume(returning: entry)
         }
     }
 
     private func cancelEntryWaiter(_ waiterID: UUID) {
-        entryWaiters.removeValue(forKey: waiterID)?.continuation.resume()
+        entryWaiters.removeValue(forKey: waiterID)?.continuation.resume(returning: nil)
+    }
+
+    private func matchingEntry(for condition: EntryCondition) -> Entry? {
+        switch condition {
+        case let .count(target):
+            guard entries.count >= target else { return nil }
+            return entries[target - 1]
+        case let .caller(caller):
+            return entries.first { $0.caller == caller }
+        case let .exact(token, caller):
+            return entries.first { $0.token == token && $0.caller == caller }
+        case let .after(id, caller):
+            guard let index = entries.firstIndex(where: { $0.id == id }) else {
+                return nil
+            }
+            return entries.dropFirst(index + 1).first {
+                $0.caller == caller && $0.token != entries[index].token
+            }
+        }
     }
 }
 
@@ -1295,6 +1689,22 @@ private final class StateEmissionProbe: Sendable {
         states.withLock { states in
             states.contains(expected)
         }
+    }
+
+    func totalCount() -> Int {
+        states.withLock { $0.count }
+    }
+}
+
+private final class RedriveRequestProbe: Sendable {
+    private let requests = Mutex(0)
+
+    func record() {
+        requests.withLock { $0 += 1 }
+    }
+
+    func count() -> Int {
+        requests.withLock { $0 }
     }
 }
 

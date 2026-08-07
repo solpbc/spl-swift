@@ -60,6 +60,12 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         case paused
     }
 
+    enum RetirementCommitCaller: Sendable, Equatable {
+        case publicOpenStream
+        case establishment
+        case activeChildConnected
+    }
+
     private struct Generation: Sendable {
         let token: UInt64
         let session: any TunnelGeneration
@@ -102,8 +108,10 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private let makeSession: TunnelGenerationFactory
     private let sleeper: @Sendable (Duration) async throws -> Void
     private let now: @Sendable () -> ContinuousClock.Instant
-    private let retirementCommitTestGate: (@Sendable () async -> Void)?
+    private let retirementCommitTestGate: (@Sendable (UInt64, RetirementCommitCaller) async -> Void)?
     private let stateEmissionTestObserver: @Sendable (TunnelState) -> Void
+    // why: This is observation-only test instrumentation and must never gate behavior.
+    private let redriveRequestTestObserver: @Sendable () -> Void
 
     private let stateStream: AsyncStream<TunnelState>
     private let stateContinuation: AsyncStream<TunnelState>.Continuation
@@ -159,8 +167,9 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             TunnelSession(pairing: pairing, clientInfo: clientInfo, policy: policy)
         },
         // Internal test seams; defaults have no production effect.
-        retirementCommitTestGate: (@Sendable () async -> Void)? = nil,
-        stateEmissionTestObserver: @escaping @Sendable (TunnelState) -> Void = { _ in }
+        retirementCommitTestGate: (@Sendable (UInt64, RetirementCommitCaller) async -> Void)? = nil,
+        stateEmissionTestObserver: @escaping @Sendable (TunnelState) -> Void = { _ in },
+        redriveRequestTestObserver: @escaping @Sendable () -> Void = {}
     ) {
         self.pairing = pairing
         self.clientInfo = clientInfo
@@ -171,6 +180,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         self.makeSession = makeSession
         self.retirementCommitTestGate = retirementCommitTestGate
         self.stateEmissionTestObserver = stateEmissionTestObserver
+        self.redriveRequestTestObserver = redriveRequestTestObserver
 
         let state = AsyncStream<TunnelState>.makeStream()
         self.stateStream = state.stream
@@ -243,10 +253,10 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         guard let current = generation else {
             throw SessionError.notConnected
         }
+
+        let stream: MuxStream
         do {
-            let stream = try await current.session.openStream()
-            await commitRetiringGeneration()
-            return stream
+            stream = try await current.session.openStream()
         } catch {
             if let sessionError = error as? SessionError, sessionError == .revoked {
                 throw sessionError
@@ -260,6 +270,14 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             }
             throw error
         }
+
+        guard await commitRetiringGeneration(
+            for: current.token,
+            caller: .publicOpenStream
+        ) else {
+            throw SessionError.notConnected
+        }
+        return stream
     }
 
     public func inboundActivitySnapshot() async -> UInt64 {
@@ -358,6 +376,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
 
         let plan = planner.plan(candidates: plannedEndpoints, now: now())
         connectingToken = token
+        let connected: (via: ConnectedVia, endpoint: TransportEndpoint?)
         do {
             let via = try await session.connect(
                 endpoints: plan.candidates,
@@ -375,14 +394,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             }
             connectingToken = nil
             currentVia = via
-            await commitRetiringGeneration()
-            guard generation?.token == token, lifecycle == .running else {
-                throw SessionError.notConnected
-            }
-            planner.noteConnected(endpoint: endpoint, now: now())
-            armStabilityTimer(for: token)
-            supervisorLog.notice("supervisor connected generation=\(token, privacy: .public)")
-            return via
+            connected = (via, endpoint)
         } catch let error as SessionError {
             connectingToken = nil
             planner.noteFailure(error, attemptedTrustedEndpoint: plan.preferredEndpoint)
@@ -392,6 +404,19 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             planner.noteFailure(.unreachable, attemptedTrustedEndpoint: plan.preferredEndpoint)
             throw SessionError.unreachable
         }
+
+        guard await commitRetiringGeneration(for: token, caller: .establishment) else {
+            // why: handleActiveChildState already recorded this failure with the planner;
+            // re-noting it here would demote direct trust for a post-ready failure.
+            if let failure = generationFailure, failure.token == token {
+                throw failure.error
+            }
+            throw SessionError.notConnected
+        }
+        planner.noteConnected(endpoint: connected.endpoint, now: now())
+        armStabilityTimer(for: token)
+        supervisorLog.notice("supervisor connected generation=\(token, privacy: .public)")
+        return connected.via
     }
 
     private func installGeneration(_ session: any TunnelGeneration, token: UInt64) async {
@@ -447,20 +472,36 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         }
     }
 
-    private func commitRetiringGeneration() async {
+    private func isValidInstalledGeneration(_ token: UInt64) -> Bool {
+        generation?.token == token &&
+            lifecycle == .running &&
+            generationFailure?.token != token
+    }
+
+    private func commitRetiringGeneration(
+        for token: UInt64,
+        caller: RetirementCommitCaller
+    ) async -> Bool {
+        guard isValidInstalledGeneration(token) else {
+            return false
+        }
         guard retiringGeneration != nil else {
-            return
+            return true
         }
         if let retirementCommitTestGate {
-            await retirementCommitTestGate()
+            await retirementCommitTestGate(token, caller)
         }
-        // The test gate can suspend while pause() or disconnect() clears this generation.
+        // The test gate can suspend while identity, lifecycle, or failure eligibility changes.
+        guard isValidInstalledGeneration(token) else {
+            return false
+        }
         guard let retiringGeneration else {
-            return
+            return true
         }
         self.retiringGeneration = nil
         retiringGeneration.stateTask?.cancel()
         await retiringGeneration.generation.session.disconnect()
+        return isValidInstalledGeneration(token)
     }
 
     private func clearRetiringGeneration(disconnect: Bool) async {
@@ -535,8 +576,10 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         case .connected:
             // why: Connected is the first public capability; dial-progress states must retain
             // terminal eligibility until the successor is externally observable or usable.
-            await commitRetiringGeneration()
-            guard generation?.token == token, lifecycle == .running else {
+            guard await commitRetiringGeneration(
+                for: token,
+                caller: .activeChildConnected
+            ) else {
                 return
             }
             publish(childState)
@@ -577,6 +620,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         } else {
             pendingRedrive = RedriveRequest(sourceToken: sourceToken, reason: reason, userInitiated: userInitiated)
         }
+        redriveRequestTestObserver()
         guard redriveTask == nil else {
             return
         }
