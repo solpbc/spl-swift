@@ -305,11 +305,18 @@ struct TunnelAttemptObservabilityTests {
     }
 
     private func collect(_ stream: AsyncStream<TunnelAttemptEvent>) async -> [TunnelAttemptEvent] {
-        var events: [TunnelAttemptEvent] = []
-        for await event in stream {
-            events.append(event)
+        do {
+            return try await withAttemptTimeout {
+                var events: [TunnelAttemptEvent] = []
+                for await event in stream {
+                    events.append(event)
+                }
+                return events
+            }
+        } catch {
+            Issue.record("Attempt updates stream did not finish before timeout")
+            return []
         }
-        return events
     }
 
     private func strings(in value: Any) -> [String] {
