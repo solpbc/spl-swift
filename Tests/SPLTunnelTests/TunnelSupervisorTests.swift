@@ -550,6 +550,11 @@ struct TunnelSupervisorTests {
         guard await commitGate.waitForEntry(1) else {
             #expect(Bool(false))
             await commitGate.release()
+            await tls.setSendError(NWError.tls(-9832))
+            await writeGate.release()
+            _ = await deniedWrite.result
+            await supervisor.disconnect()
+            await reconnects.stop()
             return
         }
         #expect(emissions.count(.connected(via: endpoint.connectedVia)) == connectedCount)
@@ -635,6 +640,12 @@ struct TunnelSupervisorTests {
         guard await commitGate.waitForEntry(1) else {
             #expect(Bool(false))
             await commitGate.release()
+            await tls.setSendError(NWError.tls(-9832))
+            await writeGate.release()
+            _ = await deniedWrite.result
+            await supervisor.disconnect()
+            await states.stop()
+            await reconnects.stop()
             return
         }
         #expect(emissions.count(.connected(via: endpoint.connectedVia)) == connectedCount)
@@ -1184,9 +1195,15 @@ private actor SuccessorInstallGate {
 }
 
 private actor RetirementCommitGate {
+    private struct EntryWaiter {
+        let target: Int
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
     private let holdFrom: Int
     private let released = TestSignal()
     private var entries = 0
+    private var entryWaiters: [UUID: EntryWaiter] = [:]
 
     init(holdFrom: Int) {
         self.holdFrom = holdFrom
@@ -1194,6 +1211,7 @@ private actor RetirementCommitGate {
 
     func waitAtCommit() async {
         entries += 1
+        resumeEntryWaiters()
         guard entries >= holdFrom else {
             return
         }
@@ -1201,20 +1219,61 @@ private actor RetirementCommitGate {
     }
 
     func waitForEntry(_ target: Int) async -> Bool {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
-        while ContinuousClock.now < deadline {
-            if entries >= target {
-                return true
-            }
-            try? await Task.sleep(for: .milliseconds(5))
+        guard entries < target else {
+            return true
         }
-        return false
+
+        let waiterID = UUID()
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    await self.waitForEntrySignal(target, waiterID: waiterID)
+                }
+                group.addTask {
+                    try await Task<Never, Never>.sleep(for: .seconds(1))
+                    throw TestTimeout()
+                }
+                try await group.next()!
+                group.cancelAll()
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     func release() async {
         await released.signal()
     }
 
+    private func waitForEntrySignal(_ target: Int, waiterID: UUID) async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard entries < target, !Task.isCancelled else {
+                    continuation.resume()
+                    return
+                }
+                entryWaiters[waiterID] = EntryWaiter(target: target, continuation: continuation)
+            }
+        } onCancel: {
+            Task {
+                await self.cancelEntryWaiter(waiterID)
+            }
+        }
+    }
+
+    private func resumeEntryWaiters() {
+        let satisfiedWaiters = entryWaiters.compactMap { waiterID, waiter in
+            entries >= waiter.target ? waiterID : nil
+        }
+        for waiterID in satisfiedWaiters {
+            entryWaiters.removeValue(forKey: waiterID)?.continuation.resume()
+        }
+    }
+
+    private func cancelEntryWaiter(_ waiterID: UUID) {
+        entryWaiters.removeValue(forKey: waiterID)?.continuation.resume()
+    }
 }
 
 private final class StateEmissionProbe: Sendable {
