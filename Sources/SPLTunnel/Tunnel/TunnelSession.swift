@@ -54,13 +54,17 @@ private struct PendingInstallFailure: Sendable {
     let tearDownReason: TearDownReason
 }
 
-public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
+public actor TunnelSession: TunnelSessioning, MuxStreamOpening, TunnelAttemptObserving {
     public nonisolated var stateUpdates: AsyncStream<TunnelState> {
         stateStream
     }
 
     public nonisolated var connectionModeUpdates: AsyncStream<ConnectionMode?> {
         connectionModeStream
+    }
+
+    public nonisolated var attemptUpdates: AsyncStream<TunnelAttemptEvent> {
+        attemptUpdatesStream
     }
 
     public private(set) var connectionMode: ConnectionMode?
@@ -75,6 +79,9 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private let stateContinuation: AsyncStream<TunnelState>.Continuation
     private let connectionModeStream: AsyncStream<ConnectionMode?>
     private let connectionModeContinuation: AsyncStream<ConnectionMode?>.Continuation
+    private let attemptUpdatesStream: AsyncStream<TunnelAttemptEvent>
+    private let attemptUpdatesContinuation: AsyncStream<TunnelAttemptEvent>.Continuation
+    private let now: @Sendable () -> ContinuousClock.Instant
     private var state: TunnelState = .disconnected
     private var inboundPumpTask: Task<Void, Never>?
     private var inboundPumpID: UUID?
@@ -88,6 +95,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private var terminalEligiblePumpID: UUID?
     private var connectAttemptID: UUID?
     private var isTerminated = false
+    private var attemptUpdatesFinished = false
 
     public init(
         pairing: StoredPairing,
@@ -116,6 +124,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         // Internal test observation point for the pending install-failure latch.
         // The default has no production effect.
         pendingInstallFailureTestObserver: @escaping @Sendable () async -> Void = {},
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
     ) {
         self.pairing = pairing
         self.policy = policy
@@ -123,6 +132,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         self.makeMultiplexer = makeMultiplexer
         self.installWindowTestGate = installWindowTestGate
         self.pendingInstallFailureTestObserver = pendingInstallFailureTestObserver
+        self.now = now
 
         let state = AsyncStream<TunnelState>.makeStream()
         self.stateStream = state.stream
@@ -131,6 +141,10 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         let mode = AsyncStream<ConnectionMode?>.makeStream()
         self.connectionModeStream = mode.stream
         self.connectionModeContinuation = mode.continuation
+
+        let attempts = AsyncStream<TunnelAttemptEvent>.makeStream(bufferingPolicy: .unbounded)
+        self.attemptUpdatesStream = attempts.stream
+        self.attemptUpdatesContinuation = attempts.continuation
 
         state.continuation.yield(.disconnected)
         mode.continuation.yield(nil)
@@ -146,6 +160,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         endpoints: [TransportEndpoint],
         preferredEndpoint: TransportEndpoint?
     ) async throws -> ConnectedVia {
+        defer { finishAttemptUpdates() }
         guard !endpoints.isEmpty else {
             throw SessionError.unreachable
         }
@@ -182,6 +197,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         publish(.disconnected)
         stateContinuation.finish()
         connectionModeContinuation.finish()
+        finishAttemptUpdates()
     }
 
     public func openStream() async throws -> MuxStream {
@@ -216,11 +232,16 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
         publish(.connecting(candidates: endpoints.map(\.connectedVia)))
 
         do {
+            let attemptUpdatesContinuation = attemptUpdatesContinuation
             let coordinator = RaceCoordinator<ConnectedAttempt>(
                 stagger: policy.race.stagger,
                 loserGrace: policy.race.loserGrace,
                 budget: policy.race.budget,
-                close: { await $0.tls.close() }
+                close: { await $0.tls.close() },
+                now: now,
+                attemptEventSink: { event in
+                    attemptUpdatesContinuation.yield(event)
+                }
             ) { endpoint, progress in
                 try await self.connectEndpoint(endpoint, progress: progress)
             }
@@ -499,6 +520,14 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening {
     private func setConnectionMode(_ newMode: ConnectionMode?) {
         connectionMode = newMode
         connectionModeContinuation.yield(newMode)
+    }
+
+    private func finishAttemptUpdates() {
+        guard !attemptUpdatesFinished else {
+            return
+        }
+        attemptUpdatesFinished = true
+        attemptUpdatesContinuation.finish()
     }
 
     private static func defaultTLSConnector(

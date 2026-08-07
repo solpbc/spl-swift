@@ -12,8 +12,6 @@ struct RaceResult<Value: Sendable>: Sendable {
 }
 
 struct RaceAttemptProgress: Sendable {
-    static let none = RaceAttemptProgress(onWaiting: {})
-
     private let onWaiting: @Sendable () async -> Void
 
     init(onWaiting: @escaping @Sendable () async -> Void) {
@@ -22,6 +20,98 @@ struct RaceAttemptProgress: Sendable {
 
     func reportWaiting() async {
         await onWaiting()
+    }
+}
+
+private actor RaceAttemptEmitter {
+    private let routes: [Int: TunnelAttemptRoute]
+    private let now: @Sendable () -> ContinuousClock.Instant
+    private let sink: @Sendable (TunnelAttemptEvent) -> Void
+    private var starts: [Int: ContinuousClock.Instant] = [:]
+    private var waitingEmitted = Set<Int>()
+    private var terminalEmitted = Set<Int>()
+    private var cancellationObserved = Set<Int>()
+
+    init(
+        routes: [TunnelAttemptRoute],
+        now: @escaping @Sendable () -> ContinuousClock.Instant,
+        sink: @escaping @Sendable (TunnelAttemptEvent) -> Void
+    ) {
+        self.routes = Dictionary(uniqueKeysWithValues: routes.enumerated().map { ($0.offset, $0.element) })
+        self.now = now
+        self.sink = sink
+    }
+
+    func started(order: Int) {
+        guard starts[order] == nil, !cancellationObserved.contains(order), let route = routes[order] else {
+            return
+        }
+        starts[order] = now()
+        sink(TunnelAttemptEvent(route: route, ordinal: order, phase: .started))
+    }
+
+    func waiting(order: Int) {
+        guard starts[order] != nil, !terminalEmitted.contains(order), waitingEmitted.insert(order).inserted else {
+            return
+        }
+        emit(order: order, phase: .waitingForBroker(elapsedMilliseconds: elapsedMilliseconds(order: order)))
+    }
+
+    func transportReady(order: Int) {
+        guard !terminalEmitted.contains(order), !cancellationObserved.contains(order) else {
+            return
+        }
+        emit(order: order, phase: .transportReady(elapsedMilliseconds: elapsedMilliseconds(order: order)))
+    }
+
+    func failed(order: Int, failureClass: TunnelAttemptFailureClass) {
+        emitTerminal(order: order, phase: .failed(failureClass, elapsedMilliseconds: elapsedMilliseconds(order: order)))
+    }
+
+    func selected(order: Int) {
+        emitTerminal(order: order, phase: .selected(elapsedMilliseconds: elapsedMilliseconds(order: order)))
+    }
+
+    func cancelled(order: Int) {
+        emitTerminal(order: order, phase: .cancelled(elapsedMilliseconds: elapsedMilliseconds(order: order)))
+    }
+
+    func observeCancellation(excluding winnerOrder: Int? = nil) {
+        for order in routes.keys where order != winnerOrder && !terminalEmitted.contains(order) {
+            cancellationObserved.insert(order)
+        }
+    }
+
+    func observeCancellation(order: Int) {
+        guard !terminalEmitted.contains(order) else {
+            return
+        }
+        cancellationObserved.insert(order)
+    }
+
+    func isCancellationObserved(order: Int) -> Bool {
+        cancellationObserved.contains(order)
+    }
+
+    private func emitTerminal(order: Int, phase: TunnelAttemptPhase) {
+        guard terminalEmitted.insert(order).inserted else {
+            return
+        }
+        emit(order: order, phase: phase)
+    }
+
+    private func emit(order: Int, phase: TunnelAttemptPhase) {
+        guard starts[order] != nil, let route = routes[order] else {
+            return
+        }
+        sink(TunnelAttemptEvent(route: route, ordinal: order, phase: phase))
+    }
+
+    private func elapsedMilliseconds(order: Int) -> Int {
+        guard let startedAt = starts[order] else {
+            return 0
+        }
+        return startedAt.duration(to: now()).milliseconds
     }
 }
 
@@ -54,12 +144,16 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
     private let budget: Duration
     private let close: @Sendable (Value) async -> Void
     private let dial: @Sendable (TransportEndpoint, RaceAttemptProgress) async throws -> Value
+    private let now: @Sendable () -> ContinuousClock.Instant
+    private let attemptEventSink: @Sendable (TunnelAttemptEvent) -> Void
 
     init(
         stagger: Duration,
         loserGrace: Duration,
         budget: Duration,
         close: @escaping @Sendable (Value) async -> Void,
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
+        attemptEventSink: @escaping @Sendable (TunnelAttemptEvent) -> Void = { _ in },
         dial: @escaping @Sendable (TransportEndpoint, RaceAttemptProgress) async throws -> Value
     ) {
         self.stagger = stagger
@@ -67,6 +161,8 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
         self.budget = budget
         self.close = close
         self.dial = dial
+        self.now = now
+        self.attemptEventSink = attemptEventSink
     }
 
     func connect(
@@ -79,17 +175,34 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
 
         let sorted = Self.sorted(endpoints, preferredEndpoint: preferredEndpoint)
         raceLog.notice("dial candidates=\(Self.describe(sorted), privacy: .public)")
+        let attempts = RaceAttemptEmitter(
+            routes: sorted.map(Self.attemptRoute),
+            now: now,
+            sink: attemptEventSink
+        )
         guard sorted.count > 1 else {
             let endpoint = sorted[0]
-            let startedAt = ContinuousClock.now
+            let startedAt = now()
+            await attempts.started(order: 0)
             do {
-                let value = try await dial(endpoint, .none)
-                raceLog.notice("candidate ok endpoint=\(endpoint.logDescription, privacy: .public) duration_ms=\(startedAt.duration(to: .now).milliseconds, privacy: .public)")
+                let progress = RaceAttemptProgress {
+                    await attempts.waiting(order: 0)
+                }
+                let value = try await dial(endpoint, progress)
+                await attempts.transportReady(order: 0)
+                await attempts.selected(order: 0)
+                raceLog.notice("candidate ok endpoint=\(endpoint.logDescription, privacy: .public) duration_ms=\(startedAt.duration(to: now()).milliseconds, privacy: .public)")
                 raceLog.notice("race winner endpoint=\(endpoint.logDescription, privacy: .public)")
                 return RaceResult(endpoint: endpoint, value: value)
             } catch {
                 let sessionError = Self.sessionError(from: error)
-                raceLog.notice("candidate failed endpoint=\(endpoint.logDescription, privacy: .public) error=\(String(describing: sessionError), privacy: .public) duration_ms=\(startedAt.duration(to: .now).milliseconds, privacy: .public)")
+                if Task.isCancelled {
+                    await attempts.observeCancellation(order: 0)
+                    await attempts.cancelled(order: 0)
+                } else {
+                    await attempts.failed(order: 0, failureClass: Self.attemptFailureClass(for: sessionError))
+                }
+                raceLog.notice("candidate failed endpoint=\(endpoint.logDescription, privacy: .public) error=\(String(describing: sessionError), privacy: .public) duration_ms=\(startedAt.duration(to: now()).milliseconds, privacy: .public)")
                 throw sessionError
             }
         }
@@ -106,17 +219,26 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                         }
                     }
 
-                    let startedAt = ContinuousClock.now
+                    await attempts.started(order: order)
+                    let startedAt = now()
                     do {
                         let progress = RaceAttemptProgress {
                             await waitingTracker.markWaiting(order: order)
+                            await attempts.waiting(order: order)
                         }
                         let value = try await dial(endpoint, progress)
-                        raceLog.notice("candidate ok endpoint=\(endpoint.logDescription, privacy: .public) duration_ms=\(startedAt.duration(to: .now).milliseconds, privacy: .public)")
+                        await attempts.transportReady(order: order)
+                        raceLog.notice("candidate ok endpoint=\(endpoint.logDescription, privacy: .public) duration_ms=\(startedAt.duration(to: now()).milliseconds, privacy: .public)")
                         return .success(order: order, endpoint: endpoint, value: value)
                     } catch {
                         let sessionError = Self.sessionError(from: error)
-                        raceLog.notice("candidate failed endpoint=\(endpoint.logDescription, privacy: .public) error=\(String(describing: sessionError), privacy: .public) duration_ms=\(startedAt.duration(to: .now).milliseconds, privacy: .public)")
+                        if await attempts.isCancellationObserved(order: order) || Task.isCancelled {
+                            await attempts.observeCancellation(order: order)
+                            await attempts.cancelled(order: order)
+                        } else {
+                            await attempts.failed(order: order, failureClass: Self.attemptFailureClass(for: sessionError))
+                        }
+                        raceLog.notice("candidate failed endpoint=\(endpoint.logDescription, privacy: .public) error=\(String(describing: sessionError), privacy: .public) duration_ms=\(startedAt.duration(to: now()).milliseconds, privacy: .public)")
                         return .failure(order: order, error: sessionError)
                     }
                 }
@@ -143,9 +265,13 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                     return
                 }
                 await close(value)
+                if await attempts.isCancellationObserved(order: order) {
+                    await attempts.cancelled(order: order)
+                }
             }
 
             func cancelAndDrain(winnerOrder: Int?) async {
+                await attempts.observeCancellation(excluding: winnerOrder)
                 group.cancelAll()
                 for success in successes {
                     await closeIfNeeded(order: success.order, value: success.value, winnerOrder: winnerOrder)
@@ -160,6 +286,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
             do {
                 while let event = try await group.next() {
                     if Task.isCancelled {
+                        await attempts.observeCancellation()
                         if case .success(let order, _, let value) = event {
                             await closeIfNeeded(order: order, value: value, winnerOrder: nil)
                         }
@@ -211,6 +338,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                         }
                         if let winner = successes.min(by: { $0.order < $1.order }) {
                             await cancelAndDrain(winnerOrder: winner.order)
+                            await attempts.selected(order: winner.order)
                             raceLog.notice("race winner endpoint=\(winner.endpoint.logDescription, privacy: .public)")
                             return RaceResult(endpoint: winner.endpoint, value: winner.value)
                         }
@@ -231,6 +359,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                             throw aggregate
                         }
                         await cancelAndDrain(winnerOrder: winner.order)
+                        await attempts.selected(order: winner.order)
                         raceLog.notice("race winner endpoint=\(winner.endpoint.logDescription, privacy: .public)")
                         return RaceResult(endpoint: winner.endpoint, value: winner.value)
                     }
@@ -251,6 +380,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                 throw CancellationError()
             }
             await cancelAndDrain(winnerOrder: winner.order)
+            await attempts.selected(order: winner.order)
             raceLog.notice("race winner endpoint=\(winner.endpoint.logDescription, privacy: .public)")
             return RaceResult(endpoint: winner.endpoint, value: winner.value)
         }
@@ -297,6 +427,34 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
 
     private static func describe(_ endpoints: [TransportEndpoint]) -> String {
         endpoints.map(\.logDescription).joined(separator: ", ")
+    }
+
+    private static func attemptRoute(_ endpoint: TransportEndpoint) -> TunnelAttemptRoute {
+        switch endpoint {
+        case .lan(_, _, _, let unpinnedInterface):
+            return unpinnedInterface ? .directUnpinned : .directPinned
+        case .relay:
+            return .relay
+        }
+    }
+
+    private static func attemptFailureClass(for error: SessionError) -> TunnelAttemptFailureClass {
+        switch error {
+        case .unreachable:
+            .unreachable
+        case .tlsFailed:
+            .tls
+        case .authRefreshRequired:
+            .authRefreshRequired
+        case .notEntitled:
+            .notEntitled
+        case .revoked:
+            .revoked
+        case .transportFailed, .inboundClosed, .directKeepaliveMissed, .relayKeepaliveMissed:
+            .transport
+        case .notConnected:
+            .other
+        }
     }
 
     static func sessionError(from error: any Error) -> SessionError {
