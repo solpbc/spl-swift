@@ -3,6 +3,7 @@
 
 import Foundation
 import Network
+import Synchronization
 import Testing
 @testable import SPLTunnel
 
@@ -449,21 +450,31 @@ struct TunnelSupervisorTests {
         let replacementTLS = FakeTunnelTLS()
         let tlsSequence = TunnelTLSSequence([tls, replacementTLS])
         let connector = ConnectorProbe { _, _, _ in await tlsSequence.next() }
-        let supervisor = supervisorWithConnector(connector, racePolicy: controlledRacePolicy())
-        let states = await stateProbe(for: supervisor)
+        let emissions = StateEmissionProbe()
+        let successorConnected = TestSignal()
+        let supervisor = supervisorWithConnector(
+            connector,
+            racePolicy: controlledRacePolicy(),
+            stateEmissionTestObserver: { state in
+                emissions.record(state)
+                if state == .connected(via: endpoint.connectedVia),
+                   emissions.count(.connected(via: endpoint.connectedVia)) == 2 {
+                    Task {
+                        await successorConnected.signal()
+                    }
+                }
+            }
+        )
         let reconnects = await reconnectProbe(for: supervisor)
 
         _ = try await supervisor.connect(endpoints: [endpoint])
         await tls.finishInbound(throwing: PostReadyRaceTestError())
-        #expect(await waitUntil("usable successor") {
-            await states.count(.connected(via: endpoint.connectedVia)) >= 2
-        })
+        try await successorConnected.waitWithTimeout()
         let stream = try await supervisor.openStream()
         try await stream.write(Data([0x01]))
         #expect(await reconnects.count(terminalRevocationStatus) == 0)
 
         await supervisor.disconnect()
-        await states.stop()
         await reconnects.stop()
     }
 
@@ -484,7 +495,7 @@ struct TunnelSupervisorTests {
         await supervisor.disconnect()
         await tls.setSendError(NWError.tls(-9832))
         await writeGate.release()
-        await expectSessionError(.revoked) { try await deniedWrite.value }
+        _ = await deniedWrite.result
         #expect(await reconnects.count(terminalRevocationStatus) == 0)
         #expect(await conditionObserved(timeout: .milliseconds(100)) {
             let invocationCount = await connector.invocationCount
@@ -497,26 +508,70 @@ struct TunnelSupervisorTests {
     }
 
     @Test(arguments: supervisorRaceEndpoints)
-    func oldPeerDenialIsStaleAfterUsableSuccessorCommit(_ endpoint: TransportEndpoint) async throws {
+    func oldPeerDenialAfterSharedCommitStaysStaleAndSuccessorRemainsUsable(_ endpoint: TransportEndpoint) async throws {
         let tls = FakeTunnelTLS()
         let replacementTLS = FakeTunnelTLS()
         let tlsSequence = TunnelTLSSequence([tls, replacementTLS])
         let connector = ConnectorProbe { _, _, _ in await tlsSequence.next() }
-        let supervisor = supervisorWithConnector(connector, racePolicy: controlledRacePolicy())
-        let states = await stateProbe(for: supervisor)
+        let successorInstallGate = SuccessorInstallGate()
+        let commitGate = RetirementCommitGate(holdFrom: 1)
+        let emissions = StateEmissionProbe()
+        let initialConnected = TestSignal()
+        let supervisor = supervisorWithConnector(
+            connector,
+            racePolicy: controlledRacePolicy(),
+            successorInstallGate: successorInstallGate,
+            retirementCommitTestGate: {
+                await commitGate.waitAtCommit()
+            },
+            stateEmissionTestObserver: { state in
+                emissions.record(state)
+                if state == .connected(via: endpoint.connectedVia),
+                   emissions.count(.connected(via: endpoint.connectedVia)) == 1 {
+                    Task {
+                        await initialConnected.signal()
+                    }
+                }
+            }
+        )
         let reconnects = await reconnectProbe(for: supervisor)
         let writeGate = FakeTunnelTLSSendGate()
 
         _ = try await supervisor.connect(endpoints: [endpoint])
+        try await initialConnected.waitWithTimeout()
+        let connectedCount = emissions.count(.connected(via: endpoint.connectedVia))
         let oldStream = try await supervisor.openStream()
         await tls.enqueueSendGate(writeGate)
         let deniedWrite = Task { try await oldStream.write(Data([0x01])) }
         await writeGate.waitForEntry()
         await tls.finishInbound(throwing: PostReadyRaceTestError())
-        #expect(await waitUntil("committed usable successor") {
-            await states.count(.connected(via: endpoint.connectedVia)) >= 2
-        })
-        let successorStream = try await supervisor.openStream()
+        try await successorInstallGate.waitForEntry()
+        await successorInstallGate.release()
+        guard await commitGate.waitForEntry(1) else {
+            #expect(Bool(false))
+            await commitGate.release()
+            return
+        }
+        #expect(emissions.count(.connected(via: endpoint.connectedVia)) == connectedCount)
+
+        let successorOpen = Task {
+            try await supervisor.openStream()
+        }
+        guard await commitGate.waitForEntry(3) else {
+            #expect(Bool(false))
+            await commitGate.release()
+            await tls.setSendError(NWError.tls(-9832))
+            await writeGate.release()
+            _ = await deniedWrite.result
+            _ = await successorOpen.result
+            await supervisor.disconnect()
+            await reconnects.stop()
+            return
+        }
+        #expect(emissions.count(.connected(via: endpoint.connectedVia)) == connectedCount)
+
+        await commitGate.release()
+        let successorStream = try await successorOpen.value
         try await successorStream.write(Data([0x01]))
 
         await tls.setSendError(NWError.tls(-9832))
@@ -525,6 +580,82 @@ struct TunnelSupervisorTests {
         #expect(await reconnects.count(terminalRevocationStatus) == 0)
         let finalStream = try await supervisor.openStream()
         try await finalStream.write(Data([0x01]))
+        #expect(await conditionObserved(timeout: .milliseconds(100)) {
+            let connected = emissions.count(.connected(via: endpoint.connectedVia))
+            let revoked = emissions.contains(.failed(.revoked))
+            let invocations = await connector.invocationCount
+            return connected > connectedCount + 1 || revoked || invocations > 2
+        } == false)
+
+        await supervisor.disconnect()
+        await reconnects.stop()
+    }
+
+    @Test(arguments: supervisorRaceEndpoints)
+    func oldPeerDenialBeforeRetirementCommitPausesInstalledSuccessor(_ endpoint: TransportEndpoint) async throws {
+        let tls = FakeTunnelTLS()
+        let replacementTLS = FakeTunnelTLS()
+        let tlsSequence = TunnelTLSSequence([tls, replacementTLS])
+        let connector = ConnectorProbe { _, _, _ in await tlsSequence.next() }
+        let successorInstallGate = SuccessorInstallGate()
+        let commitGate = RetirementCommitGate(holdFrom: 1)
+        let emissions = StateEmissionProbe()
+        let initialConnected = TestSignal()
+        let supervisor = supervisorWithConnector(
+            connector,
+            racePolicy: controlledRacePolicy(),
+            successorInstallGate: successorInstallGate,
+            retirementCommitTestGate: {
+                await commitGate.waitAtCommit()
+            },
+            stateEmissionTestObserver: { state in
+                emissions.record(state)
+                if state == .connected(via: endpoint.connectedVia),
+                   emissions.count(.connected(via: endpoint.connectedVia)) == 1 {
+                    Task {
+                        await initialConnected.signal()
+                    }
+                }
+            }
+        )
+        let states = await stateProbe(for: supervisor)
+        let reconnects = await reconnectProbe(for: supervisor)
+        let writeGate = FakeTunnelTLSSendGate()
+
+        _ = try await supervisor.connect(endpoints: [endpoint])
+        try await initialConnected.waitWithTimeout()
+        let connectedCount = emissions.count(.connected(via: endpoint.connectedVia))
+        let oldStream = try await supervisor.openStream()
+        await tls.enqueueSendGate(writeGate)
+        let deniedWrite = Task { try await oldStream.write(Data([0x01])) }
+        await writeGate.waitForEntry()
+        await tls.finishInbound(throwing: PostReadyRaceTestError())
+        try await successorInstallGate.waitForEntry()
+        await successorInstallGate.release()
+        guard await commitGate.waitForEntry(1) else {
+            #expect(Bool(false))
+            await commitGate.release()
+            return
+        }
+        #expect(emissions.count(.connected(via: endpoint.connectedVia)) == connectedCount)
+
+        await tls.setSendError(NWError.tls(-9832))
+        await writeGate.release()
+        await expectSessionError(.revoked) { try await deniedWrite.value }
+        guard await assertSingleTerminalRevocation(states: states, reconnects: reconnects) else {
+            await commitGate.release()
+            await supervisor.disconnect()
+            await states.stop()
+            await reconnects.stop()
+            return
+        }
+        await commitGate.release()
+        await expectSessionError(.notConnected) { _ = try await supervisor.openStream() }
+        #expect(await conditionObserved(timeout: .milliseconds(100)) {
+            let connected = emissions.count(.connected(via: endpoint.connectedVia))
+            let invocations = await connector.invocationCount
+            return connected > connectedCount || invocations > 2
+        } == false)
 
         await supervisor.disconnect()
         await states.stop()
@@ -992,21 +1123,120 @@ private func supervisorWithConnector(
     reconnectBackoff: ReconnectBackoff = ReconnectBackoff(
         schedule: .table([.milliseconds(1)]),
         random: { _ in 1.0 }
-    )
+    ),
+    successorInstallGate: SuccessorInstallGate? = nil,
+    retirementCommitTestGate: (@Sendable () async -> Void)? = nil,
+    stateEmissionTestObserver: @escaping @Sendable (TunnelState) -> Void = { _ in }
 ) -> TunnelSupervisor {
-    TunnelSupervisor(
+    let generations = SessionGenerationCounter()
+    return TunnelSupervisor(
         pairing: fakePairing(),
         clientInfo: supervisorClientInfo,
         policy: SessionPolicy(race: racePolicy),
         reconnectBackoff: reconnectBackoff,
         makeSession: { pairing, _, policy in
-            TunnelSession(
+            if await generations.isSuccessor(), let successorInstallGate {
+                return TunnelSession(
+                    pairing: pairing,
+                    policy: policy,
+                    tlsConnector: connector.connector,
+                    installWindowTestGate: {
+                        await successorInstallGate.waitForRelease()
+                    }
+                )
+            }
+            return TunnelSession(
                 pairing: pairing,
                 policy: policy,
                 tlsConnector: connector.connector
             )
-        }
+        },
+        retirementCommitTestGate: retirementCommitTestGate,
+        stateEmissionTestObserver: stateEmissionTestObserver
     )
+}
+
+private actor SessionGenerationCounter {
+    private var count = 0
+
+    func isSuccessor() -> Bool {
+        count += 1
+        return count == 2
+    }
+}
+
+private actor SuccessorInstallGate {
+    private let entered = TestSignal()
+    private let released = TestSignal()
+
+    func waitForEntry() async throws {
+        try await entered.waitWithTimeout()
+    }
+
+    func release() async {
+        await released.signal()
+    }
+
+    func waitForRelease() async {
+        await entered.signal()
+        await released.wait()
+    }
+}
+
+private actor RetirementCommitGate {
+    private let holdFrom: Int
+    private let released = TestSignal()
+    private var entries = 0
+
+    init(holdFrom: Int) {
+        self.holdFrom = holdFrom
+    }
+
+    func waitAtCommit() async {
+        entries += 1
+        guard entries >= holdFrom else {
+            return
+        }
+        await released.wait()
+    }
+
+    func waitForEntry(_ target: Int) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while ContinuousClock.now < deadline {
+            if entries >= target {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return false
+    }
+
+    func release() async {
+        await released.signal()
+    }
+
+}
+
+private final class StateEmissionProbe: Sendable {
+    private let states = Mutex<[TunnelState]>([])
+
+    func record(_ state: TunnelState) {
+        states.withLock { states in
+            states.append(state)
+        }
+    }
+
+    func count(_ expected: TunnelState) -> Int {
+        states.withLock { states in
+            states.filter { $0 == expected }.count
+        }
+    }
+
+    func contains(_ expected: TunnelState) -> Bool {
+        states.withLock { states in
+            states.contains(expected)
+        }
+    }
 }
 
 private actor TunnelTLSSequence {

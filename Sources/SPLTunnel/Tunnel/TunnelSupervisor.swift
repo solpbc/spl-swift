@@ -102,6 +102,8 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private let makeSession: TunnelGenerationFactory
     private let sleeper: @Sendable (Duration) async throws -> Void
     private let now: @Sendable () -> ContinuousClock.Instant
+    private let retirementCommitTestGate: (@Sendable () async -> Void)?
+    private let stateEmissionTestObserver: @Sendable (TunnelState) -> Void
 
     private let stateStream: AsyncStream<TunnelState>
     private let stateContinuation: AsyncStream<TunnelState>.Continuation
@@ -155,7 +157,10 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         now: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
         makeSession: @escaping TunnelGenerationFactory = { pairing, clientInfo, policy in
             TunnelSession(pairing: pairing, clientInfo: clientInfo, policy: policy)
-        }
+        },
+        // Internal test seams; defaults have no production effect.
+        retirementCommitTestGate: (@Sendable () async -> Void)? = nil,
+        stateEmissionTestObserver: @escaping @Sendable (TunnelState) -> Void = { _ in }
     ) {
         self.pairing = pairing
         self.clientInfo = clientInfo
@@ -164,6 +169,8 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         self.sleeper = sleeper
         self.now = now
         self.makeSession = makeSession
+        self.retirementCommitTestGate = retirementCommitTestGate
+        self.stateEmissionTestObserver = stateEmissionTestObserver
 
         let state = AsyncStream<TunnelState>.makeStream()
         self.stateStream = state.stream
@@ -237,7 +244,9 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             throw SessionError.notConnected
         }
         do {
-            return try await current.session.openStream()
+            let stream = try await current.session.openStream()
+            await commitRetiringGeneration()
+            return stream
         } catch {
             if let sessionError = error as? SessionError, sessionError == .revoked {
                 throw sessionError
@@ -439,6 +448,13 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     }
 
     private func commitRetiringGeneration() async {
+        guard retiringGeneration != nil else {
+            return
+        }
+        if let retirementCommitTestGate {
+            await retirementCommitTestGate()
+        }
+        // The test gate can suspend while pause() or disconnect() clears this generation.
         guard let retiringGeneration else {
             return
         }
@@ -514,7 +530,15 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         switch childState {
         case .disconnected:
             break
-        case .connecting, .tlsHandshaking, .awaitingBroker, .connected:
+        case .connecting, .tlsHandshaking, .awaitingBroker:
+            publish(childState)
+        case .connected:
+            // why: Connected is the first public capability; dial-progress states must retain
+            // terminal eligibility until the successor is externally observable or usable.
+            await commitRetiringGeneration()
+            guard generation?.token == token, lifecycle == .running else {
+                return
+            }
             publish(childState)
         case .failed(let error):
             currentVia = nil
@@ -607,6 +631,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     }
 
     private func publish(_ newState: TunnelState) {
+        stateEmissionTestObserver(newState)
         stateContinuation.yield(newState)
         supervisorLog.notice("supervisor state=\(TunnelStateLogDescription.describe(newState), privacy: .public)")
     }
