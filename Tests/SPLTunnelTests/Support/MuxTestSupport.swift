@@ -3,7 +3,24 @@
 
 @testable import SPLTunnel
 import Foundation
+import os
 import Testing
+
+final class MuxInstantBox: Sendable {
+    private let lock: OSAllocatedUnfairLock<ContinuousClock.Instant>
+
+    init(_ instant: ContinuousClock.Instant = .now) {
+        self.lock = OSAllocatedUnfairLock(initialState: instant)
+    }
+
+    func get() -> ContinuousClock.Instant {
+        lock.withLock { $0 }
+    }
+
+    func advance(_ duration: Duration) {
+        lock.withLock { $0 = $0.advanced(by: duration) }
+    }
+}
 
 enum MuxTestError: Error, Equatable, Sendable {
     case sinkFailure
@@ -129,6 +146,99 @@ actor BlockingFirstMuxSink {
 
     func frames() -> [Frame] {
         recordedFrames
+    }
+}
+
+actor SlowFIFOMuxSink {
+    let perFrameDelay: Duration
+
+    private var decoder = FrameDecoder()
+    private var completedFrames: [Frame] = []
+    private var acceptedDataCount = 0
+    private var queue: [Item] = []
+    private var draining = false
+    private var dataWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private struct Item {
+        let frames: [Frame]
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    init(perFrameDelay: Duration = .milliseconds(50)) {
+        self.perFrameDelay = perFrameDelay
+    }
+
+    func record(_ bytes: Data) async throws {
+        decoder.feed(bytes)
+        var frames: [Frame] = []
+        while let frame = try decoder.next() {
+            frames.append(frame)
+            if frame.streamID != 0, frame.flags & FrameFlags.data.rawValue != 0 {
+                acceptedDataCount += 1
+            }
+        }
+        resumeDataWaiters()
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.append(Item(frames: frames, continuation: continuation))
+            Task { await self.drain() }
+        }
+    }
+
+    func waitUntilAcceptedDataCount(_ count: Int) async {
+        if acceptedDataCount >= count {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            dataWaiters.append(continuation)
+        }
+        if acceptedDataCount < count {
+            await waitUntilAcceptedDataCount(count)
+        }
+    }
+
+    func waitUntilCompletedPong(timeout: Duration) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if completedFrames.contains(where: isPong) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        throw MuxTestError.timedOut("pong not completed within budget")
+    }
+
+    func frames() -> [Frame] {
+        completedFrames
+    }
+
+    private func drain() async {
+        guard !draining else {
+            return
+        }
+        draining = true
+        while let item = queue.first {
+            queue.removeFirst()
+            try? await Task.sleep(for: perFrameDelay)
+            completedFrames.append(contentsOf: item.frames)
+            item.continuation.resume()
+        }
+        draining = false
+        if !queue.isEmpty {
+            await drain()
+        }
+    }
+
+    private func resumeDataWaiters() {
+        let waiters = dataWaiters
+        dataWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func isPong(_ frame: Frame) -> Bool {
+        frame.streamID == 0 && frame.flags == FrameFlags.pong.rawValue
     }
 }
 
@@ -266,29 +376,32 @@ func firstIncomingStream(
     }
 }
 
-func firstKeepaliveLoss(
-    from stream: AsyncStream<Void>,
+@discardableResult
+func firstKeepaliveLoss<Element: Sendable>(
+    from stream: AsyncStream<Element>,
     timeout: Duration = .milliseconds(500)
-) async throws {
-    try await withThrowingTaskGroup(of: Void.self) { group in
+) async throws -> Element {
+    try await withThrowingTaskGroup(of: Element.self) { group in
         group.addTask {
             var iterator = stream.makeAsyncIterator()
-            guard await iterator.next() != nil else {
+            guard let value = await iterator.next() else {
                 throw MuxTestError.timedOut("keepalive lost stream ended")
             }
+            return value
         }
         group.addTask {
             try await Task.sleep(for: timeout)
             throw MuxTestError.timedOut("keepalive lost")
         }
 
-        try await #require(group.next())
+        let result = try await #require(group.next())
         group.cancelAll()
+        return result
     }
 }
 
-func keepaliveLossObserved(
-    from stream: AsyncStream<Void>,
+func keepaliveLossObserved<Element: Sendable>(
+    from stream: AsyncStream<Element>,
     timeout: Duration = .milliseconds(100)
 ) async -> Bool {
     await withTaskGroup(of: Bool.self) { group in

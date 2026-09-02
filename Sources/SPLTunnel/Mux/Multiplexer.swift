@@ -39,19 +39,33 @@ private struct OutstandingPing: Sendable {
     let issuedTick: UInt64
 }
 
+public struct KeepaliveLossEvent: Sendable, Equatable {
+    public enum Reason: Sendable, Equatable {
+        case sendFailure
+        case missedPingLimit
+    }
+
+    public let reason: Reason
+    public let missedPingCount: Int
+    public let elapsedSinceLastPong: Duration
+    public let outboundInFlight: Bool
+}
+
 public actor Multiplexer {
-    public nonisolated var keepaliveLost: AsyncStream<Void> {
+    public nonisolated var keepaliveLost: AsyncStream<KeepaliveLossEvent> {
         keepaliveLostStream
     }
 
     public nonisolated let incomingStreams: AsyncStream<MuxStream>
 
-    private let sink: @Sendable (Data) async throws -> Void
+    private let scheduler: MuxOutboundScheduler
+    private let dataSink: @Sendable (Data) async throws -> Void
     private let sleeper: @Sendable (Duration) async throws -> Void
+    private let now: @Sendable () -> ContinuousClock.Instant
     private let role: Role
     private let incomingContinuation: AsyncStream<MuxStream>.Continuation
-    private let keepaliveLostStream: AsyncStream<Void>
-    private let keepaliveLostContinuation: AsyncStream<Void>.Continuation
+    private let keepaliveLostStream: AsyncStream<KeepaliveLossEvent>
+    private let keepaliveLostContinuation: AsyncStream<KeepaliveLossEvent>.Continuation
     private var nextOutboundID: UInt32
     private var streams: [UInt32: MuxStream] = [:]
     private var tornDown = false
@@ -60,6 +74,8 @@ public actor Multiplexer {
     private var outstandingPings: [OutstandingPing] = []
     private var keepaliveTickIndex: UInt64 = 0
     private var inboundActivityCounter: UInt64 = 0
+    private var lastMatchedPongAt: ContinuousClock.Instant?
+    private var keepaliveStartedAt: ContinuousClock.Instant?
 
     public init(sink: @escaping @Sendable (Data) async throws -> Void, role: Role = .dialer) {
         self.init(
@@ -72,13 +88,19 @@ public actor Multiplexer {
     internal init(
         sink: @escaping @Sendable (Data) async throws -> Void,
         role: Role = .dialer,
-        sleeper: @escaping @Sendable (Duration) async throws -> Void
+        sleeper: @escaping @Sendable (Duration) async throws -> Void,
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
     ) {
         let incoming = AsyncStream<MuxStream>.makeStream()
-        let keepalive = AsyncStream<Void>.makeStream()
-        self.sink = sink
+        let keepalive = AsyncStream<KeepaliveLossEvent>.makeStream()
+        let scheduler = MuxOutboundScheduler(sink: sink)
+        self.scheduler = scheduler
+        self.dataSink = { data in
+            try await scheduler.send(data, priority: .data)
+        }
         self.role = role
         self.sleeper = sleeper
+        self.now = now
         self.incomingStreams = incoming.stream
         self.incomingContinuation = incoming.continuation
         self.keepaliveLostStream = keepalive.stream
@@ -98,7 +120,7 @@ public actor Multiplexer {
         nextOutboundID &+= 2
         let stream = MuxStream(
             id: id,
-            sink: sink,
+            sink: dataSink,
             onTerminal: { [weak self] streamID in
                 await self?.evictTerminalStream(id: streamID)
             }
@@ -106,7 +128,7 @@ public actor Multiplexer {
         let frame = try encodeFrame(buildOpen(streamID: id))
         streams[id] = stream
         do {
-            try await sink(frame)
+            try await sendControl(frame)
         } catch {
             streams.removeValue(forKey: id)
             throw error
@@ -135,6 +157,8 @@ public actor Multiplexer {
 
         outstandingPings.removeAll(keepingCapacity: true)
         keepaliveTickIndex = 0
+        lastMatchedPongAt = nil
+        keepaliveStartedAt = now()
         keepaliveTask = Task {
             await runKeepalive(interval: interval, missedLimit: missedLimit)
         }
@@ -148,6 +172,7 @@ public actor Multiplexer {
         tornDown = true
         keepaliveTask?.cancel()
         keepaliveTask = nil
+        await scheduler.tearDown()
         keepaliveLostContinuation.finish()
         outstandingPings.removeAll(keepingCapacity: true)
         incomingContinuation.finish()
@@ -278,7 +303,7 @@ public actor Multiplexer {
             logger.warning(
                 "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.protocolError.rawValue, privacy: .public)"
             )
-            try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: .protocolError)))
+            try await sendControl(try encodeFrame(buildReset(streamID: frame.streamID, reason: .protocolError)))
             return
         }
 
@@ -286,7 +311,7 @@ public actor Multiplexer {
             logger.warning(
                 "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.protocolError.rawValue, privacy: .public)"
             )
-            try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: .protocolError)))
+            try await sendControl(try encodeFrame(buildReset(streamID: frame.streamID, reason: .protocolError)))
             return
         }
 
@@ -294,13 +319,13 @@ public actor Multiplexer {
             logger.warning(
                 "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.streamLimitExceeded.rawValue, privacy: .public)"
             )
-            try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: .streamLimitExceeded)))
+            try await sendControl(try encodeFrame(buildReset(streamID: frame.streamID, reason: .streamLimitExceeded)))
             return
         }
 
         let stream = MuxStream(
             id: frame.streamID,
-            sink: sink,
+            sink: dataSink,
             onTerminal: { [weak self] streamID in
                 await self?.evictTerminalStream(id: streamID)
             }
@@ -312,7 +337,7 @@ public actor Multiplexer {
                 logger.warning(
                     "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(ResetReason.flowControlError.rawValue, privacy: .public)"
                 )
-                try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: .flowControlError)))
+                try await sendControl(try encodeFrame(buildReset(streamID: frame.streamID, reason: .flowControlError)))
                 return
             }
         }
@@ -333,11 +358,12 @@ public actor Multiplexer {
         switch (isPing, isPong) {
         case (true, false):
             let nonce = try parseControlNonce(from: frame.payload)
-            try await sink(try encodeFrame(buildPong(nonce: nonce)))
+            try await sendControl(try encodeFrame(buildPong(nonce: nonce)))
         case (false, true):
             let nonce = try parseControlNonce(from: frame.payload)
             if let matched = outstandingPings.first(where: { $0.nonce == nonce }) {
                 outstandingPings.removeAll { $0.issuedTick <= matched.issuedTick }
+                lastMatchedPongAt = now()
             }
         default:
             throw FramingError.unknownControlFrame
@@ -352,7 +378,7 @@ public actor Multiplexer {
         logger.warning(
             "framing_protocol_violation stream_id=\(frame.streamID, privacy: .public) flags=\(frame.flags, privacy: .public) length=\(frame.payload.count, privacy: .public) reason=\(reason.rawValue, privacy: .public)"
         )
-        try await sink(try encodeFrame(buildReset(streamID: frame.streamID, reason: reason)))
+        try await sendControl(try encodeFrame(buildReset(streamID: frame.streamID, reason: reason)))
     }
 
     private func emitUnknownStreamReset(
@@ -364,7 +390,7 @@ public actor Multiplexer {
         logger.warning(
             "framing_protocol_violation stream_id=\(streamID, privacy: .public) flags=\(flags, privacy: .public) length=\(length, privacy: .public) reason=\(reason.rawValue, privacy: .public)"
         )
-        try await sink(try encodeFrame(buildReset(streamID: streamID, reason: reason)))
+        try await sendControl(try encodeFrame(buildReset(streamID: streamID, reason: reason)))
     }
 
     private func evictTerminalStream(id: UInt32) {
@@ -387,7 +413,7 @@ public actor Multiplexer {
                 }
                 // Sink failure means the transport write path is dead; tear down immediately.
                 logger.notice("mux keepalive lost reason=\("sendFailure", privacy: .public)")
-                keepaliveLostContinuation.yield(())
+                await emitKeepaliveLost(reason: .sendFailure, missedPingCount: outstandingPings.count)
                 await tearDown(reason: .transportFailure)
                 return
             }
@@ -409,7 +435,7 @@ public actor Multiplexer {
            oldest.issuedTick <= currentTick - missedLimitTicks {
             // Missed PONGs are session policy: signal and let the session decide whether to tear down.
             logger.notice("mux keepalive lost missed_pings=\(effectiveMissedLimit, privacy: .public)")
-            keepaliveLostContinuation.yield(())
+            await emitKeepaliveLost(reason: .missedPingLimit, missedPingCount: effectiveMissedLimit)
             keepaliveTask?.cancel()
             keepaliveTask = nil
             return
@@ -417,7 +443,22 @@ public actor Multiplexer {
 
         let nonce = try randomNonce()
         outstandingPings.append(OutstandingPing(nonce: nonce, issuedTick: currentTick))
-        try await sink(try encodeFrame(buildPing(nonce: nonce)))
+        try await sendControl(try encodeFrame(buildPing(nonce: nonce)))
+    }
+
+    private func sendControl(_ frame: Data) async throws {
+        try await scheduler.send(frame, priority: .control)
+    }
+
+    private func emitKeepaliveLost(reason: KeepaliveLossEvent.Reason, missedPingCount: Int) async {
+        let origin = lastMatchedPongAt ?? keepaliveStartedAt ?? now()
+        let event = KeepaliveLossEvent(
+            reason: reason,
+            missedPingCount: missedPingCount,
+            elapsedSinceLastPong: origin.duration(to: now()),
+            outboundInFlight: await scheduler.dataInFlightOrQueued()
+        )
+        keepaliveLostContinuation.yield(event)
     }
 
     private func activeStreamCount() -> Int {

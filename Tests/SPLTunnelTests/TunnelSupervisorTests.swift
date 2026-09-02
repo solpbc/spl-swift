@@ -412,24 +412,21 @@ struct TunnelSupervisorTests {
         let states = await stateProbe(for: supervisor)
         let reconnects = await reconnectProbe(for: supervisor)
         let deniedGate = FakeTunnelTLSSendGate()
-        let genericGate = FakeTunnelTLSSendGate()
 
         _ = try await supervisor.connect(endpoints: [endpoint])
         let stream = try await supervisor.openStream()
         await tls.enqueueSendGate(deniedGate)
         let deniedWrite = Task { try await stream.write(Data([0x01])) }
         await deniedGate.waitForEntry()
-        await tls.enqueueSendGate(genericGate)
+        // openStream's OPEN is a control frame, but it cannot preempt the in-flight
+        // DATA sink call; it stays queued in the mux until this write completes.
         let genericOpen = Task { try await supervisor.openStream() }
-        await genericGate.waitForEntry()
 
         await tls.setSendError(NWError.tls(-9832))
         await deniedGate.release()
         await expectSessionError(.revoked) { try await deniedWrite.value }
         _ = await assertSingleTerminalRevocation(states: states, reconnects: reconnects)
 
-        await tls.setSendError(MuxError.transportClosed)
-        await genericGate.release()
         await expectSessionError(.notConnected) { _ = try await genericOpen.value }
         #expect(await conditionObserved(timeout: .milliseconds(100)) {
             let terminalCount = await reconnects.count(terminalRevocationStatus)
@@ -1547,9 +1544,10 @@ private actor GatedOpenGeneration: TunnelGeneration {
     }
 
     func openStream() async throws -> MuxStream {
-        let stream = try await base.openStream()
+        // Hold before the mux OPEN so a paused DATA sink cannot deadlock a
+        // serialized outbound scheduler (control frames cannot preempt in-flight DATA).
         await gate.waitForRelease()
-        return stream
+        return try await base.openStream()
     }
 
     func inboundActivitySnapshot() async -> UInt64 {
