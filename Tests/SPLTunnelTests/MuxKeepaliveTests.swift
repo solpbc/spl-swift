@@ -368,6 +368,64 @@ struct MuxKeepaliveTests {
         await gate.cancelAll()
     }
 
+    @Test func outboundInFlightIsFalseWhenNoDataIsQueuedAtMissedPingLoss() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveTickGate()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) }
+        )
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost) }
+
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 1)
+        await gate.waitForObservedTick(count: 1)
+        await gate.releaseOne()
+        await gate.waitForObservedTick(count: 2)
+        await gate.releaseOne()
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(event.outboundInFlight == false)
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
+    @Test func outboundInFlightIsTrueWhenDataIsQueuedAtMissedPingLoss() async throws {
+        let sink = SlowFIFOMuxSink(perFrameDelay: .milliseconds(80))
+        let gate = KeepaliveTickGate()
+        let mux = Multiplexer(
+            sink: { bytes in try await sink.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) }
+        )
+        var streams: [MuxStream] = []
+        for _ in 0..<16 {
+            streams.append(try await mux.openStream())
+        }
+        let chunk = Data(count: MuxConstants.recommendedChunk)
+        let writes = streams.map { stream in
+            Task {
+                try await stream.write(chunk)
+            }
+        }
+        await sink.waitUntilAcceptedDataCount(1)
+
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost) }
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 1)
+        await gate.waitForObservedTick(count: 1)
+        await gate.releaseOne()
+        await gate.waitForObservedTick(count: 2)
+        await gate.releaseOne()
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(event.outboundInFlight == true)
+
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+        for write in writes {
+            write.cancel()
+            _ = await write.result
+        }
+    }
+
     private func pingFrames(in recorder: MuxFrameRecorder) async throws -> [Frame] {
         await recorder.frames().filter { $0.streamID == 0 && $0.flags == FrameFlags.ping.rawValue }
     }
