@@ -65,11 +65,13 @@ public struct ProbeWatchdog: Sendable {
 
         consecutiveFailures += 1
 
-        let activeTransferStalled = !inboundAdvanced && activeLocalTransfers > 0
-        // Active local traffic with no inbound delta can only lower the effective threshold;
-        // it never raises the threshold or delays reconnect escalation.
+        // A single failed probe is not evidence of a dead connection: the probe shares
+        // the same mux session as real transfer traffic, so it can legitimately queue
+        // behind an in-flight upload and time out even though the session is healthy.
+        // `activeLocalTransfers` no longer bypasses the multi-strike floor below — it
+        // only ever selects which floor applies, same as before.
         let failureLimit = inboundAdvanced ? policy.activeInboundFailureLimit : policy.silentFailureLimit
-        let shouldReconnect = activeTransferStalled || consecutiveFailures >= failureLimit
+        let shouldReconnect = consecutiveFailures >= failureLimit
         let health: ProbeHealth = consecutiveFailures >= 2 ? .degraded : .unknown
 
         if shouldReconnect {

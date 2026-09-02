@@ -74,12 +74,21 @@ struct ProbeWatchdogTests {
         assertReconnect(failedProbe(&watchdog, inboundAdvanced: true), nextInterval: .seconds(30))
     }
 
-    @Test func activeTransferAcceleratesOnlyWithoutInboundDelta() {
+    @Test func activeTransferStalledDoesNotBypassTheSilentFailureFloor() {
+        // Regression: a single failed probe during an active local transfer with no
+        // inbound delta must NOT force an immediate reconnect — the probe shares the
+        // mux with real upload traffic and can legitimately queue behind it. It should
+        // take the same silentFailureLimit strikes as any other silent failure.
         var stalled = makeWatchdog()
 
-        let immediate = failedProbe(&stalled, inboundAdvanced: false, activeLocalTransfers: 1)
-        #expect(immediate.health == .unknown)
-        #expect(immediate.action == .reconnect)
+        for _ in 1...2 {
+            let verdict = failedProbe(&stalled, inboundAdvanced: false, activeLocalTransfers: 1)
+            #expect(verdict.action == .none)
+        }
+        assertReconnect(
+            failedProbe(&stalled, inboundAdvanced: false, activeLocalTransfers: 1),
+            nextInterval: .seconds(30)
+        )
 
         var advancing = makeWatchdog()
         for _ in 1...5 {
