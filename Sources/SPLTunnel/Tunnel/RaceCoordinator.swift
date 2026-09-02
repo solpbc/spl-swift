@@ -390,39 +390,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
         _ endpoints: [TransportEndpoint],
         preferredEndpoint: TransportEndpoint? = nil
     ) -> [TransportEndpoint] {
-        endpoints.enumerated()
-            .sorted { lhs, rhs in
-                let leftPreferred = lhs.element == preferredEndpoint ? 0 : 1
-                let rightPreferred = rhs.element == preferredEndpoint ? 0 : 1
-                if leftPreferred != rightPreferred {
-                    return leftPreferred < rightPreferred
-                }
-                let leftRank = rank(lhs.element)
-                let rightRank = rank(rhs.element)
-                if leftRank == rightRank {
-                    return lhs.offset < rhs.offset
-                }
-                return leftRank < rightRank
-            }
-            .map(\.element)
-    }
-
-    private static func rank(_ endpoint: TransportEndpoint) -> Int {
-        switch endpoint {
-        case .lan(let host, _, _, _):
-            if TunnelAddressClassifier.isRFC1918IPv4Literal(host), !endpoint.unpinnedInterface {
-                return 0
-            }
-            if TunnelAddressClassifier.isIPv6ULA(host) {
-                return 1
-            }
-            if TunnelAddressClassifier.isRFC1918IPv4Literal(host), endpoint.unpinnedInterface {
-                return 3
-            }
-            return 2
-        case .relay:
-            return 4
-        }
+        CandidateOrdering.sorted(endpoints, preferredEndpoint: preferredEndpoint)
     }
 
     private static func describe(_ endpoints: [TransportEndpoint]) -> String {
