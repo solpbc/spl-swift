@@ -319,7 +319,7 @@ actor RelayWSTransport: ByteTransport {
     ) throws -> URLRequest {
         let url = try Self.webSocketURL(endpoint: endpoint, path: path, instanceID: credential.instanceID)
         var request = URLRequest(url: url)
-        request.setValue(clientInfo.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(RelayWire.userAgent, forHTTPHeaderField: "User-Agent")
         switch credential {
         case .session(_, let authToken):
             request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")

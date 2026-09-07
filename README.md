@@ -33,7 +33,7 @@ Platform differences are configuration, not conditionals. Consuming apps supply:
 - `KeychainPolicy` through `SPLKeychainStore(policy:)`, including `service`, `account`, optional `accessGroup`, `useDataProtectionKeychain`, and `accessibility`.
 - `SessionPolicy`, composed from `RacePolicy` and `KeepalivePolicy`, when `TunnelSession` or `TunnelSupervisor` needs non-default timing.
 - Apps that own their own reconnect loop drive `ReconnectBackoff` and `ProbeWatchdog` directly; protocol timing remains in the proto docs and conformance tests.
-- `SPLClientInfo`, whose `userAgent` becomes the per-app `User-Agent` on dial and pair requests.
+- `SPLClientInfo`, whose `userAgent` provides the client app identifier for inner direct communication with the home server.
 
 ## Adapter guidance
 

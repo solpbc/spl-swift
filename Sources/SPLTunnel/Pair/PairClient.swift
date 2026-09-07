@@ -33,6 +33,7 @@ public struct PairClient: Sendable {
         pairURL: PairURL,
         deviceLabel: String,
         relayEndpoint: URL,
+        now: Date = Date(),
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate] = { $0 }
     ) async throws -> StoredPairing {
         switch pairURL.kind {
@@ -41,6 +42,7 @@ public struct PairClient: Sendable {
                 pairURL: pairURL,
                 deviceLabel: deviceLabel,
                 relayEndpoint: relayEndpoint,
+                now: now,
                 orderCandidates: orderCandidates
             )
         case .relay:
@@ -50,7 +52,8 @@ public struct PairClient: Sendable {
                 pairURL: pairURL,
                 generated: generated,
                 deviceLabel: deviceLabel,
-                defaultRelayEndpoint: validatedRelayEndpoint
+                defaultRelayEndpoint: validatedRelayEndpoint,
+                now: now
             )
         }
     }
@@ -59,6 +62,7 @@ public struct PairClient: Sendable {
         pairURL: PairURL,
         deviceLabel: String,
         relayEndpoint: RelayEndpoint,
+        now: Date = Date(),
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate] = { $0 }
     ) async throws -> StoredPairing {
         switch pairURL.kind {
@@ -68,6 +72,7 @@ public struct PairClient: Sendable {
                 deviceLabel: deviceLabel,
                 relayEndpoint: relayEndpoint.url,
                 enrollmentEndpoint: relayEndpoint,
+                now: now,
                 orderCandidates: orderCandidates
             )
         case .relay:
@@ -76,7 +81,8 @@ public struct PairClient: Sendable {
                 pairURL: pairURL,
                 generated: generated,
                 deviceLabel: deviceLabel,
-                defaultRelayEndpoint: relayEndpoint
+                defaultRelayEndpoint: relayEndpoint,
+                now: now
             )
         }
     }
@@ -85,6 +91,7 @@ public struct PairClient: Sendable {
         pairURL: PairURL,
         deviceLabel: String,
         relayEndpoint: URL,
+        now: Date,
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
     ) async throws -> StoredPairing {
         let enrollmentEndpoint = try? RelayEndpoint(relayEndpoint)
@@ -93,6 +100,7 @@ public struct PairClient: Sendable {
             deviceLabel: deviceLabel,
             relayEndpoint: relayEndpoint,
             enrollmentEndpoint: enrollmentEndpoint,
+            now: now,
             orderCandidates: orderCandidates
         )
     }
@@ -102,6 +110,7 @@ public struct PairClient: Sendable {
         deviceLabel: String,
         relayEndpoint: URL,
         enrollmentEndpoint: RelayEndpoint?,
+        now: Date,
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
     ) async throws -> StoredPairing {
         guard pairURL.candidates.allSatisfy({ TunnelAddressClassifier.isLocalNetworkAddressLiteral($0.address) }) else {
@@ -141,7 +150,27 @@ public struct PairClient: Sendable {
                 await attempt?.close()
                 attempt = nil
                 pairLog.notice("paired direct host=\(candidate.address, privacy: .public) port=\(candidatePort, privacy: .public)")
-                let relayEnrollment = await optionalRelayEnrollment(relayEndpoint: enrollmentEndpoint, lanResponse: lanResponse)
+                let relayEnrollment: RelayEnrollment
+                switch lanResponse.relayAccessState {
+                case .omitted:
+                    relayEnrollment = .unavailable
+                case .invalid:
+                    pairLog.notice("relay access invalid on direct pair")
+                    relayEnrollment = .unavailable
+                case .present(let envelope):
+                    if let enrollmentEndpoint,
+                       let capability = try? InstanceCapability.validateBootstrap(
+                           envelope,
+                           expectedInstanceID: lanResponse.instanceID,
+                           expectedOrigin: enrollmentEndpoint,
+                           now: now
+                       ) {
+                        relayEnrollment = .enrolled(deviceToken: capability.deviceToken, expiresAt: capability.expiresAt)
+                    } else {
+                        pairLog.notice("relay access validation failed on direct pair")
+                        relayEnrollment = .unavailable
+                    }
+                }
                 return try Self.makeStoredPairing(
                     lanResponse: lanResponse,
                     generated: generated,
@@ -181,7 +210,8 @@ public struct PairClient: Sendable {
         pairURL: PairURL,
         generated: PairingMaterial,
         deviceLabel: String,
-        defaultRelayEndpoint: RelayEndpoint
+        defaultRelayEndpoint: RelayEndpoint,
+        now: Date
     ) async throws -> StoredPairing {
         let pairKey: PairWindowRelayKey
         do {
@@ -214,7 +244,27 @@ public struct PairClient: Sendable {
                 throw PairError.relayRequestFailed(underlying: error)
             }
         }
-        let relayEnrollment = await optionalRelayEnrollment(relayEndpoint: relayEndpoint, lanResponse: lanResponse)
+        let relayEnrollment: RelayEnrollment
+        switch lanResponse.relayAccessState {
+        case .present(let envelope):
+            do {
+                let capability = try InstanceCapability.validateBootstrap(
+                    envelope,
+                    expectedInstanceID: lanResponse.instanceID,
+                    expectedOrigin: relayEndpoint,
+                    now: now
+                )
+                relayEnrollment = .enrolled(deviceToken: capability.deviceToken, expiresAt: capability.expiresAt)
+            } catch {
+                pairLog.notice("relay access invalid on off-LAN pair")
+                throw PairError.relayAccessInvalid
+            }
+        case .invalid:
+            pairLog.notice("relay access malformed on off-LAN pair")
+            throw PairError.relayAccessInvalid
+        case .omitted:
+            relayEnrollment = await optionalRelayEnrollment(relayEndpoint: relayEndpoint, lanResponse: lanResponse, now: now)
+        }
         return try Self.makeStoredPairing(
             lanResponse: lanResponse,
             generated: generated,
@@ -286,53 +336,48 @@ public struct PairClient: Sendable {
         return .lanRequestFailed(underlying: error)
     }
 
-    private func postRelay(relayEndpoint: RelayEndpoint, lanResponse: LANPairResponse) async throws -> RelayEnrollResponse {
+    private func postRelay(relayEndpoint: RelayEndpoint, lanResponse: LANPairResponse, now: Date) async throws -> ValidatedCapability {
         let request = try Self.makeRelayRequest(
             relayEndpoint: relayEndpoint,
-            response: lanResponse,
-            userAgent: clientInfo.userAgent
+            response: lanResponse
         )
 
+        let status: Int
         let data: Data
-        let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (status, data, _) = try await BoundedHTTPClient.send(request: request, session: session)
         } catch {
             throw PairError.relayRequestFailed(underlying: error)
         }
 
-        guard let http = response as? HTTPURLResponse else {
-            throw PairError.relayResponseInvalid(status: nil)
-        }
-
-        switch http.statusCode {
+        switch status {
         case 200:
             do {
-                return try Self.decodeRelayResponse(data: data)
+                return try InstanceCapability.validateHTTPResponse(
+                    data: data,
+                    expectedInstanceID: lanResponse.instanceID,
+                    expectedOrigin: relayEndpoint,
+                    currentIsV2: false,
+                    now: now
+                )
             } catch {
-                throw PairError.relayResponseInvalid(status: http.statusCode)
+                throw PairError.relayResponseInvalid(status: status)
             }
         case 401, 403, 409:
-            throw PairError.attestationRejected(status: http.statusCode)
+            throw PairError.attestationRejected(status: status)
         case 400, 404:
-            throw PairError.relayResponseInvalid(status: http.statusCode)
-        case 503:
-            throw PairError.relayRequestFailed(underlying: nil)
+            throw PairError.relayResponseInvalid(status: status)
         case 500...599:
             throw PairError.relayRequestFailed(underlying: nil)
         default:
-            throw PairError.relayResponseInvalid(status: http.statusCode)
+            throw PairError.relayResponseInvalid(status: status)
         }
     }
 
-    private func optionalRelayEnrollment(relayEndpoint: RelayEndpoint?, lanResponse: LANPairResponse) async -> RelayEnrollment {
-        guard let relayEndpoint else {
-            pairLog.notice("relay enrollment failed")
-            return .unavailable
-        }
+    private func optionalRelayEnrollment(relayEndpoint: RelayEndpoint, lanResponse: LANPairResponse, now: Date) async -> RelayEnrollment {
         do {
-            let relayResponse = try await postRelay(relayEndpoint: relayEndpoint, lanResponse: lanResponse)
-            return .enrolled(deviceToken: relayResponse.deviceToken, expiresAt: relayResponse.expiresAt)
+            let capability = try await postRelay(relayEndpoint: relayEndpoint, lanResponse: lanResponse, now: now)
+            return .enrolled(deviceToken: capability.deviceToken, expiresAt: capability.expiresAt)
         } catch let error as PairError {
             if let status = error.statusCode {
                 pairLog.notice("relay enrollment failed status=\(status, privacy: .public)")
@@ -446,14 +491,15 @@ public struct PairClient: Sendable {
         }
     }
 
-    static func makeRelayRequest(relayEndpoint: RelayEndpoint, response: LANPairResponse, userAgent: String) throws -> URLRequest {
+    static func makeRelayRequest(relayEndpoint: RelayEndpoint, response: LANPairResponse) throws -> URLRequest {
         var request = URLRequest(url: try controlURL(relayEndpoint, path: "enroll/device"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(RelayWire.userAgent, forHTTPHeaderField: "User-Agent")
         request.httpBody = try JSONEncoder().encode(RelayEnrollRequest(
             instanceID: response.instanceID,
-            homeAttestation: response.homeAttestation
+            homeAttestation: response.homeAttestation,
+            protocolVersion: 2
         ))
         return request
     }
@@ -477,10 +523,6 @@ public struct PairClient: Sendable {
 
     static func decodeLANResponse(data: Data) throws -> LANPairResponse {
         try JSONDecoder().decode(LANPairResponse.self, from: data)
-    }
-
-    static func decodeRelayResponse(data: Data) throws -> RelayEnrollResponse {
-        try JSONDecoder().decode(RelayEnrollResponse.self, from: data)
     }
 
     static func controlURL(_ base: URL, path: String, queryItems: [URLQueryItem] = []) throws -> URL {
@@ -715,6 +757,12 @@ struct LANPairRequest: Encodable {
     }
 }
 
+enum RelayAccessBootstrapState: Sendable, Equatable {
+    case omitted
+    case invalid
+    case present(RelayAccessBootstrapEnvelope)
+}
+
 struct LANPairResponse: Decodable {
     let instanceID: String
     let homeLabel: String
@@ -722,6 +770,7 @@ struct LANPairResponse: Decodable {
     let caChain: [String]
     let homeAttestation: String
     let localEndpoints: [LocalEndpoint]
+    let relayAccessState: RelayAccessBootstrapState
 
     enum CodingKeys: String, CodingKey {
         case instanceID = "instance_id"
@@ -730,6 +779,7 @@ struct LANPairResponse: Decodable {
         case caChain = "ca_chain"
         case homeAttestation = "home_attestation"
         case localEndpoints = "local_endpoints"
+        case relayAccess = "relay_access"
     }
 
     init(from decoder: Decoder) throws {
@@ -740,26 +790,29 @@ struct LANPairResponse: Decodable {
         caChain = try container.decode([String].self, forKey: .caChain)
         homeAttestation = try container.decode(String.self, forKey: .homeAttestation)
         localEndpoints = try container.decodeIfPresent([LocalEndpoint].self, forKey: .localEndpoints) ?? []
+        if container.contains(.relayAccess) {
+            if (try? container.decodeNil(forKey: .relayAccess)) == true {
+                relayAccessState = .invalid
+            } else if let envelope = try? container.decode(RelayAccessBootstrapEnvelope.self, forKey: .relayAccess) {
+                relayAccessState = .present(envelope)
+            } else {
+                relayAccessState = .invalid
+            }
+        } else {
+            relayAccessState = .omitted
+        }
     }
 }
 
 struct RelayEnrollRequest: Encodable {
     let instanceID: String
     let homeAttestation: String
+    let protocolVersion: Int
 
     enum CodingKeys: String, CodingKey {
         case instanceID = "instance_id"
         case homeAttestation = "home_attestation"
-    }
-}
-
-struct RelayEnrollResponse: Decodable {
-    let deviceToken: String
-    let expiresAt: String?
-
-    enum CodingKeys: String, CodingKey {
-        case deviceToken = "device_token"
-        case expiresAt = "expires_at"
+        case protocolVersion = "protocol_version"
     }
 }
 
@@ -775,6 +828,7 @@ public enum PairError: Error, Equatable, Sendable {
     case relayRequestFailed(underlying: (any Error & Sendable)?)
     case relayResponseInvalid(status: Int?)
     case relayInstanceMismatch
+    case relayAccessInvalid
     case attestationRejected(status: Int)
     case directAddressNotLocal
 
@@ -800,6 +854,7 @@ public enum PairError: Error, Equatable, Sendable {
              (.pairingWindowClosed, .pairingWindowClosed),
              (.relayRequestFailed, .relayRequestFailed),
              (.relayInstanceMismatch, .relayInstanceMismatch),
+             (.relayAccessInvalid, .relayAccessInvalid),
              (.directAddressNotLocal, .directAddressNotLocal):
             return true
         case (.lanCandidatesExhausted(let lhsSawCA), .lanCandidatesExhausted(let rhsSawCA)):

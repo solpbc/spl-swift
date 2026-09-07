@@ -674,8 +674,8 @@ struct PairClientDirectTests {
         #expect(pairing.localEndpoints == [dialed, other])
     }
 
-    @Test func enrollmentFailureReturnsUnavailableOnValidPairing() async throws {
-        // proto/pairing.md:147-179 cert storage precedes relay enrollment, so enrollment failure preserves LAN pairing.
+    @Test func directPairOmittingRelayAccessDoesNotCallRelayAndStoresUnavailable() async throws {
+        // Direct pairing never calls /enroll/device. Missing relay_access stores .unavailable.
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let fixture = try TestCA.make()
         let responseBody = try Self.pairResponseData(bundle: fixture)
@@ -697,25 +697,31 @@ struct PairClientDirectTests {
             relayEndpoint: Self.relayEndpoint
         )
 
+        #expect(await transport.requestCount == 1)
         #expect(pairing.relayEnrollment == .unavailable)
-        #expect(HTTPStubProtocol.state.requests(forHost: pairClientRelayHost).count == 1)
+        #expect(HTTPStubProtocol.state.requests(forHost: pairClientRelayHost).isEmpty)
     }
 
-    @Test func enrollmentCancellationReturnsUnavailableOnValidPairing() async throws {
-        // proto/pairing.md:147-179 cert storage precedes relay enrollment, so enrollment failure preserves LAN pairing.
+    @Test func directPairWithNullRelayAccessStoresUnavailableAndSucceedsLANPair() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let fixture = try TestCA.make()
-        let responseBody = try Self.pairResponseData(bundle: fixture)
+        let responseBody = try Self.pairResponseData(
+            bundle: fixture,
+            relayAccess: nil
+        )
+        // Explicitly inject "relay_access": null in JSON
+        var json = try #require(JSONSerialization.jsonObject(with: responseBody) as? [String: Any])
+        json["relay_access"] = NSNull()
+        let nullResponseBody = try JSONSerialization.data(withJSONObject: json)
+
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
         ])
         let transport = FakeLANPairTransport(outcomes: [
-            .response(status: 200, body: responseBody),
+            .response(status: 200, body: nullResponseBody),
         ])
         let client = PairClient(
-            session: makeHTTPStubSession(host: pairClientRelayHost) { _ in
-                .failure(CancellationError())
-            },
+            session: Self.relayFailureSession(status: 503),
             lanTransport: transport,
             clientInfo: pairClientInfo
         )
@@ -726,9 +732,95 @@ struct PairClientDirectTests {
             relayEndpoint: Self.relayEndpoint
         )
 
-        #expect(pairing.relayEnrollment == .unavailable)
         #expect(await transport.requestCount == 1)
-        #expect(HTTPStubProtocol.state.requests(forHost: pairClientRelayHost).count == 1)
+        #expect(pairing.relayEnrollment == .unavailable)
+        #expect(HTTPStubProtocol.state.requests(forHost: pairClientRelayHost).isEmpty)
+    }
+
+    @Test func directPairWithValidRelayAccessStoresEnrolledWithoutRelayCall() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let fixture = try TestCA.make()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let jwt = Self.v2JWT(instanceID: "instance-1", exp: 1_800_003_600)
+        let responseBody = try Self.pairResponseData(
+            bundle: fixture,
+            relayAccess: [
+                "protocol_version": 2,
+                "status": "ready",
+                "relay_origin": "https://\(pairClientRelayHost)",
+                "instance_id": "instance-1",
+                "device_token": jwt,
+                "expires_at": "2027-01-15T09:00:00Z",
+            ]
+        )
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: responseBody),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        let pairing = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint,
+            now: now
+        )
+
+        #expect(await transport.requestCount == 1)
+        #expect(pairing.relayEnrollment == .enrolled(deviceToken: jwt, expiresAt: "2027-01-15T09:00:00Z"))
+        #expect(HTTPStubProtocol.state.requests(forHost: pairClientRelayHost).isEmpty)
+    }
+
+    @Test func directPairWithInvalidRelayAccessStoresUnavailableAndSucceedsLANPair() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let fixture = try TestCA.make()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let responseBody = try Self.pairResponseData(
+            bundle: fixture,
+            relayAccess: [
+                "protocol_version": 2,
+                "device_token": "not-a-valid-jwt",
+            ]
+        )
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: responseBody),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo
+        )
+
+        let pairing = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint,
+            now: now
+        )
+
+        #expect(await transport.requestCount == 1)
+        #expect(pairing.relayEnrollment == .unavailable)
+        #expect(HTTPStubProtocol.state.requests(forHost: pairClientRelayHost).isEmpty)
+    }
+
+    @Test func buildHTTPRequestCarriesClientInfoUserAgent() {
+        let requestData = PairClient.buildHTTPRequest(
+            method: "POST",
+            path: "/pair",
+            body: Data("body".utf8),
+            clientInfo: SPLClientInfo(userAgent: "custom-client-app/1.2.3")
+        )
+        let requestString = String(decoding: requestData, as: UTF8.self)
+        #expect(requestString.contains("User-Agent: custom-client-app/1.2.3\r\n"))
     }
 
     @Test func controlURLRejectsPlaintextRelaySchemes() throws {
@@ -783,7 +875,8 @@ struct PairClientDirectTests {
         bundle: TestCA.Bundle,
         instanceID: String = "instance-1",
         caChain: [String]? = nil,
-        localEndpoints: [LocalEndpoint] = []
+        localEndpoints: [LocalEndpoint] = [],
+        relayAccess: [String: Any]? = nil
     ) throws -> Data {
         let endpoints = localEndpoints.map {
             [
@@ -792,14 +885,38 @@ struct PairClientDirectTests {
                 "scope": $0.scope,
             ] as [String: Any]
         }
-        return try JSONSerialization.data(withJSONObject: [
+        var dict: [String: Any] = [
             "instance_id": instanceID,
             "home_label": "test home",
             "client_cert": bundle.clientCertificatePEM,
             "ca_chain": caChain ?? [bundle.caCertificatePEM],
             "home_attestation": "attestation",
             "local_endpoints": endpoints,
-        ] as [String: Any])
+        ]
+        if let relayAccess {
+            dict["relay_access"] = relayAccess
+        }
+        return try JSONSerialization.data(withJSONObject: dict)
+    }
+
+    fileprivate static func v2JWT(instanceID: String, exp: Int) -> String {
+        let payload: [String: Any] = [
+            "iss": "solstone-relay",
+            "sub": "instance:\(instanceID)",
+            "aud": "spl-relay",
+            "scope": "session.dial",
+            "ver": 2,
+            "instance_id": instanceID,
+            "iat": exp - 3600,
+            "exp": exp,
+            "jti": "jti-direct-pair",
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        let b64 = data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "e30.\(b64).sig"
     }
 
     private static func parseRequest(_ data: Data) throws -> (requestLine: String, body: Data) {
@@ -908,19 +1025,246 @@ struct PairClientRelayTests {
         #expect(HTTPStubProtocol.state.requests(forHost: "127.0.0.1").isEmpty)
     }
 
+    @Test func relayPairWithValidBootstrapStoresEnrolledWithoutEnrollRequest() async throws {
+        defer { HTTPStubProtocol.state.reset(host: "127.0.0.1") }
+        let live = try TestCA.make()
+        let pairURL = try Self.relayPairURL(bundle: live)
+        let jid = try Self.caJID(bundle: live)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let jwt = PairClientDirectTests.v2JWT(instanceID: jid, exp: 1_800_003_600)
+        let client = PairClient(
+            session: makeHTTPStubSession(host: "127.0.0.1") { _ in
+                Issue.record("enrollment must not be attempted when bootstrap is present")
+                return .http(status: 500, data: Data())
+            },
+            clientInfo: pairClientInfo
+        )
+
+        let pairing: StoredPairing = try await Self.withRelayPairingServer(
+            bundle: live,
+            responseProvider: { relayEndpoint in
+                try PairClientDirectTests.pairResponseData(
+                    bundle: live,
+                    instanceID: jid,
+                    caChain: [live.caCertificatePEM],
+                    relayAccess: [
+                        "protocol_version": 2,
+                        "status": "ready",
+                        "relay_origin": relayEndpoint.absoluteString,
+                        "instance_id": jid,
+                        "device_token": jwt,
+                        "expires_at": "2027-01-15T09:00:00Z",
+                    ]
+                )
+            }
+        ) { relayEndpoint in
+            try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: RelayEndpoint.unchecked(relayEndpoint),
+                now: now
+            )
+        }
+
+        #expect(pairing.relayEnrollment == .enrolled(deviceToken: jwt, expiresAt: "2027-01-15T09:00:00Z"))
+        #expect(HTTPStubProtocol.state.requests(forHost: "127.0.0.1").isEmpty)
+    }
+
+    @Test func relayPairWithOmittedBootstrapFallsBackToTransitionalEnrollment() async throws {
+        defer { HTTPStubProtocol.state.reset(host: "127.0.0.1") }
+        let live = try TestCA.make()
+        let pairURL = try Self.relayPairURL(bundle: live)
+        let jid = try Self.caJID(bundle: live)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let jwt = PairClientDirectTests.v2JWT(instanceID: jid, exp: 1_800_003_600)
+        let responseBody = try PairClientDirectTests.pairResponseData(
+            bundle: live,
+            instanceID: jid,
+            caChain: [live.caCertificatePEM]
+        )
+        let client = PairClient(
+            session: makeHTTPStubSession(host: "127.0.0.1") { request in
+                let body = try #require(request.httpBody)
+                let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                #expect(request.value(forHTTPHeaderField: "User-Agent") == "spl")
+                #expect(json["instance_id"] as? String == jid)
+                #expect(json["protocol_version"] as? Int == 2)
+                return .http(status: 200, data: Data("""
+                {"protocol_version":2,"device_token":"\(jwt)","expires_at":"2027-01-15T09:00:00Z"}
+                """.utf8))
+            },
+            clientInfo: pairClientInfo
+        )
+
+        let pairing: StoredPairing = try await Self.withRelayPairingServer(bundle: live, responseBody: responseBody) { relayEndpoint in
+            try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: RelayEndpoint.unchecked(relayEndpoint),
+                now: now
+            )
+        }
+
+        #expect(pairing.relayEnrollment == .enrolled(deviceToken: jwt, expiresAt: "2027-01-15T09:00:00Z"))
+        #expect(HTTPStubProtocol.state.requests(forHost: "127.0.0.1").count == 1)
+    }
+
+    @Test func relayPairWithOmittedBootstrapEnroll503StoresUnavailable() async throws {
+        defer { HTTPStubProtocol.state.reset(host: "127.0.0.1") }
+        let live = try TestCA.make()
+        let pairURL = try Self.relayPairURL(bundle: live)
+        let jid = try Self.caJID(bundle: live)
+        let responseBody = try PairClientDirectTests.pairResponseData(
+            bundle: live,
+            instanceID: jid,
+            caChain: [live.caCertificatePEM]
+        )
+        let client = PairClient(
+            session: makeHTTPStubSession(host: "127.0.0.1") { _ in
+                .http(status: 503, data: Data())
+            },
+            clientInfo: pairClientInfo
+        )
+
+        let pairing: StoredPairing = try await Self.withRelayPairingServer(bundle: live, responseBody: responseBody) { relayEndpoint in
+            try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: RelayEndpoint.unchecked(relayEndpoint)
+            )
+        }
+
+        #expect(pairing.relayEnrollment == .unavailable)
+        #expect(HTTPStubProtocol.state.requests(forHost: "127.0.0.1").count == 1)
+    }
+
+    @Test func relayPairWithOmittedBootstrapEnrollNetworkFailureStoresUnavailable() async throws {
+        defer { HTTPStubProtocol.state.reset(host: "127.0.0.1") }
+        let live = try TestCA.make()
+        let pairURL = try Self.relayPairURL(bundle: live)
+        let jid = try Self.caJID(bundle: live)
+        let responseBody = try PairClientDirectTests.pairResponseData(
+            bundle: live,
+            instanceID: jid,
+            caChain: [live.caCertificatePEM]
+        )
+        let client = PairClient(
+            session: makeHTTPStubSession(host: "127.0.0.1") { _ in
+                .failure(URLError(.notConnectedToInternet))
+            },
+            clientInfo: pairClientInfo
+        )
+
+        let pairing: StoredPairing = try await Self.withRelayPairingServer(bundle: live, responseBody: responseBody) { relayEndpoint in
+            try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: RelayEndpoint.unchecked(relayEndpoint)
+            )
+        }
+
+        #expect(pairing.relayEnrollment == .unavailable)
+        #expect(HTTPStubProtocol.state.requests(forHost: "127.0.0.1").count == 1)
+    }
+
+    @Test func relayPairWithOmittedBootstrapEnrollInvalidBodyStoresUnavailable() async throws {
+        defer { HTTPStubProtocol.state.reset(host: "127.0.0.1") }
+        let live = try TestCA.make()
+        let pairURL = try Self.relayPairURL(bundle: live)
+        let jid = try Self.caJID(bundle: live)
+        let responseBody = try PairClientDirectTests.pairResponseData(
+            bundle: live,
+            instanceID: jid,
+            caChain: [live.caCertificatePEM]
+        )
+        let client = PairClient(
+            session: makeHTTPStubSession(host: "127.0.0.1") { _ in
+                .http(status: 200, data: Data(#"{"invalid":"response"}"#.utf8))
+            },
+            clientInfo: pairClientInfo
+        )
+
+        let pairing: StoredPairing = try await Self.withRelayPairingServer(bundle: live, responseBody: responseBody) { relayEndpoint in
+            try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: RelayEndpoint.unchecked(relayEndpoint)
+            )
+        }
+
+        #expect(pairing.relayEnrollment == .unavailable)
+        #expect(HTTPStubProtocol.state.requests(forHost: "127.0.0.1").count == 1)
+    }
+
+    @Test func relayPairWithInvalidBootstrapFailsClosedWithoutEnrollRequest() async throws {
+        defer { HTTPStubProtocol.state.reset(host: "127.0.0.1") }
+        let live = try TestCA.make()
+        let pairURL = try Self.relayPairURL(bundle: live)
+        let jid = try Self.caJID(bundle: live)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let responseBody = try PairClientDirectTests.pairResponseData(
+            bundle: live,
+            instanceID: jid,
+            caChain: [live.caCertificatePEM],
+            relayAccess: [
+                "protocol_version": 2,
+                "device_token": "malformed-jwt",
+            ]
+        )
+        let client = PairClient(
+            session: makeHTTPStubSession(host: "127.0.0.1") { _ in
+                Issue.record("enrollment must not be attempted when bootstrap is invalid")
+                return .http(status: 500, data: Data())
+            },
+            clientInfo: pairClientInfo
+        )
+
+        try await Self.withRelayPairingServer(bundle: live, responseBody: responseBody) { relayEndpoint in
+            await expectPairError(.relayAccessInvalid) {
+                _ = try await client.pair(
+                    pairURL: pairURL,
+                    deviceLabel: "test phone",
+                    relayEndpoint: RelayEndpoint.unchecked(relayEndpoint),
+                    now: now
+                )
+            }
+        }
+
+        #expect(HTTPStubProtocol.state.requests(forHost: "127.0.0.1").isEmpty)
+    }
+
     private static func withRelayPairingServer<T>(
         bundle: TestCA.Bundle,
         responseBody: Data,
         operation: (URL) async throws -> T
     ) async throws -> T {
-        let pairingServer = PairingMuxServer(
+        try await withRelayPairingServer(
             bundle: bundle,
-            response: PairingHTTPServerResponse(status: 200, body: responseBody)
+            responseProvider: { _ in responseBody },
+            operation: operation
         )
+    }
+
+    private static func withRelayPairingServer<T>(
+        bundle: TestCA.Bundle,
+        responseProvider: @escaping @Sendable (URL) throws -> Data,
+        operation: (URL) async throws -> T
+    ) async throws -> T {
+        let relayPortBox = RelayPortBox()
+        let pairingServer = PairingMuxServer(bundle: bundle) { _ in
+            guard let port = await relayPortBox.port,
+                  let endpoint = URL(string: "ws://127.0.0.1:\(port)"),
+                  let body = try? responseProvider(endpoint) else {
+                return PairingHTTPServerResponse(status: 500, body: Data())
+            }
+            return PairingHTTPServerResponse(status: 200, body: body)
+        }
         try await pairingServer.start()
         let relay = RelayBridgeServer(tlsPort: await pairingServer.port)
         try await relay.start()
-        let relayEndpoint = try #require(URL(string: "ws://127.0.0.1:\(await relay.port)"))
+        let port = await relay.port
+        await relayPortBox.setPort(port)
+        let relayEndpoint = try #require(URL(string: "ws://127.0.0.1:\(port)"))
 
         do {
             let result = try await operation(relayEndpoint)
@@ -963,5 +1307,13 @@ private func expectPairError(
         #expect(error == expected)
     } catch {
         Issue.record("Expected \(expected), got \(error)")
+    }
+}
+
+private actor RelayPortBox {
+    var port: Int?
+
+    func setPort(_ port: Int) {
+        self.port = port
     }
 }

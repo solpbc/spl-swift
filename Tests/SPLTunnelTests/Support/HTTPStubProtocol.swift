@@ -7,6 +7,7 @@ enum HTTPStubResult: Sendable {
     case http(status: Int, data: Data, headers: [String: String] = [:])
     case nonHTTP(data: Data)
     case failure(any Error & Sendable)
+    case hang
 }
 
 final class HTTPStubProtocol: URLProtocol {
@@ -50,13 +51,18 @@ final class HTTPStubProtocol: URLProtocol {
                 client?.urlProtocolDidFinishLoading(self)
             case .failure(let error):
                 client?.urlProtocol(self, didFailWithError: error)
+            case .hang:
+                // Do not respond until task is cancelled/stopped
+                break
             }
         } catch {
             client?.urlProtocol(self, didFailWithError: error)
         }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+    }
 
     private static func requestWithReadableBody(_ request: URLRequest) throws -> URLRequest {
         guard request.httpBody == nil, let bodyStream = request.httpBodyStream else {

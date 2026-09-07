@@ -12,7 +12,6 @@ public enum DeviceTokenRefreshResult: Sendable, Equatable {
 
 public struct DeviceTokenRefresher: Sendable {
     private let session: URLSession
-    private let clientInfo: SPLClientInfo
 
     public init(clientInfo: SPLClientInfo) {
         self.init(session: .shared, clientInfo: clientInfo)
@@ -20,7 +19,6 @@ public struct DeviceTokenRefresher: Sendable {
 
     init(session: URLSession, clientInfo: SPLClientInfo) {
         self.session = session
-        self.clientInfo = clientInfo
     }
 
     public func refreshIfNeeded(pairing: StoredPairing, now: Date) async -> DeviceTokenRefreshResult {
@@ -30,10 +28,10 @@ public struct DeviceTokenRefresher: Sendable {
         guard DeviceTokenClaims.needsRefresh(token: deviceToken, now: now) else {
             return .notNeeded(pairing)
         }
-        return await refreshNow(pairing: pairing)
+        return await refreshNow(pairing: pairing, now: now)
     }
 
-    public func refreshNow(pairing: StoredPairing) async -> DeviceTokenRefreshResult {
+    public func refreshNow(pairing: StoredPairing, now: Date = Date()) async -> DeviceTokenRefreshResult {
         guard case .enrolled(let deviceToken, _) = pairing.relayEnrollment else {
             return .notNeeded(pairing)
         }
@@ -48,32 +46,34 @@ public struct DeviceTokenRefresher: Sendable {
         do {
             request = try Self.makeRefreshRequest(
                 relayEndpoint: validatedRelayEndpoint,
-                deviceToken: deviceToken,
-                userAgent: clientInfo.userAgent
+                deviceToken: deviceToken
             )
         } catch {
             return .transientFailure(pairing)
         }
 
+        let status: Int
         let data: Data
-        let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (status, data, _) = try await BoundedHTTPClient.send(request: request, session: session)
         } catch {
             return .transientFailure(pairing)
         }
 
-        guard let http = response as? HTTPURLResponse else {
-            return .transientFailure(pairing)
-        }
-
-        switch http.statusCode {
+        switch status {
         case 200:
+            let currentIsV2 = DeviceTokenClaims.parse(deviceToken)?.isV2 ?? false
             do {
-                let relayResponse = try PairClient.decodeRelayResponse(data: data)
+                let validated = try InstanceCapability.validateHTTPResponse(
+                    data: data,
+                    expectedInstanceID: pairing.instanceID,
+                    expectedOrigin: validatedRelayEndpoint,
+                    currentIsV2: currentIsV2,
+                    now: now
+                )
                 return .refreshed(pairing.updatingRelayEnrollment(.enrolled(
-                    deviceToken: relayResponse.deviceToken,
-                    expiresAt: relayResponse.expiresAt
+                    deviceToken: validated.deviceToken,
+                    expiresAt: validated.expiresAt
                 )))
             } catch {
                 return .transientFailure(pairing)
@@ -93,12 +93,15 @@ public struct DeviceTokenRefresher: Sendable {
         }
     }
 
-    static func makeRefreshRequest(relayEndpoint: RelayEndpoint, deviceToken: String, userAgent: String) throws -> URLRequest {
+    static func makeRefreshRequest(relayEndpoint: RelayEndpoint, deviceToken: String) throws -> URLRequest {
         var request = URLRequest(url: try PairClient.controlURL(relayEndpoint, path: "token/refresh"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        request.httpBody = try JSONEncoder().encode(RelayRefreshRequest(deviceToken: deviceToken))
+        request.setValue(RelayWire.userAgent, forHTTPHeaderField: "User-Agent")
+        request.httpBody = try JSONEncoder().encode(RelayRefreshRequest(
+            deviceToken: deviceToken,
+            protocolVersion: 2
+        ))
         return request
     }
 
@@ -113,9 +116,11 @@ public struct DeviceTokenRefresher: Sendable {
 
 private struct RelayRefreshRequest: Encodable {
     let deviceToken: String
+    let protocolVersion: Int
 
     enum CodingKeys: String, CodingKey {
         case deviceToken = "device_token"
+        case protocolVersion = "protocol_version"
     }
 }
 

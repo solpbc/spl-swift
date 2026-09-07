@@ -77,7 +77,7 @@ struct DialClientTests {
 
         #expect(echoed == Data([0x04, 0x05, 0x06]))
         #expect(authorization == "Bearer device-token")
-        #expect(userAgent == dialClientInfo.userAgent)
+        #expect(userAgent == "spl")
         #expect(transport.transportKind == "relay")
     }
 
@@ -103,7 +103,7 @@ struct DialClientTests {
         #expect(echoed == Data([0x07, 0x08, 0x09]))
         #expect(authorization == nil)
         #expect(pairKey == "e34481a4cde647ba9c9fb29a59e18271")
-        #expect(userAgent == dialClientInfo.userAgent)
+        #expect(userAgent == "spl")
         #expect(transport.transportKind == "relay")
     }
 
@@ -263,7 +263,7 @@ struct DialClientTests {
         #expect(request.url?.absoluteString == "wss://link.solstone.app/session/dial?instance=instance")
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer token")
         #expect(request.value(forHTTPHeaderField: "Sec-Pair-Key") == nil)
-        #expect(request.value(forHTTPHeaderField: "User-Agent") == "spl-client/42")
+        #expect(request.value(forHTTPHeaderField: "User-Agent") == "spl")
     }
 
     @Test func relayHTTP503FailsBeforeTransportOpen() async throws {

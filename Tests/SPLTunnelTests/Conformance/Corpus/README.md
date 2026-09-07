@@ -4,7 +4,7 @@
 # SPL authority definition bundle
 
 `bundle/` is a read-only, byte-identical copy of the five-file pair-link
-definition bundle 5.0.0 from authority commit `e639605b692577700648af470ee27da898c6df75`.
+definition bundle 7.0.0 from authority commit `d550bc4b7bc01a38a85cee48c6fe373971c5c7f7`.
 `bundle/manifest.json` is authoritative for the payload inventory and digests;
 `adoption.json` records this consumer's selected authority material.
 
