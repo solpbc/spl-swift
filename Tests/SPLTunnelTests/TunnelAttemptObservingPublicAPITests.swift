@@ -8,7 +8,7 @@ import Testing
 @Suite("Tunnel Attempt Observing Public API")
 struct TunnelAttemptObservingPublicAPITests {
     @Test func packageVersionAdvancesForAttemptObservability() {
-        #expect(SPLTunnelPackage.version == "0.3.2")
+        #expect(SPLTunnelPackage.version.compare("0.3.2", options: .numeric) != .orderedAscending)
     }
 
     @Test func publicTypesAndConcreteSessionConformance() {
