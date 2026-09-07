@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 import Foundation
+import Synchronization
 import Testing
 @testable import SPLTunnel
 
@@ -74,7 +75,7 @@ struct DeviceTokenRefresherTests {
             #expect(request.httpMethod == "POST")
             #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
             #expect(request.value(forHTTPHeaderField: "User-Agent") == "spl")
-            #expect(json["device_token"] as? String == "old-token")
+            #expect(json["device_token"] as? String == Self.legacyJWT(iat: 1_799_999_000, exp: 1_800_001_000))
             #expect(json["protocol_version"] as? Int == 2)
             return .http(status: 200, data: Data("""
             {"protocol_version":2,"device_token":"\(newJWT)","expires_at":"2027-01-15T09:00:00Z"}
@@ -239,12 +240,88 @@ struct DeviceTokenRefresherTests {
         }
     }
 
+
+    @Test func malformedCurrentTokenNeverContactsRelay() async {
+        for token in ["old-token", Self.v2JWT(instanceID: "other-home", exp: 1_800_003_600),
+                      Self.v2JWT(instanceID: "instance-1", exp: 1_800_003_600) + ".extra"] {
+            defer { HTTPStubProtocol.state.reset(host: deviceTokenRelayHost) }
+            let session = makeHTTPStubSession(host: deviceTokenRelayHost) { _ in
+                Issue.record("invalid current access must not contact relay")
+                return .http(status: 500, data: Data())
+            }
+            let stored = pairing(relayEnrollment: .enrolled(deviceToken: token, expiresAt: nil))
+            let result = await DeviceTokenRefresher(session: session, clientInfo: deviceTokenClientInfo)
+                .refreshNow(pairing: stored, now: Date(timeIntervalSince1970: 1_800_000_000))
+            #expect(result == .transientFailure(stored))
+            #expect(HTTPStubProtocol.state.requests(forHost: deviceTokenRelayHost).isEmpty)
+        }
+    }
+
+    @Test func expiredCurrentCredentialsCanRenewWithinGrace() async {
+        for token in [Self.legacyJWT(iat: 1_799_990_000, exp: 1_799_999_000),
+                      Self.v2JWT(instanceID: "instance-1", exp: 1_799_999_000)] {
+            defer { HTTPStubProtocol.state.reset(host: deviceTokenRelayHost) }
+            let replacement = Self.v2JWT(instanceID: "instance-1", exp: 1_800_003_600)
+            let session = makeHTTPStubSession(host: deviceTokenRelayHost) { _ in
+                .http(status: 200, data: Data("""
+                {"protocol_version":2,"device_token":"\(replacement)","expires_at":"2027-01-15T09:00:00Z"}
+                """.utf8))
+            }
+            let stored = pairing(relayEnrollment: .enrolled(deviceToken: token, expiresAt: nil))
+            let result = await DeviceTokenRefresher(session: session, clientInfo: deviceTokenClientInfo)
+                .refreshIfNeeded(pairing: stored, now: Date(timeIntervalSince1970: 1_800_000_000))
+            #expect(result == .refreshed(stored.updatingRelayEnrollment(.enrolled(
+                deviceToken: replacement, expiresAt: "2027-01-15T09:00:00Z"))))
+            #expect(HTTPStubProtocol.state.requests(forHost: deviceTokenRelayHost).count == 1)
+        }
+    }
+
+    @Test func legacyReplacementMustMatchHomeAndClaims() async throws {
+        let valid = Self.legacyJWT(iat: 1_800_000_000, exp: 1_800_003_600)
+        let data = try #require(InstanceCapability.base64URLDecode(String(valid.split(separator: ".")[1])))
+        let claims = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        for (key, value) in [("instance_id", "other"), ("aud", "other"), ("scope", "other"),
+                             ("sub", ""), ("device_fp", "bad"), ("iss", ""), ("jti", "")] {
+            defer { HTTPStubProtocol.state.reset(host: deviceTokenRelayHost) }
+            var changed = claims
+            changed[key] = value
+            let encoded = try JSONSerialization.data(withJSONObject: changed).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+            let body = Data("{\"device_token\":\"e30.\(encoded).sig\"}".utf8)
+            let session = makeHTTPStubSession(host: deviceTokenRelayHost) { _ in .http(status: 200, data: body) }
+            let stored = pairing()
+            let result = await DeviceTokenRefresher(session: session, clientInfo: deviceTokenClientInfo)
+                .refreshNow(pairing: stored, now: Date(timeIntervalSince1970: 1_800_000_000))
+            #expect(result == .transientFailure(stored))
+            #expect(HTTPStubProtocol.state.requests(forHost: deviceTokenRelayHost).count == 1)
+        }
+    }
+
+    @Test func replacementExpiringDuringRequestCannotReplaceState() async {
+        defer { HTTPStubProtocol.state.reset(host: deviceTokenRelayHost) }
+        let clock = RefreshAcceptanceClock()
+        let token = Self.v2JWT(instanceID: "instance-1", exp: 1_800_000_010)
+        let session = makeHTTPStubSession(host: deviceTokenRelayHost) { _ in
+            clock.advance(11)
+            return .http(status: 200, data: Data("""
+            {"protocol_version":2,"device_token":"\(token)","expires_at":"2027-01-15T08:00:10Z"}
+            """.utf8))
+        }
+        let stored = pairing()
+        let result = await DeviceTokenRefresher(session: session, clientInfo: deviceTokenClientInfo,
+                                               elapsedSeconds: { clock.read() })
+            .refreshNow(pairing: stored, now: Date(timeIntervalSince1970: 1_800_000_000))
+        #expect(result == .transientFailure(stored))
+        #expect(HTTPStubProtocol.state.requests(forHost: deviceTokenRelayHost).count == 1)
+    }
+
     private func expectRefreshResult(_ stub: HTTPStubResult, expected: DeviceTokenRefreshResult) async {
         defer { HTTPStubProtocol.state.reset(host: deviceTokenRelayHost) }
         let session = makeHTTPStubSession(host: deviceTokenRelayHost) { _ in stub }
         let refresher = DeviceTokenRefresher(session: session, clientInfo: deviceTokenClientInfo)
 
-        let result = await refresher.refreshNow(pairing: pairing())
+        let result = await refresher.refreshNow(pairing: pairing(), now: Date(timeIntervalSince1970: 1_800_000_000))
 
         #expect(result == expected)
     }
@@ -259,7 +336,7 @@ struct DeviceTokenRefresherTests {
 
     private func pairing(
         relayEndpoint: String = "https://\(deviceTokenRelayHost)",
-        relayEnrollment: RelayEnrollment = .enrolled(deviceToken: "old-token", expiresAt: nil)
+        relayEnrollment: RelayEnrollment = .enrolled(deviceToken: Self.legacyJWT(iat: 1_799_999_000, exp: 1_800_001_000), expiresAt: nil)
     ) -> StoredPairing {
         StoredPairing(
             instanceID: "instance-1",
@@ -297,8 +374,9 @@ struct DeviceTokenRefresherTests {
 
     private static func legacyJWT(iat: Int, exp: Int) -> String {
         let payload: [String: Any] = [
-            "iat": Double(iat),
-            "exp": Double(exp),
+            "iss": "relay", "sub": "device:test", "aud": "spl-relay", "scope": "session.dial",
+            "instance_id": "instance-1", "device_fp": "sha256:" + String(repeating: "a", count: 64),
+            "jti": "legacy-jti", "iat": iat, "exp": exp,
         ]
         let data = try! JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
         let b64 = data.base64EncodedString()
@@ -307,4 +385,10 @@ struct DeviceTokenRefresherTests {
             .replacingOccurrences(of: "=", with: "")
         return "e30.\(b64).sig"
     }
+}
+
+private final class RefreshAcceptanceClock: Sendable {
+    private let value = Mutex<TimeInterval>(0)
+    func read() -> TimeInterval { value.withLock { $0 } }
+    func advance(_ seconds: TimeInterval) { value.withLock { $0 += seconds } }
 }

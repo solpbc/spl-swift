@@ -46,6 +46,7 @@ public struct PairClient: Sendable {
                 orderCandidates: orderCandidates
             )
         case .relay:
+            let preparationStart = ProcessInfo.processInfo.systemUptime
             let generated = try materialGenerator(deviceLabel)
             let validatedRelayEndpoint = try Self.validatedRelayEndpoint(relayEndpoint)
             return try await pairViaRelay(
@@ -53,7 +54,7 @@ public struct PairClient: Sendable {
                 generated: generated,
                 deviceLabel: deviceLabel,
                 defaultRelayEndpoint: validatedRelayEndpoint,
-                now: now
+                now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - preparationStart)
             )
         }
     }
@@ -76,13 +77,14 @@ public struct PairClient: Sendable {
                 orderCandidates: orderCandidates
             )
         case .relay:
+            let preparationStart = ProcessInfo.processInfo.systemUptime
             let generated = try materialGenerator(deviceLabel)
             return try await pairViaRelay(
                 pairURL: pairURL,
                 generated: generated,
                 deviceLabel: deviceLabel,
                 defaultRelayEndpoint: relayEndpoint,
-                now: now
+                now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - preparationStart)
             )
         }
     }
@@ -113,6 +115,7 @@ public struct PairClient: Sendable {
         now: Date,
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
     ) async throws -> StoredPairing {
+        let acceptanceStart = ProcessInfo.processInfo.systemUptime
         guard pairURL.candidates.allSatisfy({ TunnelAddressClassifier.isLocalNetworkAddressLiteral($0.address) }) else {
             pairLog.notice("direct pair candidates rejected reason=\("non_local_candidate", privacy: .public) count=\(pairURL.candidates.count, privacy: .public)")
             throw PairError.directAddressNotLocal
@@ -163,7 +166,7 @@ public struct PairClient: Sendable {
                            envelope,
                            expectedInstanceID: lanResponse.instanceID,
                            expectedOrigin: enrollmentEndpoint,
-                           now: now
+                           now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - acceptanceStart)
                        ) {
                         relayEnrollment = .enrolled(deviceToken: capability.deviceToken, expiresAt: capability.expiresAt)
                     } else {
@@ -213,6 +216,7 @@ public struct PairClient: Sendable {
         defaultRelayEndpoint: RelayEndpoint,
         now: Date
     ) async throws -> StoredPairing {
+        let acceptanceStart = ProcessInfo.processInfo.systemUptime
         let pairKey: PairWindowRelayKey
         do {
             pairKey = try PairWindowRelayKey(sBytes: pairURL.sBytes)
@@ -252,7 +256,7 @@ public struct PairClient: Sendable {
                     envelope,
                     expectedInstanceID: lanResponse.instanceID,
                     expectedOrigin: relayEndpoint,
-                    now: now
+                    now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - acceptanceStart)
                 )
                 relayEnrollment = .enrolled(deviceToken: capability.deviceToken, expiresAt: capability.expiresAt)
             } catch {
@@ -263,7 +267,7 @@ public struct PairClient: Sendable {
             pairLog.notice("relay access malformed on off-LAN pair")
             throw PairError.relayAccessInvalid
         case .omitted:
-            relayEnrollment = await optionalRelayEnrollment(relayEndpoint: relayEndpoint, lanResponse: lanResponse, now: now)
+            relayEnrollment = await optionalRelayEnrollment(relayEndpoint: relayEndpoint, lanResponse: lanResponse, now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - acceptanceStart))
         }
         return try Self.makeStoredPairing(
             lanResponse: lanResponse,
@@ -337,6 +341,7 @@ public struct PairClient: Sendable {
     }
 
     private func postRelay(relayEndpoint: RelayEndpoint, lanResponse: LANPairResponse, now: Date) async throws -> ValidatedCapability {
+        let acceptanceStart = ProcessInfo.processInfo.systemUptime
         let request = try Self.makeRelayRequest(
             relayEndpoint: relayEndpoint,
             response: lanResponse
@@ -358,7 +363,7 @@ public struct PairClient: Sendable {
                     expectedInstanceID: lanResponse.instanceID,
                     expectedOrigin: relayEndpoint,
                     currentIsV2: false,
-                    now: now
+                    now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - acceptanceStart)
                 )
             } catch {
                 throw PairError.relayResponseInvalid(status: status)

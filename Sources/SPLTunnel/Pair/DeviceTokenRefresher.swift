@@ -12,13 +12,15 @@ public enum DeviceTokenRefreshResult: Sendable, Equatable {
 
 public struct DeviceTokenRefresher: Sendable {
     private let session: URLSession
+    private let elapsedSeconds: @Sendable () -> TimeInterval
 
     public init(clientInfo: SPLClientInfo) {
         self.init(session: .shared, clientInfo: clientInfo)
     }
 
-    init(session: URLSession, clientInfo: SPLClientInfo) {
+    init(session: URLSession, clientInfo: SPLClientInfo, elapsedSeconds: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.session = session
+        self.elapsedSeconds = elapsedSeconds
     }
 
     public func refreshIfNeeded(pairing: StoredPairing, now: Date) async -> DeviceTokenRefreshResult {
@@ -42,6 +44,12 @@ public struct DeviceTokenRefresher: Sendable {
             return .transientFailure(pairing)
         }
 
+        let currentIsV2: Bool
+        do {
+            currentIsV2 = try InstanceCapability.renewalIsV2(deviceToken, expectedInstanceID: pairing.instanceID, now: now)
+        } catch { return .transientFailure(pairing) }
+        let started = elapsedSeconds()
+
         let request: URLRequest
         do {
             request = try Self.makeRefreshRequest(
@@ -62,14 +70,13 @@ public struct DeviceTokenRefresher: Sendable {
 
         switch status {
         case 200:
-            let currentIsV2 = DeviceTokenClaims.parse(deviceToken)?.isV2 ?? false
             do {
                 let validated = try InstanceCapability.validateHTTPResponse(
                     data: data,
                     expectedInstanceID: pairing.instanceID,
                     expectedOrigin: validatedRelayEndpoint,
                     currentIsV2: currentIsV2,
-                    now: now
+                    now: now.addingTimeInterval(max(0, elapsedSeconds() - started))
                 )
                 return .refreshed(pairing.updatingRelayEnrollment(.enrolled(
                     deviceToken: validated.deviceToken,

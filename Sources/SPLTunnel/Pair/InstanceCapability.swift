@@ -3,7 +3,7 @@
 
 import Foundation
 
-enum InstanceCapabilityError: Error, Equatable, Sendable {
+public enum InstanceCapabilityError: Error, Equatable, Sendable {
     case invalidEnvelope
     case invalidJWT
     case unknownVersion
@@ -15,6 +15,7 @@ enum InstanceCapabilityError: Error, Equatable, Sendable {
     case expired
     case clockSkew
     case downgradeRejected
+    case invalidOrigin
 }
 
 struct ValidatedCapability: Sendable, Equatable {
@@ -41,33 +42,133 @@ enum InstanceCapability {
     static func parseRFC3339Date(_ string: String) -> Date? {
         let formatterWithFraction = ISO8601DateFormatter()
         formatterWithFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatterWithFraction.date(from: string) {
+        if let date = formatterWithFraction.date(from: string.uppercased()) {
             return date
         }
         let standardFormatter = ISO8601DateFormatter()
         standardFormatter.formatOptions = [.withInternetDateTime]
-        return standardFormatter.date(from: string)
+        return standardFormatter.date(from: string.uppercased())
+    }
+
+    static func normalizedOrigin(_ url: URL, allowInsecure: Bool = false) throws -> URL {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let rawScheme = components.scheme?.lowercased(),
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              components.percentEncodedPath.isEmpty || components.percentEncodedPath == "/",
+              !host.unicodeScalars.contains(where: {
+                  $0.value <= 32 || $0.value == 127 || "/\\?#@%".unicodeScalars.contains($0)
+              }),
+              !url.absoluteString.unicodeScalars.contains(where: { $0.value <= 32 || $0.value == 127 }),
+              components.port.map({ (1...65535).contains($0) }) ?? true else {
+            throw InstanceCapabilityError.invalidOrigin
+        }
+        let secure = rawScheme == "https" || rawScheme == "wss"
+        guard secure || (allowInsecure && (rawScheme == "http" || rawScheme == "ws")) else {
+            throw InstanceCapabilityError.invalidOrigin
+        }
+        components.scheme = secure ? "https" : "http"
+        components.host = host.lowercased()
+        if components.port == (secure ? 443 : 80) { components.port = nil }
+        components.path = ""
+        guard let result = components.url else { throw InstanceCapabilityError.invalidOrigin }
+        return result
     }
 
     static func normalizeOrigin(_ url: URL) -> (scheme: String, host: String, port: Int)? {
-        guard let rawScheme = url.scheme?.lowercased(),
-              let rawHost = url.host?.lowercased() else {
-            return nil
+        guard let origin = try? normalizedOrigin(url, allowInsecure: true),
+              let scheme = origin.scheme, let host = origin.host else { return nil }
+        return (scheme, host, origin.port ?? (scheme == "https" ? 443 : 80))
+    }
+
+    static func payload(_ token: String) throws -> Data {
+        let segments = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard segments.count == 3, segments.allSatisfy({ !$0.isEmpty && $0.utf8.allSatisfy {
+                  (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 95
+              } }),
+              let data = base64URLDecode(String(segments[1])) else {
+            throw InstanceCapabilityError.invalidJWT
         }
-        let canonicalScheme: String
-        let defaultPort: Int
-        switch rawScheme {
-        case "https", "wss":
-            canonicalScheme = "https"
-            defaultPort = 443
-        case "http", "ws":
-            canonicalScheme = "http"
-            defaultPort = 80
-        default:
-            return nil
+        return data
+    }
+
+    static func validateTimes(iat: Int, exp: Int, now: Date, requireUsable: Bool) throws {
+        let maxSafeInteger = 9_007_199_254_740_991
+        guard iat >= 0, exp > iat, exp <= maxSafeInteger else {
+            throw InstanceCapabilityError.invalidJWT
         }
-        let port = url.port ?? defaultPort
-        return (canonicalScheme, rawHost, port)
+        let sampledNow = now.timeIntervalSince1970
+        guard sampledNow.isFinite else { throw InstanceCapabilityError.invalidJWT }
+        guard Double(iat) <= floor(sampledNow) + 60 else { throw InstanceCapabilityError.clockSkew }
+        if requireUsable && sampledNow >= Double(exp) { throw InstanceCapabilityError.expired }
+    }
+
+    static func validateExpiry(_ value: String?, exp: Int) throws {
+        guard let value else { return }
+        let rfc3339 = #"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})$"#
+        guard value.range(of: rfc3339, options: .regularExpression) == value.startIndex..<value.endIndex else {
+            throw InstanceCapabilityError.expiryMismatch
+        }
+        // Reject nonzero fractions before Foundation can round submillisecond precision.
+        if let dot = value.firstIndex(of: ".") {
+            let digits = value[value.index(after: dot)...].prefix(while: { $0.isASCII && $0.isNumber })
+            guard !digits.isEmpty, digits.allSatisfy({ $0 == "0" }) else {
+                throw InstanceCapabilityError.expiryMismatch
+            }
+        }
+        guard let date = parseRFC3339Date(value), date.timeIntervalSince1970 == Double(exp) else {
+            throw InstanceCapabilityError.expiryMismatch
+        }
+        let normalized = value.uppercased()
+        var offset = 0
+        if !normalized.hasSuffix("Z") {
+            let suffix = Array(normalized.suffix(6))
+            guard let hours = Int(String(suffix[1...2])), hours <= 23,
+                  let minutes = Int(String(suffix[4...5])), minutes <= 59 else {
+                throw InstanceCapabilityError.expiryMismatch
+            }
+            offset = (hours * 3600 + minutes * 60) * (suffix[0] == "-" ? -1 : 1)
+        }
+        guard let zone = TimeZone(secondsFromGMT: offset) else { throw InstanceCapabilityError.expiryMismatch }
+        let roundTrip = ISO8601DateFormatter()
+        roundTrip.formatOptions = [.withInternetDateTime]
+        roundTrip.timeZone = zone
+        // Foundation normalizes impossible calendar dates; compare the supplied civil time too.
+        guard roundTrip.string(from: date).prefix(19) == normalized.prefix(19) else {
+            throw InstanceCapabilityError.expiryMismatch
+        }
+    }
+
+    static func validateLegacyJWT(_ token: String, expectedInstanceID: String, expiresAt: String?, now: Date, requireUsable: Bool = true) throws {
+        let claims: LegacyJWTClaims
+        do { claims = try JSONDecoder().decode(LegacyJWTClaims.self, from: payload(token)) }
+        catch { throw InstanceCapabilityError.invalidJWT }
+        guard claims.instanceID == expectedInstanceID else { throw InstanceCapabilityError.instanceMismatch }
+        guard claims.aud == "spl-relay", claims.scope == "session.dial",
+              claims.sub.hasPrefix("device:"), claims.sub.count > 7,
+              !claims.iss.isEmpty, !claims.jti.isEmpty,
+              claims.deviceFP.hasPrefix("sha256:"), claims.deviceFP.utf8.count == 71,
+              claims.deviceFP.dropFirst(7).allSatisfy({ $0.isASCII && $0.isHexDigit }) else {
+            throw InstanceCapabilityError.invalidJWT
+        }
+        try validateTimes(iat: claims.iat, exp: claims.exp, now: now, requireUsable: requireUsable)
+        try validateExpiry(expiresAt, exp: claims.exp)
+    }
+
+    static func renewalIsV2(_ token: String, expectedInstanceID: String, now: Date) throws -> Bool {
+        let data = try payload(token)
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw InstanceCapabilityError.invalidJWT
+        }
+        if object.keys.contains("ver") {
+            try validateV2JWT(token, expectedInstanceID: expectedInstanceID, expectedExpiresAtRFC3339: nil,
+                              now: now, requireUsable: false)
+            return true
+        }
+        try validateLegacyJWT(token, expectedInstanceID: expectedInstanceID, expiresAt: nil,
+                              now: now, requireUsable: false)
+        return false
     }
 
     static func originsMatch(_ a: URL, _ b: URL) -> Bool {
@@ -83,17 +184,10 @@ enum InstanceCapability {
         _ token: String,
         expectedInstanceID: String,
         expectedExpiresAtRFC3339: String?,
-        now: Date
+        now: Date,
+        requireUsable: Bool = true
     ) throws {
-        let segments = token.split(separator: ".", omittingEmptySubsequences: false)
-        guard segments.count >= 3 else {
-            throw InstanceCapabilityError.invalidJWT
-        }
-        let payloadSegment = String(segments[1])
-        guard !payloadSegment.isEmpty,
-              let payloadData = base64URLDecode(payloadSegment) else {
-            throw InstanceCapabilityError.invalidJWT
-        }
+        let payloadData = try payload(token)
 
         let decoder = JSONDecoder()
         let claims: V2JWTClaims
@@ -121,29 +215,8 @@ enum InstanceCapability {
         guard !claims.iss.isEmpty, !claims.jti.isEmpty else {
             throw InstanceCapabilityError.invalidJWT
         }
-        guard claims.exp > claims.iat else {
-            throw InstanceCapabilityError.invalidJWT
-        }
-
-        let nowEpoch = Int(now.timeIntervalSince1970)
-        // Clock skew: iat <= now + 60s
-        guard claims.iat <= nowEpoch + 60 else {
-            throw InstanceCapabilityError.clockSkew
-        }
-        // Usable now: now < exp
-        guard nowEpoch < claims.exp else {
-            throw InstanceCapabilityError.expired
-        }
-
-        if let expectedExpiresAtRFC3339 {
-            guard let date = parseRFC3339Date(expectedExpiresAtRFC3339) else {
-                throw InstanceCapabilityError.expiryMismatch
-            }
-            let expSeconds = Int(date.timeIntervalSince1970)
-            guard expSeconds == claims.exp else {
-                throw InstanceCapabilityError.expiryMismatch
-            }
-        }
+        try validateTimes(iat: claims.iat, exp: claims.exp, now: now, requireUsable: requireUsable)
+        try validateExpiry(expectedExpiresAtRFC3339, exp: claims.exp)
     }
 
     // Bootstrap validation (relay_access object)
@@ -220,13 +293,8 @@ enum InstanceCapability {
                 // Downgrade guard: cannot replace v2 with unversioned v1
                 throw InstanceCapabilityError.downgradeRejected
             }
-            guard let claims = DeviceTokenClaims.parse(envelope.deviceToken) else {
-                throw InstanceCapabilityError.invalidJWT
-            }
-            // Expired replacement is rejected
-            guard now < claims.expiresAt else {
-                throw InstanceCapabilityError.expired
-            }
+            try validateLegacyJWT(envelope.deviceToken, expectedInstanceID: expectedInstanceID,
+                                  expiresAt: envelope.expiresAt, now: now)
             return ValidatedCapability(
                 deviceToken: envelope.deviceToken,
                 expiresAt: envelope.expiresAt,
@@ -359,5 +427,41 @@ private struct DynamicCodingKey: CodingKey {
     init?(intValue: Int) {
         self.stringValue = "\(intValue)"
         self.intValue = intValue
+    }
+}
+
+private struct LegacyJWTClaims: Decodable {
+    let iss: String
+    let sub: String
+    let aud: String
+    let scope: String
+    let instanceID: String
+    let deviceFP: String
+    let iat: Int
+    let exp: Int
+    let jti: String
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case iss, sub, aud, scope, iat, exp, jti
+        case instanceID = "instance_id"
+        case deviceFP = "device_fp"
+    }
+
+    init(from decoder: Decoder) throws {
+        let dynamic = try decoder.container(keyedBy: DynamicCodingKey.self)
+        let allowed = Set(CodingKeys.allCases.map(\.stringValue))
+        guard Set(dynamic.allKeys.map(\.stringValue)) == allowed else {
+            throw InstanceCapabilityError.extraFields
+        }
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        iss = try c.decode(String.self, forKey: .iss)
+        sub = try c.decode(String.self, forKey: .sub)
+        aud = try c.decode(String.self, forKey: .aud)
+        scope = try c.decode(String.self, forKey: .scope)
+        instanceID = try c.decode(String.self, forKey: .instanceID)
+        deviceFP = try c.decode(String.self, forKey: .deviceFP)
+        iat = try c.decode(Int.self, forKey: .iat)
+        exp = try c.decode(Int.self, forKey: .exp)
+        jti = try c.decode(String.self, forKey: .jti)
     }
 }
