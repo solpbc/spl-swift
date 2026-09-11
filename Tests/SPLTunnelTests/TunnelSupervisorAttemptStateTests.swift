@@ -97,6 +97,60 @@ struct TunnelSupervisorAttemptStateTests {
         #expect(await supervisor.attemptState == .connected)
     }
 
+    @Test("In-flight connect failure does not increment attempt when a late child .failed arrives")
+    func lateChildFailedDuringInFlightConnectDoesNotDoubleCountAttempt() async throws {
+        let sleepProbe = SleepProbe()
+        let gen0Gate = TestSignal()
+        let backoff = ReconnectBackoff(schedule: .table([.milliseconds(25), .milliseconds(50)]), random: { _ in 1.0 })
+        let gen1Gate = TestSignal()
+        let factory = FakeGenerationFactory(scripts: [
+            .failure(.unreachable, gate: gen0Gate),
+            .success(relayEndpoint, gate: gen1Gate)
+        ])
+        let supervisor = fakeSupervisor(
+            factory: factory,
+            reconnectBackoff: backoff,
+            sleeper: { duration in
+                try await sleepProbe.sleep(duration)
+            }
+        )
+
+        let stream = await supervisor.attemptStateUpdates()
+        var iterator = stream.makeAsyncIterator()
+        #expect(await iterator.next() == .idle)
+
+        let connectTask = Task {
+            try await supervisor.connect(endpoints: [self.relayEndpoint])
+        }
+
+        await waitUntil("transition to attempting") {
+            await supervisor.attemptState == .attempting
+        }
+        #expect(await iterator.next() == .attempting)
+        await gen0Gate.signal()
+
+        await sleepProbe.waitForSleepCount(excluding: .seconds(60), target: 1)
+        let retrying = TunnelSupervisorAttemptState.unavailable(.retrying(
+            failureClass: .unreachable,
+            attempt: 1,
+            retryAfter: .milliseconds(25)
+        ))
+        #expect(await supervisor.attemptState == retrying)
+        #expect(await iterator.next() == retrying)
+
+        let gen0 = try await factory.generation(at: 0)
+        await gen0.fail(.unreachable)
+        #expect(await supervisor.attemptState == retrying)
+
+        await sleepProbe.releaseFirstSleep(duration: .milliseconds(25))
+
+        #expect(await iterator.next() == .attempting)
+        await gen1Gate.signal()
+        #expect(await iterator.next() == .connected)
+        _ = try await connectTask.value
+        #expect(await supervisor.attemptState == .connected)
+    }
+
     @Test("AC3: Active generation non-terminal failure emits retrying unavailable and redrive establishes replacement")
     func activeGenerationFailure() async throws {
         let sleepProbe = SleepProbe()

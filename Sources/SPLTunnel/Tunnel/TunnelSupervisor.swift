@@ -444,11 +444,17 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             currentVia = via
             connected = (via, endpoint)
         } catch let error as SessionError {
-            connectingToken = nil
+            // why: leave connectingToken set so a racing child .failed cannot look like
+            // post-connect route-loss and increment the retry attempt a second time.
+            if generationFailure?.token != token {
+                generationFailure = (token: token, error: error)
+            }
             planner.noteFailure(error, attemptedTrustedEndpoint: plan.preferredEndpoint)
             throw error
         } catch {
-            connectingToken = nil
+            if generationFailure?.token != token {
+                generationFailure = (token: token, error: .unreachable)
+            }
             planner.noteFailure(.unreachable, attemptedTrustedEndpoint: plan.preferredEndpoint)
             throw SessionError.unreachable
         }
@@ -639,6 +645,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             publish(childState)
         case .failed(let error):
             currentVia = nil
+            let alreadyRecorded = generationFailure?.token == token
             generationFailure = (token: token, error: error)
             cancelStabilityTimer()
             if Self.isTerminalPause(error) {
@@ -646,6 +653,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
                 return
             }
             guard connectingToken != token else {
+                return
+            }
+            // why: connect() catch already recorded this generation; a late .failed must
+            // not publish a second retrying step.
+            guard !alreadyRecorded else {
                 return
             }
             publishRetryingUnavailable(error)
