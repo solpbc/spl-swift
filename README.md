@@ -37,7 +37,7 @@ Platform differences are configuration, not conditionals. Consuming apps supply:
 
 ## Adapter guidance
 
-The library reports connection progress through `TunnelState` and `stateUpdates` on `TunnelSession` and `TunnelSupervisor`; it does not ship app-window state. A connect-window terminal signal is an adapter-layer pattern: the app observes those state transitions, decides which failures are terminal for its UI, and keeps that policy outside `SPLTunnel`.
+The library reports connection progress through `TunnelState` and `stateUpdates` on `TunnelSession` and `TunnelSupervisor`; it does not ship app-window state. A connect-window terminal signal is an adapter-layer pattern: the app observes those state transitions, decides which failures are terminal for its UI, and keeps that policy outside `SPLTunnel`. For supervisors that manage reconnect across generations, `attemptState` and `attemptStateUpdates()` provide the current high-level attempt state (`idle`, `attempting`, `unavailable`, `connected`, `terminal`); apps should not combine `stateUpdates` with `reconnectUpdates` to reconstruct this.
 
 `LoopbackProxy(opener:)` accepts any `MuxStreamOpening` implementation, so apps can hand it a `TunnelSession` for a single connection lifecycle or a `TunnelSupervisor` when reconnect behavior should preserve the loopback port.
 

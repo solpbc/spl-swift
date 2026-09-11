@@ -53,6 +53,13 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
 
     public private(set) var connectionMode: ConnectionMode?
     public private(set) var reconnectStatus: ReconnectStatus?
+    /// Actor-isolated current high-level attempt state. Starts in `.idle`.
+    public private(set) var attemptState: TunnelSupervisorAttemptState = .idle
+
+    // why: observation-only test instrumentation and must never gate behavior.
+    var attemptStateSubscriberCount: Int {
+        attemptStateSubscribers.count
+    }
 
     private enum Lifecycle: Sendable, Equatable {
         case idle
@@ -140,6 +147,9 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private var currentVia: ConnectedVia?
     private var planner = DialPlanner()
     private var backoff = ReconnectBackoff()
+    private var pendingRetryStep: ReconnectBackoff.Step?
+    private var attemptStateSubscribers: [UInt64: AsyncStream<TunnelSupervisorAttemptState>.Continuation] = [:]
+    private var nextAttemptStateSubscriberID: UInt64 = 0
 
     public init(
         pairing: StoredPairing,
@@ -198,6 +208,28 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         mode.continuation.yield(nil)
     }
 
+    /// Returns a new `.bufferingNewest(1)` stream yielding attempt-state transitions.
+    ///
+    /// Yields the current `attemptState` immediately upon creation. Cancelling an iterator removes
+    /// only that individual subscription. The stream does not finish on pause or disconnect.
+    public func attemptStateUpdates() -> AsyncStream<TunnelSupervisorAttemptState> {
+        let (stream, continuation) = AsyncStream<TunnelSupervisorAttemptState>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        nextAttemptStateSubscriberID += 1
+        let subscriberID = nextAttemptStateSubscriberID
+        attemptStateSubscribers[subscriberID] = continuation
+        continuation.yield(attemptState)
+        continuation.onTermination = { [weak self] _ in
+            Task {
+                await self?.removeAttemptStateSubscriber(subscriberID)
+            }
+        }
+        return stream
+    }
+
+    private func removeAttemptStateSubscriber(_ id: UInt64) {
+        attemptStateSubscribers.removeValue(forKey: id)
+    }
+
     @discardableResult
     public func connect(endpoints: [TransportEndpoint]) async throws -> ConnectedVia {
         guard !endpoints.isEmpty else {
@@ -219,6 +251,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             redriveTask = nil
             cancelEstablishment()
             backoff.reset()
+            pendingRetryStep = nil
             setReconnectStatus(nil)
         }
 
@@ -235,9 +268,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         cancelEstablishment()
         connectingToken = nil
         backoff.reset()
+        pendingRetryStep = nil
         setReconnectStatus(nil)
-        await clearGeneration(disconnect: true)
         currentVia = nil
+        publishAttemptState(.idle)
+        await clearGeneration(disconnect: true)
         setConnectionMode(nil)
         publish(.disconnected)
     }
@@ -262,6 +297,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
                 throw sessionError
             }
             if generation?.token == current.token, connectingToken != current.token {
+                publishRetryingUnavailable(.transportFailed("mux closed"))
                 requestRedrive(
                     reason: .transportFailed("mux closed"),
                     userInitiated: false,
@@ -331,7 +367,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         var nextUserInitiated = userInitiated
         while lifecycle == .running {
             if !nextUserInitiated {
-                let step = backoff.nextDelay()
+                let step = consumeRetryStep()
                 setReconnectStatus(ReconnectStatus(
                     reason: nextReason,
                     attempt: step.attempt,
@@ -339,6 +375,9 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
                     terminalPause: false
                 ))
                 try await sleeper(step.delay)
+                guard lifecycle == .running else {
+                    throw SessionError.notConnected
+                }
             } else {
                 setReconnectStatus(ReconnectStatus(
                     reason: nextReason,
@@ -357,6 +396,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
                     await pause(error)
                     throw error
                 }
+                publishRetryingUnavailable(error)
                 nextReason = error
                 nextUserInitiated = false
             }
@@ -372,10 +412,18 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         nextGenerationToken += 1
         let token = nextGenerationToken
         let session = await makeSession(pairing, clientInfo, policy)
+        guard lifecycle == .running, nextGenerationToken == token else {
+            throw SessionError.notConnected
+        }
         await installGeneration(session, token: token)
 
         let plan = planner.plan(candidates: plannedEndpoints, now: now())
         connectingToken = token
+        guard lifecycle == .running, nextGenerationToken == token else {
+            connectingToken = nil
+            throw SessionError.notConnected
+        }
+        publishAttemptState(.attempting)
         let connected: (via: ConnectedVia, endpoint: TransportEndpoint?)
         do {
             let via = try await session.connect(
@@ -413,6 +461,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             }
             throw SessionError.notConnected
         }
+        publishAttemptState(.connected)
         planner.noteConnected(endpoint: connected.endpoint, now: now())
         armStabilityTimer(for: token)
         supervisorLog.notice("supervisor connected generation=\(token, privacy: .public)")
@@ -465,8 +514,12 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         modeTask?.cancel()
         modeTask = nil
         let session = generation?.session
+        let wasConnected = (attemptState == .connected)
         generation = nil
         generationFailure = nil
+        if lifecycle == .running, wasConnected, session != nil {
+            publishAttemptState(.unavailable(.replacing))
+        }
         if disconnect {
             await session?.disconnect()
         }
@@ -550,6 +603,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             return
         }
         backoff.reset()
+        pendingRetryStep = nil
         stabilityTask = nil
         activeStabilityToken = nil
     }
@@ -594,6 +648,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             guard connectingToken != token else {
                 return
             }
+            publishRetryingUnavailable(error)
             planner.noteFailure(error, attemptedTrustedEndpoint: nil)
             publish(.connecting(candidates: plannedEndpoints.map(\.connectedVia)))
             requestRedrive(reason: error, userInitiated: false, sourceToken: token)
@@ -661,8 +716,10 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         cancelEstablishment()
         connectingToken = nil
         backoff.reset()
+        pendingRetryStep = nil
         planner.noteTerminalPause()
         currentVia = nil
+        publishAttemptState(.terminal(error.attemptFailureClass))
         await clearGeneration(disconnect: true)
         setConnectionMode(nil)
         setReconnectStatus(ReconnectStatus(
@@ -672,6 +729,35 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             terminalPause: true
         ))
         publish(.failed(error))
+    }
+
+    private func publishAttemptState(_ new: TunnelSupervisorAttemptState) {
+        guard new != attemptState else {
+            return
+        }
+        attemptState = new
+        for continuation in attemptStateSubscribers.values {
+            continuation.yield(new)
+        }
+        supervisorLog.notice("supervisor attempt_state=\(String(describing: new), privacy: .public)")
+    }
+
+    private func publishRetryingUnavailable(_ error: SessionError) {
+        let step = backoff.nextDelay()
+        pendingRetryStep = step
+        publishAttemptState(.unavailable(.retrying(
+            failureClass: error.attemptFailureClass,
+            attempt: step.attempt,
+            retryAfter: step.delay
+        )))
+    }
+
+    private func consumeRetryStep() -> ReconnectBackoff.Step {
+        if let pending = pendingRetryStep {
+            pendingRetryStep = nil
+            return pending
+        }
+        return backoff.nextDelay()
     }
 
     private func publish(_ newState: TunnelState) {

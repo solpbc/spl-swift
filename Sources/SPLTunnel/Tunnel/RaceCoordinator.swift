@@ -200,7 +200,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                     await attempts.observeCancellation(order: 0)
                     await attempts.cancelled(order: 0)
                 } else {
-                    await attempts.failed(order: 0, failureClass: Self.attemptFailureClass(for: sessionError))
+                    await attempts.failed(order: 0, failureClass: sessionError.attemptFailureClass)
                 }
                 raceLog.notice("candidate failed endpoint=\(endpoint.logDescription, privacy: .public) error=\(String(describing: sessionError), privacy: .public) duration_ms=\(startedAt.duration(to: now()).milliseconds, privacy: .public)")
                 throw sessionError
@@ -236,7 +236,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                             await attempts.observeCancellation(order: order)
                             await attempts.cancelled(order: order)
                         } else {
-                            await attempts.failed(order: order, failureClass: Self.attemptFailureClass(for: sessionError))
+                            await attempts.failed(order: order, failureClass: sessionError.attemptFailureClass)
                         }
                         raceLog.notice("candidate failed endpoint=\(endpoint.logDescription, privacy: .public) error=\(String(describing: sessionError), privacy: .public) duration_ms=\(startedAt.duration(to: now()).milliseconds, privacy: .public)")
                         return .failure(order: order, error: sessionError)
@@ -403,25 +403,6 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
             return unpinnedInterface ? .directUnpinned : .directPinned
         case .relay:
             return .relay
-        }
-    }
-
-    private static func attemptFailureClass(for error: SessionError) -> TunnelAttemptFailureClass {
-        switch error {
-        case .unreachable:
-            .unreachable
-        case .tlsFailed:
-            .tls
-        case .authRefreshRequired:
-            .authRefreshRequired
-        case .notEntitled:
-            .notEntitled
-        case .revoked:
-            .revoked
-        case .transportFailed, .inboundClosed, .directKeepaliveMissed, .relayKeepaliveMissed:
-            .transport
-        case .notConnected:
-            .other
         }
     }
 
