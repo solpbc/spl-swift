@@ -13,5 +13,5 @@
 /// wire behavior in this package.
 public enum SPLTunnelPackage {
     /// The package version, set at release tagging.
-    public static let version = "0.5.0"
+    public static let version = "0.6.1-dev"
 }

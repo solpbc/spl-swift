@@ -110,7 +110,19 @@ public actor LoopbackProxy {
 
         connection.start(queue: .global(qos: .utility))
         let stream: MuxStream
+        let firstRead: (Data, Bool)
         do {
+            // Browser preconnections can remain idle. Allocate a remote stream only
+            // when this TCP connection has bytes to forward, preserving its first read.
+            while true {
+                let (chunk, isComplete) = try await receive(from: connection)
+                try Task.checkCancellation()
+                if let chunk, !chunk.isEmpty {
+                    firstRead = (chunk, isComplete)
+                    break
+                }
+                if isComplete || chunk == nil { return }
+            }
             stream = try await opener.openStream()
         } catch {
             return
@@ -118,7 +130,7 @@ public actor LoopbackProxy {
 
         await withTaskGroup(of: LoopbackPumpStats.self) { group in
             group.addTask {
-                let bytes = await pumpTCP(connection, to: stream)
+                let bytes = await pumpTCP(connection, to: stream, firstRead: firstRead)
                 return LoopbackPumpStats(bytesIn: bytes, bytesOut: 0)
             }
             group.addTask {
@@ -133,11 +145,22 @@ public actor LoopbackProxy {
         }
     }
 
-    private nonisolated static func pumpTCP(_ connection: NWConnection, to stream: MuxStream) async -> Int {
+    private nonisolated static func pumpTCP(
+        _ connection: NWConnection,
+        to stream: MuxStream,
+        firstRead: (Data, Bool)
+    ) async -> Int {
         var bytes = 0
+        var pendingRead: (Data?, Bool)? = firstRead
         while !Task.isCancelled {
             do {
-                let (chunk, isComplete) = try await receive(from: connection)
+                let (chunk, isComplete): (Data?, Bool)
+                if let first = pendingRead {
+                    (chunk, isComplete) = first
+                    pendingRead = nil
+                } else {
+                    (chunk, isComplete) = try await receive(from: connection)
+                }
                 if let chunk, !chunk.isEmpty {
                     bytes += chunk.count
                     try await stream.write(chunk)

@@ -243,6 +243,112 @@ struct LoopbackProxyTests {
         }
     }
 
+    @Test func idlePreconnectionsDoNotConsumeRemoteStreamCapacity() async throws {
+        // Real TCP preconnections must not consume the Journal door's eight stream slots.
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
+        let opener = CappedLoopbackOpener(limit: 8, response: response)
+        try await Self.withLoopbackProxy(opener: opener) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            var clients: [NWConnection] = []
+            defer { for client in clients { client.cancel() } }
+            for _ in 0..<8 {
+                let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+                clients.append(client)
+                try await startAndReturnReadyWaiter(client).wait()
+            }
+            #expect(await waitUntil("eight idle TCP connections accepted") {
+                await proxy.connectionTaskCount() == 8
+            })
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            clients.append(client)
+            try await startAndReturnReadyWaiter(client).wait()
+            let responseBox = AsyncResultBox<Data>()
+            let receiver = Task {
+                await responseBox.store((try? await Self.collectResponse(from: client)) ?? Data())
+            }
+            defer { receiver.cancel() }
+            try await Self.sendFinal(request, to: client)
+            #expect(await waitUntil("request completes despite idle preconnections", timeout: .seconds(2)) {
+                await responseBox.snapshot() != nil
+            })
+            #expect(await responseBox.snapshot() == response)
+            #expect(await opener.openCount() == 1)
+            #expect(await opener.capturedRequest() == request)
+        }
+    }
+
+    @Test func emptyTCPHalfCloseDoesNotOpenRemoteStream() async throws {
+        let opener = CappedLoopbackOpener(limit: 8, response: Data())
+        try await Self.withLoopbackProxy(opener: opener) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            #expect(await waitUntil("idle connection accepted before EOF") {
+                await proxy.connectionTaskCount() == 1
+            })
+            try await Self.sendFinal(Data(), to: client)
+            #expect(await waitUntil("empty half-close handler completes") {
+                await proxy.connectionTaskCount() == 0
+            })
+            #expect(await opener.openCount() == 0)
+        }
+    }
+
+    @Test func stopCancelsIdlePreconnectionWithoutOpeningRemoteStream() async throws {
+        let opener = CappedLoopbackOpener(limit: 8, response: Data())
+        try await Self.withLoopbackProxy(opener: opener) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            #expect(await waitUntil("idle connection accepted before stop") {
+                await proxy.connectionTaskCount() == 1
+            })
+            let closed = AsyncResultBox<Bool>()
+            let receiver = Task {
+                _ = try? await Self.collectResponse(from: client)
+                await closed.store(true)
+            }
+            defer { receiver.cancel() }
+            await proxy.stop()
+            #expect(await waitUntil("stop closes idle TCP socket") {
+                await closed.snapshot() == true
+            })
+            #expect(await opener.openCount() == 0)
+        }
+    }
+
+    @Test func firstChunkAndLaterChunkPreserveOrderBeforeHalfClose() async throws {
+        // session.md: TCP EOF maps to stream CLOSE; response remains readable after it.
+        let first = Data("first request chunk".utf8)
+        let second = Data("second request chunk".utf8)
+        let response = Data("response after request EOF".utf8)
+        let opener = InMemoryLoopbackOpener(response: response)
+        try await Self.withLoopbackProxy(opener: opener) { _, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            try await LoopbackProxy.send(first, to: client)
+            #expect(await waitUntil("first chunk forwarded before TCP EOF") {
+                await opener.capturedRequest() == first
+            })
+            let responseBox = AsyncResultBox<Data>()
+            let receiver = Task {
+                await responseBox.store((try? await Self.collectResponse(from: client)) ?? Data())
+            }
+            defer { receiver.cancel() }
+            try await Self.sendFinal(second, to: client)
+            #expect(await waitUntil("response after two chunks and half-close") {
+                await responseBox.snapshot() != nil
+            })
+            #expect(await opener.capturedRequest() == first + second)
+            #expect(await responseBox.snapshot() == response)
+        }
+    }
+
     @Test func shortLivedConnectionChurnDoesNotRetainCompletedTasks() async throws {
         // Actor-owned task bookkeeping must stay bounded under short-lived connection churn.
         let churnCount = 200
@@ -261,7 +367,8 @@ struct LoopbackProxyTests {
             for _ in 0..<churnCount {
                 let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
                 clients.append(client)
-                client.start(queue: .global(qos: .utility))
+                try await startAndReturnReadyWaiter(client).wait()
+                try await LoopbackProxy.send(Data([0x41]), to: client)
             }
 
             // 200 real loopback connections need more than the 500 ms default: the
@@ -269,12 +376,9 @@ struct LoopbackProxyTests {
             #expect(await waitUntil("loopback churn accepted", timeout: .seconds(10)) {
                 await opener.attemptCount() >= churnCount
             })
-            for _ in 0..<100 {
-                await Task.yield()
-            }
-
-            let retainedCount = await proxy.connectionTaskCount()
-            #expect(retainedCount == 0)
+            #expect(await waitUntil("completed churn handlers removed", timeout: .seconds(10)) {
+                await proxy.connectionTaskCount() == 0
+            })
         }
     }
 
@@ -455,6 +559,49 @@ private actor InMemoryLoopbackOpener: MuxStreamOpening {
                 await stream.deliverInboundClose()
             default:
                 break
+            }
+        }
+    }
+}
+
+private actor CappedLoopbackOpener: MuxStreamOpening {
+    private let limit: Int
+    private let response: Data
+    private var attempts = 0
+    private var streams: [UInt32: MuxStream] = [:]
+    private var decoder = FrameDecoder()
+    private var request = Data()
+
+    init(limit: Int, response: Data) {
+        self.limit = limit
+        self.response = response
+    }
+
+    func openStream() async throws -> MuxStream {
+        attempts += 1
+        guard streams.count < limit else { throw LoopbackTestError() }
+        let id = UInt32(attempts * 2 - 1)
+        let stream = MuxStream(
+            id: id,
+            sink: { bytes in try await self.acceptOutbound(bytes) },
+            onTerminal: { id in await self.removeStream(id) }
+        )
+        streams[id] = stream
+        return stream
+    }
+
+    func openCount() -> Int { attempts }
+    func capturedRequest() -> Data { request }
+    private func removeStream(_ id: UInt32) { streams[id] = nil }
+
+    private func acceptOutbound(_ bytes: Data) async throws {
+        decoder.feed(bytes)
+        while let frame = try decoder.next() {
+            if frame.flags == FrameFlags.data.rawValue {
+                request.append(frame.payload)
+            } else if frame.flags == FrameFlags.close.rawValue, let stream = streams[frame.streamID] {
+                _ = await stream.deliverInboundData(response)
+                await stream.deliverInboundClose()
             }
         }
     }
