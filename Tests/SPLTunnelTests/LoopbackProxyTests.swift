@@ -349,6 +349,81 @@ struct LoopbackProxyTests {
         }
     }
 
+    @Test func idleKeepAliveConnectionsReleaseTheirRemoteStreamSlot() async throws {
+        // A keep-alive TCP connection holds its remote stream for the whole life
+        // of that connection, and the door frees a stream slot only when both
+        // halves close. Eight idle persistent connections therefore pinned all
+        // eight door slots for the life of the process, and the ninth request
+        // reached the local client as a bare connection close.
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
+        let opener = KeepAliveLoopbackOpener(limit: 8, response: response)
+        try await Self.withLoopbackProxy(opener: opener, idleReclaimAfter: .milliseconds(1500)) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            var clients: [NWConnection] = []
+            defer { for client in clients { client.cancel() } }
+
+            for _ in 0..<8 {
+                let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+                clients.append(client)
+                try await startAndReturnReadyWaiter(client).wait()
+                try await LoopbackProxy.send(request, to: client)
+                let served = try await Self.collectBytes(from: client, atLeast: response.count)
+                #expect(served == response)
+            }
+            #expect(await opener.openCount() == 8)
+
+            #expect(await waitUntil("idle keep-alive streams reclaimed", timeout: .seconds(15)) {
+                await opener.liveStreamCount() == 0
+            })
+            #expect(await proxy.stats().idleReclaims == 8)
+
+            // The slot the ninth request needed is now free.
+            let ninth = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            clients.append(ninth)
+            try await startAndReturnReadyWaiter(ninth).wait()
+            try await LoopbackProxy.send(request, to: ninth)
+            #expect(try await Self.collectBytes(from: ninth, atLeast: response.count) == response)
+            #expect(await opener.refusalCount() == 0)
+        }
+    }
+
+    @Test func aSlowResponseIsNotMistakenForAnIdleConnection() async throws {
+        // The reclaim must never fire while the journal is still working: a
+        // large ingest is silent on both halves for far longer than the
+        // deadline, and killing it would be a worse bug than the one this fixes.
+        let request = Data("POST /ingest HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
+        let opener = KeepAliveLoopbackOpener(limit: 8, response: response, responseDelay: .milliseconds(900))
+        try await Self.withLoopbackProxy(opener: opener, idleReclaimAfter: .milliseconds(200)) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            try await LoopbackProxy.send(request, to: client)
+            #expect(try await Self.collectBytes(from: client, atLeast: response.count) == response)
+            #expect(await proxy.stats().idleReclaims == 0)
+        }
+    }
+
+    @Test func aPeerStreamResetIsCountedRatherThanSwallowed() async throws {
+        // A door that refuses stream nine resets it; the proxy used to cancel
+        // the TCP connection and discard the reason, leaving the owner with an
+        // unexplained -1005 and us with no record at all.
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let opener = ResettingLoopbackOpener(reason: .streamLimitExceeded, rawByte: 0x03)
+        try await Self.withLoopbackProxy(opener: opener) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            try await LoopbackProxy.send(request, to: client)
+            #expect(await waitUntil("peer stream reset counted", timeout: .seconds(5)) {
+                await proxy.stats().streamResets == 1
+            })
+        }
+    }
+
     @Test func shortLivedConnectionChurnDoesNotRetainCompletedTasks() async throws {
         // Actor-owned task bookkeeping must stay bounded under short-lived connection churn.
         let churnCount = 200
@@ -432,9 +507,10 @@ struct LoopbackProxyTests {
 
     private static func withLoopbackProxy<T: Sendable>(
         opener: any MuxStreamOpening,
+        idleReclaimAfter: Duration = LoopbackProxy.defaultIdleReclaim,
         operation: (LoopbackProxy, UInt16) async throws -> T
     ) async throws -> T {
-        let proxy = LoopbackProxy(opener: opener)
+        let proxy = LoopbackProxy(opener: opener, idleReclaimAfter: idleReclaimAfter)
         do {
             let port = try await proxy.start()
             let result = try await operation(proxy, port)
@@ -465,6 +541,22 @@ struct LoopbackProxyTests {
         } onCancel: {
             connection.cancel()
         }
+    }
+
+    /// Reads until `atLeast` bytes have arrived. `collectResponse` waits for
+    /// EOF, which a keep-alive connection never sends.
+    private static func collectBytes(from connection: NWConnection, atLeast count: Int) async throws -> Data {
+        var collected = Data()
+        while collected.count < count {
+            let (chunk, isComplete) = try await LoopbackProxy.receive(from: connection)
+            if let chunk {
+                collected.append(chunk)
+            }
+            if isComplete || chunk == nil {
+                return collected
+            }
+        }
+        return collected
     }
 
     private static func collectResponse(from connection: NWConnection) async throws -> Data {
@@ -603,6 +695,103 @@ private actor CappedLoopbackOpener: MuxStreamOpening {
                 _ = await stream.deliverInboundData(response)
                 await stream.deliverInboundClose()
             }
+        }
+    }
+}
+
+/// A peer that answers each request and leaves the stream open, the way an
+/// HTTP keep-alive connection behind the journal door does.
+private actor KeepAliveLoopbackOpener: MuxStreamOpening {
+    private let limit: Int
+    private let response: Data
+    private let responseDelay: Duration
+    private var attempts = 0
+    private var refusals = 0
+    private var streams: [UInt32: MuxStream] = [:]
+    private var decoder = FrameDecoder()
+
+    init(limit: Int, response: Data, responseDelay: Duration = .zero) {
+        self.limit = limit
+        self.response = response
+        self.responseDelay = responseDelay
+    }
+
+    func openStream() async throws -> MuxStream {
+        attempts += 1
+        guard streams.count < limit else {
+            refusals += 1
+            throw LoopbackTestError()
+        }
+        let id = UInt32(attempts * 2 - 1)
+        let stream = MuxStream(
+            id: id,
+            sink: { bytes in try await self.acceptOutbound(bytes) },
+            onTerminal: { id in await self.removeStream(id) }
+        )
+        streams[id] = stream
+        return stream
+    }
+
+    func openCount() -> Int { attempts }
+    func refusalCount() -> Int { refusals }
+    func liveStreamCount() -> Int { streams.count }
+    private func removeStream(_ id: UInt32) { streams[id] = nil }
+
+    private func acceptOutbound(_ bytes: Data) async throws {
+        decoder.feed(bytes)
+        while let frame = try decoder.next() {
+            guard frame.flags == FrameFlags.data.rawValue, let stream = streams[frame.streamID] else {
+                continue
+            }
+            let payload = response
+            let delay = responseDelay
+            Task {
+                if delay > .zero {
+                    try? await Task.sleep(for: delay)
+                }
+                _ = await stream.deliverInboundData(payload)
+            }
+        }
+    }
+}
+
+/// A peer that refuses the request by resetting its stream, the way the door
+/// refuses stream nine with `StreamLimit`.
+private actor ResettingLoopbackOpener: MuxStreamOpening {
+    private let reason: ResetReason
+    private let rawByte: UInt8
+    private var streams: [UInt32: MuxStream] = [:]
+    private var decoder = FrameDecoder()
+    private var attempts = 0
+
+    init(reason: ResetReason, rawByte: UInt8) {
+        self.reason = reason
+        self.rawByte = rawByte
+    }
+
+    func openStream() async throws -> MuxStream {
+        attempts += 1
+        let id = UInt32(attempts * 2 - 1)
+        let stream = MuxStream(
+            id: id,
+            sink: { bytes in try await self.acceptOutbound(bytes) },
+            onTerminal: { id in await self.removeStream(id) }
+        )
+        streams[id] = stream
+        return stream
+    }
+
+    private func removeStream(_ id: UInt32) { streams[id] = nil }
+
+    private func acceptOutbound(_ bytes: Data) async throws {
+        decoder.feed(bytes)
+        while let frame = try decoder.next() {
+            guard frame.flags == FrameFlags.data.rawValue, let stream = streams[frame.streamID] else {
+                continue
+            }
+            let reason = self.reason
+            let rawByte = self.rawByte
+            Task { await stream.deliverInboundReset(reason: reason, rawByte: rawByte) }
         }
     }
 }
