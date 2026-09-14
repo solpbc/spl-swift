@@ -25,14 +25,44 @@ public struct LoopbackProxyStats: Sendable, Equatable {
     /// Idle keep-alive connections whose remote stream this proxy reclaimed.
     public var idleReclaims: Int
     /// Streams the peer reset, including its stream-limit refusal.
+    ///
+    /// Deliberately still counts every reason, so a consumer reading it keeps
+    /// the meaning it had before `streamLimitRefusals` existed. Use that field,
+    /// not this one, to tell a stream-limit refusal from a transport death.
     public var streamResets: Int
+    /// The subset of `streamResets` the peer attributed to its concurrent-stream
+    /// cap (`ResetReason.streamLimitExceeded`).
+    ///
+    /// This is the one refusal a well-behaved client provokes simply by holding
+    /// more concurrent streams than the peer admits. It is the case that must be
+    /// distinguishable from a genuine transport death, because both reach a
+    /// URLSession client as `NSURLErrorNetworkConnectionLost` (-1005).
+    public var streamLimitRefusals: Int
 
-    public init(streamOpenFailures: Int = 0, idleReclaims: Int = 0, streamResets: Int = 0) {
+    public init(
+        streamOpenFailures: Int = 0,
+        idleReclaims: Int = 0,
+        streamResets: Int = 0,
+        streamLimitRefusals: Int = 0
+    ) {
         self.streamOpenFailures = streamOpenFailures
         self.idleReclaims = idleReclaims
         self.streamResets = streamResets
+        self.streamLimitRefusals = streamLimitRefusals
     }
 }
+
+/// Notified when the peer resets one of this proxy's streams, with the wire
+/// reason it gave.
+///
+/// A counter alone cannot carry *when* — the proxy is rebuilt on every tunnel
+/// reconnect, so its tally starts over while the owner-visible problem does
+/// not. A consumer that needs a durable record observes here and writes one at
+/// the moment the refusal arrives.
+///
+/// Called synchronously from the connection's own stream pump as it tears down,
+/// so it must not block: hand the reason to a `Task` and return.
+public typealias PeerStreamResetObserver = @Sendable (ResetReason) -> Void
 
 final class LoopbackProxyCounters: @unchecked Sendable {
     // why: incremented from detached per-connection tasks, read from the actor.
@@ -40,7 +70,21 @@ final class LoopbackProxyCounters: @unchecked Sendable {
 
     func noteStreamOpenFailure() { state.withLock { $0.streamOpenFailures += 1 } }
     func noteIdleReclaim() { state.withLock { $0.idleReclaims += 1 } }
-    func noteStreamReset() { state.withLock { $0.streamResets += 1 } }
+
+    /// A peer reset carries its reason on the wire; record which one it was.
+    ///
+    /// `MuxError.streamLimitExceeded` is a *different* condition — this
+    /// multiplexer refusing its own local open — and is counted by
+    /// `noteStreamOpenFailure()`. Only a reset the peer sent lands here.
+    func noteStreamReset(reason: ResetReason) {
+        state.withLock {
+            $0.streamResets += 1
+            if reason == .streamLimitExceeded {
+                $0.streamLimitRefusals += 1
+            }
+        }
+    }
+
     func snapshot() -> LoopbackProxyStats { state.withLock { $0 } }
 }
 
@@ -98,12 +142,18 @@ public actor LoopbackProxy {
     private let opener: any MuxStreamOpening
     private let idleReclaimAfter: Duration
     private let counters = LoopbackProxyCounters()
+    private let onPeerStreamReset: PeerStreamResetObserver?
     private var listener: NWListener?
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
 
-    public init(opener: any MuxStreamOpening, idleReclaimAfter: Duration = LoopbackProxy.defaultIdleReclaim) {
+    public init(
+        opener: any MuxStreamOpening,
+        idleReclaimAfter: Duration = LoopbackProxy.defaultIdleReclaim,
+        onPeerStreamReset: PeerStreamResetObserver? = nil
+    ) {
         self.opener = opener
         self.idleReclaimAfter = idleReclaimAfter
+        self.onPeerStreamReset = onPeerStreamReset
     }
 
     /// Tunnel-side failures seen since this proxy was created.
@@ -175,13 +225,15 @@ public actor LoopbackProxy {
         let opener = self.opener
         let counters = self.counters
         let idleReclaimAfter = self.idleReclaimAfter
+        let onPeerStreamReset = self.onPeerStreamReset
         let id = UUID()
         let task = Task {
             await Self.handle(
                 connection: connection,
                 opener: opener,
                 counters: counters,
-                idleReclaimAfter: idleReclaimAfter
+                idleReclaimAfter: idleReclaimAfter,
+                onPeerStreamReset: onPeerStreamReset
             )
             self.removeConnectionTask(id)
         }
@@ -200,7 +252,8 @@ public actor LoopbackProxy {
         connection: NWConnection,
         opener: any MuxStreamOpening,
         counters: LoopbackProxyCounters,
-        idleReclaimAfter: Duration
+        idleReclaimAfter: Duration,
+        onPeerStreamReset: PeerStreamResetObserver?
     ) async {
         var bytesIn = 0
         var bytesOut = 0
@@ -254,7 +307,13 @@ public actor LoopbackProxy {
                 return LoopbackPumpStats(bytesIn: bytes, bytesOut: 0)
             }
             group.addTask {
-                let bytes = await pumpStream(stream, to: connection, idleGuard: idleGuard, counters: counters)
+                let bytes = await pumpStream(
+                    stream,
+                    to: connection,
+                    idleGuard: idleGuard,
+                    counters: counters,
+                    onPeerStreamReset: onPeerStreamReset
+                )
                 return LoopbackPumpStats(bytesIn: 0, bytesOut: bytes)
             }
 
@@ -337,7 +396,8 @@ public actor LoopbackProxy {
         _ stream: MuxStream,
         to connection: NWConnection,
         idleGuard: LoopbackIdleGuard,
-        counters: LoopbackProxyCounters
+        counters: LoopbackProxyCounters,
+        onPeerStreamReset: PeerStreamResetObserver?
     ) async -> Int {
         var bytes = 0
         do {
@@ -350,8 +410,11 @@ public actor LoopbackProxy {
         } catch {
             // The peer's reset reason is the only explanation the local client
             // will never see: it reaches URLSession as a bare connection close.
+            // Keep it — both the counter and the observer are how it survives
+            // past this log line, which no consumer reads.
             if let muxError = error as? MuxError, case .streamReset(let streamID, let reason, _) = muxError {
-                counters.noteStreamReset()
+                counters.noteStreamReset(reason: reason)
+                onPeerStreamReset?(reason)
                 logger.error(
                     "loopback stream reset by peer stream_id=\(streamID, privacy: .public) reason=\(String(describing: reason), privacy: .public)"
                 )

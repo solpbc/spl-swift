@@ -424,6 +424,95 @@ struct LoopbackProxyTests {
         }
     }
 
+    @Test(arguments: [
+        (ResetReason.streamLimitExceeded, UInt8(0x03), 1),
+        (ResetReason.internalError, UInt8(0x04), 0),
+        (ResetReason.cancel, UInt8(0x05), 0)
+    ])
+    func onlyAStreamLimitResetIsCountedAsARefusal(
+        reason: ResetReason,
+        rawByte: UInt8,
+        expectedRefusals: Int
+    ) async throws {
+        // The whole point of the field failure: a stream-limit refusal and any
+        // other way a stream dies both reach the local client as -1005. Same
+        // harness, same request, only the wire reason differs -- so a consumer
+        // reading streamLimitRefusals can tell them apart, and one reading the
+        // deliberately reason-blind streamResets cannot.
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let opener = ResettingLoopbackOpener(reason: reason, rawByte: rawByte)
+        try await Self.withLoopbackProxy(opener: opener) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            try await LoopbackProxy.send(request, to: client)
+            #expect(await waitUntil("peer stream reset counted", timeout: .seconds(5)) {
+                await proxy.stats().streamResets == 1
+            })
+            #expect(await proxy.stats().streamLimitRefusals == expectedRefusals)
+        }
+    }
+
+    @Test func theRefusalObserverReceivesTheWireReason() async throws {
+        // A counter cannot carry when: the proxy is rebuilt on every tunnel
+        // reconnect, so its tally starts over while the owner's problem does
+        // not. The observer is how a consumer writes a durable record at the
+        // moment the refusal arrives.
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let opener = ResettingLoopbackOpener(reason: .streamLimitExceeded, rawByte: 0x03)
+        let observed = OSAllocatedUnfairLock(initialState: [ResetReason]())
+        try await Self.withLoopbackProxy(
+            opener: opener,
+            onPeerStreamReset: { reason in observed.withLock { $0.append(reason) } }
+        ) { _, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            try await LoopbackProxy.send(request, to: client)
+            #expect(await waitUntil("refusal observer fired", timeout: .seconds(5)) {
+                observed.withLock { $0 == [.streamLimitExceeded] }
+            })
+        }
+    }
+
+    @Test func aHealthyRoundTripReportsNoRefusalAtAll() async throws {
+        // The negative control the contrast needs: a request that succeeds must
+        // leave every refusal instrument at zero, or a nonzero reading proves
+        // nothing.
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
+        let opener = InMemoryLoopbackOpener(response: response)
+        let observed = OSAllocatedUnfairLock(initialState: [ResetReason]())
+        try await Self.withLoopbackProxy(
+            opener: opener,
+            onPeerStreamReset: { reason in observed.withLock { $0.append(reason) } }
+        ) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            let responseBox = AsyncResultBox<Data>()
+            let receiver = Task {
+                let data = try? await Self.collectResponse(from: client)
+                await responseBox.store(data ?? Data())
+            }
+            try await Self.sendFinal(request, to: client)
+            let didReceiveResponse = await waitUntil("loopback client received response") {
+                await responseBox.snapshot() != nil
+            }
+            #expect(didReceiveResponse)
+            #expect(await responseBox.snapshot() == response)
+            receiver.cancel()
+            let stats = await proxy.stats()
+            #expect(stats.streamLimitRefusals == 0)
+            #expect(stats.streamResets == 0)
+            #expect(stats.streamOpenFailures == 0)
+            #expect(observed.withLock { $0.isEmpty })
+        }
+    }
+
     @Test func shortLivedConnectionChurnDoesNotRetainCompletedTasks() async throws {
         // Actor-owned task bookkeeping must stay bounded under short-lived connection churn.
         let churnCount = 200
@@ -508,9 +597,14 @@ struct LoopbackProxyTests {
     private static func withLoopbackProxy<T: Sendable>(
         opener: any MuxStreamOpening,
         idleReclaimAfter: Duration = LoopbackProxy.defaultIdleReclaim,
+        onPeerStreamReset: PeerStreamResetObserver? = nil,
         operation: (LoopbackProxy, UInt16) async throws -> T
     ) async throws -> T {
-        let proxy = LoopbackProxy(opener: opener, idleReclaimAfter: idleReclaimAfter)
+        let proxy = LoopbackProxy(
+            opener: opener,
+            idleReclaimAfter: idleReclaimAfter,
+            onPeerStreamReset: onPeerStreamReset
+        )
         do {
             let port = try await proxy.start()
             let result = try await operation(proxy, port)
