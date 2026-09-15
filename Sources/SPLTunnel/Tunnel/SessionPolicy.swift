@@ -6,16 +6,24 @@ import Foundation
 public struct KeepalivePolicy: Sendable, Equatable {
     public let interval: Duration
     public let missedLimit: Int
+    /// Longest the mux keeps pinging past `missedLimit` while the peer is still
+    /// touching application streams, before a late PONG counts as a lost path.
+    public let deferralLimit: Duration
     public let runsOnRelayPath: Bool
 
     public init(
         interval: Duration = .milliseconds(500),
         missedLimit: Int = 3,
+        // why: a PING behind a full send buffer is late by the buffer's drain time
+        // during a bulk upload; 30 s sits under the deployed HTTP probe watchdog's
+        // forced reconnect, so a wedged path is still caught by the outer layer.
+        deferralLimit: Duration = .seconds(30),
         // why: proto/framing.md:163-169 defines keepalive cadence as direct-mode dialer policy.
         runsOnRelayPath: Bool = false
     ) {
         self.interval = interval
         self.missedLimit = missedLimit
+        self.deferralLimit = deferralLimit
         self.runsOnRelayPath = runsOnRelayPath
     }
 }

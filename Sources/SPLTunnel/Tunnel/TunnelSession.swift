@@ -339,7 +339,8 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening, TunnelAttemptObs
             }
             await mux.startKeepalive(
                 interval: policy.keepalive.interval,
-                missedLimit: policy.keepalive.missedLimit
+                missedLimit: policy.keepalive.missedLimit,
+                deferralLimit: policy.keepalive.deferralLimit
             )
         }
         // Let already-ended pump/loss tasks run and latch against this install epoch

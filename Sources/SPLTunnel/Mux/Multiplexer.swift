@@ -74,6 +74,9 @@ public actor Multiplexer {
     private var outstandingPings: [OutstandingPing] = []
     private var keepaliveTickIndex: UInt64 = 0
     private var inboundActivityCounter: UInt64 = 0
+    /// Keepalive tick index current when the newest application-stream frame
+    /// arrived. `nil` until the first one after `startKeepalive`.
+    private var streamInboundTick: UInt64?
     private var lastMatchedPongAt: ContinuousClock.Instant?
     private var keepaliveStartedAt: ContinuousClock.Instant?
 
@@ -149,7 +152,8 @@ public actor Multiplexer {
 
     public func startKeepalive(
         interval: Duration = .milliseconds(500),
-        missedLimit: Int = 3
+        missedLimit: Int = 3,
+        deferralLimit: Duration = .seconds(30)
     ) {
         guard keepaliveTask == nil else {
             return
@@ -157,10 +161,11 @@ public actor Multiplexer {
 
         outstandingPings.removeAll(keepingCapacity: true)
         keepaliveTickIndex = 0
+        streamInboundTick = nil
         lastMatchedPongAt = nil
         keepaliveStartedAt = now()
         keepaliveTask = Task {
-            await runKeepalive(interval: interval, missedLimit: missedLimit)
+            await runKeepalive(interval: interval, missedLimit: missedLimit, deferralLimit: deferralLimit)
         }
     }
 
@@ -210,6 +215,12 @@ public actor Multiplexer {
             try await handleControlFrame(frame, isPing: isPing, isPong: isPong)
             return
         }
+
+        // A frame on an application stream is the peer reading or writing our
+        // streams right now. The keepalive uses it to tell a PONG that is late
+        // behind a full send buffer from a path that has gone dark: a dark path
+        // sends nothing at all, control frames included.
+        streamInboundTick = keepaliveTickIndex
 
         let stream = streams[frame.streamID]
 
@@ -397,14 +408,15 @@ public actor Multiplexer {
         streams.removeValue(forKey: id)
     }
 
-    private func runKeepalive(interval: Duration, missedLimit: Int) async {
+    private func runKeepalive(interval: Duration, missedLimit: Int, deferralLimit: Duration) async {
         while !Task.isCancelled {
             do {
                 try await sleeper(interval)
                 let tick = keepaliveTickIndex
                 try await performKeepaliveTick(
                     currentTick: tick,
-                    missedLimit: missedLimit
+                    missedLimit: missedLimit,
+                    deferralLimit: deferralLimit
                 )
                 keepaliveTickIndex = tick &+ 1
             } catch {
@@ -422,7 +434,8 @@ public actor Multiplexer {
 
     private func performKeepaliveTick(
         currentTick: UInt64,
-        missedLimit: Int
+        missedLimit: Int,
+        deferralLimit: Duration
     ) async throws {
         guard !tornDown else {
             throw MuxError.transportClosed
@@ -433,12 +446,28 @@ public actor Multiplexer {
         if currentTick >= missedLimitTicks,
            let oldest = outstandingPings.first,
            oldest.issuedTick <= currentTick - missedLimitTicks {
-            // Missed PONGs are session policy: signal and let the session decide whether to tear down.
-            logger.notice("mux keepalive lost missed_pings=\(effectiveMissedLimit, privacy: .public)")
-            await emitKeepaliveLost(reason: .missedPingLimit, missedPingCount: effectiveMissedLimit)
-            keepaliveTask?.cancel()
-            keepaliveTask = nil
-            return
+            // The scheduler puts a PING ahead of queued DATA, but not ahead of
+            // DATA the transport has already buffered below it, so during a bulk
+            // upload the PING reaches the peer only after those bytes do and its
+            // PONG is late by the buffer's drain time. If the peer has touched an
+            // application stream within the same window (a WINDOW grant, a
+            // response) the path is demonstrably alive; keep pinging and let the
+            // wall-clock cap decide when late becomes lost. A dark path sends
+            // nothing at all and still fails at the missed limit.
+            let sinceLastPong = pongOrigin().duration(to: now())
+            let streamRecentlyActive = streamInboundTick.map { $0 + missedLimitTicks > currentTick } ?? false
+            if streamRecentlyActive && sinceLastPong < deferralLimit {
+                logger.notice(
+                    "mux keepalive deferred missed_pings=\(effectiveMissedLimit, privacy: .public) since_pong_ms=\(Self.milliseconds(sinceLastPong), privacy: .public)"
+                )
+            } else {
+                // Missed PONGs are session policy: signal and let the session decide whether to tear down.
+                logger.notice("mux keepalive lost missed_pings=\(effectiveMissedLimit, privacy: .public)")
+                await emitKeepaliveLost(reason: .missedPingLimit, missedPingCount: effectiveMissedLimit)
+                keepaliveTask?.cancel()
+                keepaliveTask = nil
+                return
+            }
         }
 
         let nonce = try randomNonce()
@@ -450,12 +479,20 @@ public actor Multiplexer {
         try await scheduler.send(frame, priority: .control)
     }
 
+    private func pongOrigin() -> ContinuousClock.Instant {
+        lastMatchedPongAt ?? keepaliveStartedAt ?? now()
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Int64 {
+        let components = duration.components
+        return components.seconds * 1_000 + components.attoseconds / 1_000_000_000_000_000
+    }
+
     private func emitKeepaliveLost(reason: KeepaliveLossEvent.Reason, missedPingCount: Int) async {
-        let origin = lastMatchedPongAt ?? keepaliveStartedAt ?? now()
         let event = KeepaliveLossEvent(
             reason: reason,
             missedPingCount: missedPingCount,
-            elapsedSinceLastPong: origin.duration(to: now()),
+            elapsedSinceLastPong: pongOrigin().duration(to: now()),
             outboundInFlight: await scheduler.dataInFlightOrQueued()
         )
         keepaliveLostContinuation.yield(event)

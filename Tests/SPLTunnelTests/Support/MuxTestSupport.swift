@@ -269,6 +269,20 @@ actor KeepaliveTickGate {
         }
     }
 
+    /// Bounded form for a test that expects the keepalive to keep ticking: returns `false`
+    /// at the deadline instead of parking a continuation forever when the keepalive has
+    /// already stopped. Polls rather than racing continuations so nothing is left dangling.
+    func waitForObservedTick(count: Int, within timeout: Duration) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while observedTicks < count {
+            if ContinuousClock.now >= deadline {
+                return false
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return true
+    }
+
     func releaseOne() {
         guard !waitingTickContinuations.isEmpty else {
             return

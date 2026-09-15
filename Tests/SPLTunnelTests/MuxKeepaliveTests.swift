@@ -35,6 +35,116 @@ struct MuxKeepaliveTests {
         await gate.cancelAll()
     }
 
+    @Test func streamActivityDefersLossWhilePongsAreLateThenDarkPathStillFails() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveTickGate()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) }
+        )
+        let stream = try await mux.openStream()
+        await recorder.reset()
+        // One consumer for the whole test: probing the stream early and cancelling
+        // the probe finishes the AsyncStream before the real loss is yielded.
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost, timeout: .seconds(5)) }
+
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 3)
+        // A bulk upload: the peer keeps granting WINDOW, our PING sits behind the
+        // buffered DATA, and no PONG arrives for six ticks. Twice the missed limit
+        // passes; a loss here would stop the pings at three.
+        for tick in 1...6 {
+            await gate.waitForObservedTick(count: tick)
+            try await mux.feedInbound(try encodeFrame(buildWindow(streamID: stream.id, credit: 1)))
+            await gate.releaseOne()
+            try await expectTick(gate, count: tick + 1)
+            #expect(try await pingFrames(in: recorder).count == tick)
+        }
+
+        // The late PONG for the newest ping clears the whole backlog.
+        let ping = try #require(try await pingFrames(in: recorder).last)
+        try await mux.feedInbound(try encodeFrame(buildPong(nonce: try parseControlNonce(from: ping.payload))))
+
+        // Then the path goes dark: no stream frames, no PONGs. The stale grants
+        // from the upload must not carry the deferral, so the loss lands at the
+        // ordinary point, three unanswered pings after the last PONG. Nine pings
+        // at the loss is the proof of both halves: a loss during the upload would
+        // have stopped them at three, a backlog that did not clear at six.
+        for tick in 7...9 {
+            await gate.releaseOne()
+            try await expectTick(gate, count: tick + 1)
+            #expect(try await pingFrames(in: recorder).count == tick)
+        }
+        await gate.releaseOne()
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(try await pingFrames(in: recorder).count == 9)
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
+    @Test func staleStreamActivityDoesNotDeferLoss() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveTickGate()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) }
+        )
+        let stream = try await mux.openStream()
+        await recorder.reset()
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost) }
+
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 3)
+        // One WINDOW grant before the first ping, then silence.
+        await gate.waitForObservedTick(count: 1)
+        try await mux.feedInbound(try encodeFrame(buildWindow(streamID: stream.id, credit: 1)))
+        for tick in 1...3 {
+            await gate.releaseOne()
+            await gate.waitForObservedTick(count: tick + 1)
+            #expect(try await pingFrames(in: recorder).count == tick)
+        }
+        await gate.releaseOne()
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(try await pingFrames(in: recorder).count == 3)
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
+    @Test func streamActivityCannotDeferLossPastTheDeferralLimit() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveTickGate()
+        let clock = MuxInstantBox()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) },
+            now: { clock.get() }
+        )
+        let stream = try await mux.openStream()
+        await recorder.reset()
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost) }
+
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 3, deferralLimit: .seconds(3))
+        // WINDOW every tick and never a PONG: ticks 4 and 5 defer (2.0 s, 2.5 s
+        // since the keepalive started), tick 6 reaches the cap.
+        for tick in 1...5 {
+            await gate.waitForObservedTick(count: tick)
+            try await mux.feedInbound(try encodeFrame(buildWindow(streamID: stream.id, credit: 1)))
+            clock.advance(.milliseconds(500))
+            await gate.releaseOne()
+            await gate.waitForObservedTick(count: tick + 1)
+            #expect(try await pingFrames(in: recorder).count == tick)
+        }
+        try await mux.feedInbound(try encodeFrame(buildWindow(streamID: stream.id, credit: 1)))
+        clock.advance(.milliseconds(500))
+        await gate.releaseOne()
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(event.elapsedSinceLastPong == .seconds(3))
+        #expect(try await pingFrames(in: recorder).count == 5)
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
     @Test func deadPathEmitsExactlyOneLossAfterThreeUnansweredPings() async throws {
         let recorder = MuxFrameRecorder()
         let gate = KeepaliveTickGate()
@@ -423,6 +533,15 @@ struct MuxKeepaliveTests {
         for write in writes {
             write.cancel()
             _ = await write.result
+        }
+    }
+
+    /// Wait for the keepalive to reach `count` observed ticks, failing instead of hanging if
+    /// the keepalive stopped early: a loss cancels the task, and a test that expects no loss
+    /// would otherwise wait forever for a tick that never comes.
+    private func expectTick(_ gate: KeepaliveTickGate, count: Int, within timeout: Duration = .seconds(2)) async throws {
+        guard await gate.waitForObservedTick(count: count, within: timeout) else {
+            throw MuxTestError.timedOut("keepalive tick \(count) never observed; the keepalive stopped early")
         }
     }
 
