@@ -244,7 +244,8 @@ struct LoopbackProxyTests {
     }
 
     @Test func idlePreconnectionsDoNotConsumeRemoteStreamCapacity() async throws {
-        // Real TCP preconnections must not consume the Journal door's eight stream slots.
+        // This capped opener is an eight-slot test fixture, not the current
+        // Journal policy. Real TCP preconnections must not consume its slots.
         let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
         let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
         let opener = CappedLoopbackOpener(limit: 8, response: response)
@@ -352,9 +353,9 @@ struct LoopbackProxyTests {
     @Test func idleKeepAliveConnectionsReleaseTheirRemoteStreamSlot() async throws {
         // A keep-alive TCP connection holds its remote stream for the whole life
         // of that connection, and the door frees a stream slot only when both
-        // halves close. Eight idle persistent connections therefore pinned all
-        // eight door slots for the life of the process, and the ninth request
-        // reached the local client as a bare connection close.
+        // halves close. In this eight-slot fixture, eight idle persistent
+        // connections therefore pin the full cap until reclamation; this
+        // fixture does not declare the current Journal policy.
         let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
         let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
         let opener = KeepAliveLoopbackOpener(limit: 8, response: response)

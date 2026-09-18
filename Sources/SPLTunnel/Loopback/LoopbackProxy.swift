@@ -329,7 +329,7 @@ public actor LoopbackProxy {
     ///
     /// The door frees a slot only when both halves of a stream close, and
     /// nothing in the path times a stream out, so without this an idle
-    /// keep-alive connection holds one of eight slots until the process exits.
+    /// keep-alive connection holds one finite peer slot until the process exits.
     /// HTTP/1.1 expects a persistent connection to be closable while idle;
     /// clients re-open transparently.
     private nonisolated static func reclaimWhenIdle(
