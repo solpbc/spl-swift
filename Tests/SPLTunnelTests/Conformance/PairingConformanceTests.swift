@@ -11,10 +11,9 @@ private let pairingConformanceRelayHost = "pairing-conformance-relay.test"
 @Suite("PairingConformance", .serialized)
 struct PairingConformanceTests {
     @Test func directPairAdmitsPublicIPv4CandidatesIntact() async throws {
-        // No LAN-only restriction: a public IPv4 is as valid a direct-pairing
-        // candidate as a private one — the trust anchor is the embedded
-        // CA-fingerprint pin, not network locality (removed 2026-09-18,
-        // founder + CSO ruling, req_xhwmvxvn).
+        // proto/pairing.md:117 admits every IPv4 candidate outside 0.0.0.0/8 and
+        // 224.0.0.0/3, public unicast included: the trust anchor is the embedded
+        // CA-fingerprint pin, not network locality.
         let fixture = try TestCA.make()
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.0.2.10", port: 7657),
@@ -36,10 +35,8 @@ struct PairingConformanceTests {
     }
 
     @Test func directPairRejectsMulticastCandidateBeforeDial() async throws {
-        // The only literals that are never a valid direct-pairing dial
-        // target: the unspecified network and multicast/reserved. Public
-        // unicast is not one of them (removed 2026-09-18, founder + CSO
-        // ruling, req_xhwmvxvn).
+        // proto/pairing.md:117 refuses only the unspecified network 0.0.0.0/8 and
+        // multicast-or-reserved 224.0.0.0/3 before dialing.
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "224.0.0.1", port: 7657),
         ])
@@ -58,9 +55,8 @@ struct PairingConformanceTests {
     }
 
     @Test func directPairAdmitsMixedPrivateLinkLocalAndPublicCandidates() async throws {
-        // No LAN-only restriction: the whole candidate set admits regardless
-        // of which candidates are private, link-local, or public (removed
-        // 2026-09-18, founder + CSO ruling, req_xhwmvxvn).
+        // proto/pairing.md:117 admits a 0x05 set mixing private, link-local, and
+        // public candidates; :96 begins at most one nonce-bearing request.
         let fixture = try TestCA.make()
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
@@ -127,7 +123,7 @@ struct PairingConformanceTests {
     }
 
     @Test func directPairRFC1918AndCGNATMultiAdmitsIntact() async throws {
-        // proto/pairing.md:117 admits 0x05 sets only when all candidates satisfy the direct allow-list.
+        // proto/pairing.md:117 admits 0x05 sets only when all candidates satisfy address admission.
         // proto/pairing.md:96 allows at most one nonce-bearing request; :147-157 define the request shape.
         let fixture = try TestCA.make()
         let pairURL = try Self.directPairURL(candidates: [
@@ -150,9 +146,9 @@ struct PairingConformanceTests {
     }
 
     @Test func directPairCGNATWithPublicAdmitsWholeSetRegardlessOfOrder() async throws {
-        // No LAN-only restriction: a CGNAT/public mix admits regardless of
-        // candidate order (removed 2026-09-18, founder + CSO ruling,
-        // req_xhwmvxvn). directPairCGNATOnlyV04BeginsOneRequestToEncodedEndpoint
+        // proto/pairing.md:117 admits a CGNAT/public mix regardless of candidate
+        // order; :96 coalesces exact duplicates and begins at most one
+        // nonce-bearing request. directPairCGNATOnlyV04BeginsOneRequestToEncodedEndpoint
         // and directPairRFC1918AndCGNATMultiAdmitsIntact are the sibling
         // admission controls this mirrors.
         let cases = [
