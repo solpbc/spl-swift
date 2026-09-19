@@ -116,8 +116,13 @@ struct TunnelAddressClassifierTests {
         }
     }
 
-    @Test func localNetworkAddressCompositeCoversPairingLocalRanges() {
-        // proto/pairing.md:117 direct candidate refusal accepts the explicit local/shared allow-list and rejects non-local literals.
+    @Test func validDirectDialAddressCoversPrivateCgnatLoopbackAndPublicIpv4() {
+        // No LAN-only restriction: a direct pair link's trust anchor is the
+        // embedded CA-fingerprint pin, not network locality (removed
+        // 2026-09-18, founder + CSO ruling, req_xhwmvxvn). The direct
+        // pair-link wire forms are IPv4-only, so an IPv6 literal is not a
+        // valid dial target here regardless (it is simply not what the
+        // wire form ever carries) — unrelated to the removed restriction.
         let cases: [(host: String, expected: Bool)] = [
             ("10.2.3.4", true),
             ("172.16.0.1", true),
@@ -125,24 +130,29 @@ struct TunnelAddressClassifierTests {
             ("100.64.0.1", true),
             ("127.0.0.1", true),
             ("169.254.1.10", true),
-            ("fd12:3456::1", true),
-            ("[fd00::1]", true),
-            ("192.0.2.10", false),
-            ("198.51.100.20", false),
-            ("100.128.0.0", false),
+            ("192.0.2.10", true),
+            ("198.51.100.20", true),
+            ("100.128.0.0", true),
+            ("8.8.8.8", true),
+            ("0.0.0.0", false),
+            ("0.255.255.255", false),
+            ("224.0.0.1", false),
+            ("255.255.255.255", false),
+            ("fd12:3456::1", false),
+            ("[fd00::1]", false),
             ("fe80::1", false),
             ("home.local", false),
         ]
 
         for testCase in cases {
             #expect(
-                TunnelAddressClassifier.isLocalNetworkAddressLiteral(testCase.host) == testCase.expected,
+                TunnelAddressClassifier.isValidDirectDialAddressLiteral(testCase.host) == testCase.expected,
                 "host \(testCase.host)"
             )
         }
     }
 
-    @Test func malformedIPv4LiteralsAreNotLocalNetworkAddresses() {
+    @Test func malformedIPv4LiteralsAreNeverValidDirectDialAddresses() {
         let cases = [
             "10.0.0.1.",
             "10..0.0.1",
@@ -153,7 +163,7 @@ struct TunnelAddressClassifierTests {
 
         for host in cases {
             #expect(
-                TunnelAddressClassifier.isLocalNetworkAddressLiteral(host) == false,
+                TunnelAddressClassifier.isValidDirectDialAddressLiteral(host) == false,
                 "host \(host)"
             )
         }

@@ -10,11 +10,38 @@ private let pairingConformanceRelayHost = "pairing-conformance-relay.test"
 
 @Suite("PairingConformance", .serialized)
 struct PairingConformanceTests {
-    @Test func directPairRejectsNonLocalIPv4CandidateBeforeDial() async throws {
-        // proto/pairing.md:117 direct candidates outside the explicit allow-list are refused before dial.
+    @Test func directPairAdmitsPublicIPv4CandidatesIntact() async throws {
+        // No LAN-only restriction: a public IPv4 is as valid a direct-pairing
+        // candidate as a private one — the trust anchor is the embedded
+        // CA-fingerprint pin, not network locality (removed 2026-09-18,
+        // founder + CSO ruling, req_xhwmvxvn).
+        let fixture = try TestCA.make()
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.0.2.10", port: 7657),
             PairCandidate(address: "192.0.2.20", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: try Self.pairResponseData(bundle: fixture)),
+        ])
+        let client = Self.client(transport: transport)
+
+        _ = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
+
+        #expect(await transport.prepares.map(\.host) == ["192.0.2.10"])
+        #expect(await transport.requestCount == 1)
+    }
+
+    @Test func directPairRejectsMulticastCandidateBeforeDial() async throws {
+        // The only literals that are never a valid direct-pairing dial
+        // target: the unspecified network and multicast/reserved. Public
+        // unicast is not one of them (removed 2026-09-18, founder + CSO
+        // ruling, req_xhwmvxvn).
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "224.0.0.1", port: 7657),
         ])
         let transport = FakeLANPairTransport(outcomes: [])
         let client = Self.client(transport: transport)
@@ -30,25 +57,29 @@ struct PairingConformanceTests {
         #expect(await transport.requests.isEmpty)
     }
 
-    @Test func directPairRejectsMixedLocalAndNonLocalCandidatesBeforeDial() async throws {
-        // proto/pairing.md:117 the direct allow-list applies to the whole candidate set, not only the first candidate.
+    @Test func directPairAdmitsMixedPrivateLinkLocalAndPublicCandidates() async throws {
+        // No LAN-only restriction: the whole candidate set admits regardless
+        // of which candidates are private, link-local, or public (removed
+        // 2026-09-18, founder + CSO ruling, req_xhwmvxvn).
+        let fixture = try TestCA.make()
         let pairURL = try Self.directPairURL(candidates: [
             PairCandidate(address: "192.168.0.10", port: 7657),
             PairCandidate(address: "192.0.2.20", port: 7657),
             PairCandidate(address: "169.254.0.30", port: 7657),
         ])
-        let transport = FakeLANPairTransport(outcomes: [])
+        let transport = FakeLANPairTransport(outcomes: [
+            .response(status: 200, body: try Self.pairResponseData(bundle: fixture)),
+        ])
         let client = Self.client(transport: transport)
 
-        await Self.expectDirectAddressNotLocal {
-            _ = try await client.pair(
-                pairURL: pairURL,
-                deviceLabel: "test phone",
-                relayEndpoint: Self.relayEndpoint
-            )
-        }
+        _ = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
 
-        #expect(await transport.requests.isEmpty)
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requestCount == 1)
     }
 
     @Test func directPairAcceptsAllLocalCandidatesAndDialsNormally() async throws {
@@ -118,11 +149,12 @@ struct PairingConformanceTests {
         #expect(await transport.requestCount == 1)
     }
 
-    @Test func directPairCGNATWithPublicRefusesWholeSetBeforeMaterialPrepareOrWrite() async throws {
-        // proto/pairing.md:117 refuses the whole 0x05 link unless all candidates satisfy the direct allow-list.
-        // This is not independently red on pre-RFC6598 code because CGNAT was also refused there.
-        // directPairCGNATOnlyV04BeginsOneRequestToEncodedEndpoint and
-        // directPairRFC1918AndCGNATMultiAdmitsIntact are the red pre-fix admission controls.
+    @Test func directPairCGNATWithPublicAdmitsWholeSetRegardlessOfOrder() async throws {
+        // No LAN-only restriction: a CGNAT/public mix admits regardless of
+        // candidate order (removed 2026-09-18, founder + CSO ruling,
+        // req_xhwmvxvn). directPairCGNATOnlyV04BeginsOneRequestToEncodedEndpoint
+        // and directPairRFC1918AndCGNATMultiAdmitsIntact are the sibling
+        // admission controls this mirrors.
         let cases = [
             [
                 PairCandidate(address: "100.64.0.5", port: 7657),
@@ -146,8 +178,11 @@ struct PairingConformanceTests {
 
         for candidates in cases {
             let material = PairingMaterialSpy()
+            let fixture = try TestCA.make()
             let pairURL = try Self.directPairURL(candidates: candidates)
-            let transport = FakeLANPairTransport(outcomes: [])
+            let transport = FakeLANPairTransport(outcomes: [
+                .response(status: 200, body: try Self.pairResponseData(bundle: fixture)),
+            ])
             let client = PairClient(
                 session: makeHTTPStubSession(host: pairingConformanceRelayHost) { _ in
                     .http(status: 503, data: Data())
@@ -157,17 +192,15 @@ struct PairingConformanceTests {
                 materialGenerator: material.generate
             )
 
-            await Self.expectDirectAddressNotLocal {
-                _ = try await client.pair(
-                    pairURL: pairURL,
-                    deviceLabel: "test phone",
-                    relayEndpoint: Self.relayEndpoint
-                )
-            }
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
 
-            #expect(material.generationCount == 0)
-            #expect(await transport.prepares.isEmpty)
-            #expect(await transport.requests.isEmpty)
+            #expect(material.generationCount == 1)
+            #expect(await transport.prepares.map(\.host) == [candidates[0].address])
+            #expect(await transport.requestCount == 1)
         }
     }
 

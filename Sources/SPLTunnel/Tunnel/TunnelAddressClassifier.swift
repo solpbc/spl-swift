@@ -53,12 +53,22 @@ enum TunnelAddressClassifier {
         return octets[0] == 169 && octets[1] == 254
     }
 
-    static func isLocalNetworkAddressLiteral(_ host: String) -> Bool {
-        isRFC1918IPv4Literal(host) ||
-            isRFC6598IPv4Literal(host) ||
-            isIPv4LoopbackLiteral(host) ||
-            isIPv4LinkLocalLiteral(host) ||
-            isIPv6ULA(host)
+    /// Whether an address literal is a valid direct-pairing dial target.
+    ///
+    /// No LAN-only restriction: a direct pair link's trust anchor is the
+    /// embedded CA-fingerprint pin, checked at TLS handshake time, not the
+    /// network locality of the address it dials. Restricting direct-pairing
+    /// candidates to RFC1918/CGNAT/loopback/link-local ranges added no real
+    /// security value and was a historical artifact. Removed 2026-09-18
+    /// (founder + CSO ruling, req_xhwmvxvn). The direct pair-link wire forms
+    /// (`0x04`/`0x05`) carry IPv4 only; the only literals that are never a
+    /// valid dial target are the unspecified network (0.0.0.0/8) and
+    /// multicast/reserved (224-255).
+    static func isValidDirectDialAddressLiteral(_ host: String) -> Bool {
+        guard let octets = ipv4Octets(host) else {
+            return false
+        }
+        return octets[0] != 0 && octets[0] < 224
     }
 
     private static func ipv4Octets(_ host: String) -> [Int]? {

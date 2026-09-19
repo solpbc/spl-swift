@@ -116,8 +116,14 @@ public struct PairClient: Sendable {
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
     ) async throws -> StoredPairing {
         let acceptanceStart = ProcessInfo.processInfo.systemUptime
-        guard pairURL.candidates.allSatisfy({ TunnelAddressClassifier.isLocalNetworkAddressLiteral($0.address) }) else {
-            pairLog.notice("direct pair candidates rejected reason=\("non_local_candidate", privacy: .public) count=\(pairURL.candidates.count, privacy: .public)")
+        // No LAN-only restriction — a public IPv4 is as valid a direct
+        // pairing candidate as a private one (removed 2026-09-18, founder +
+        // CSO ruling, req_xhwmvxvn). `.directAddressNotLocal` is kept as the
+        // error case (cross-repo consumer in solstone-swift's
+        // PairFailureReason) but now only fires for a genuinely invalid
+        // literal (unspecified network, multicast/reserved, malformed).
+        guard pairURL.candidates.allSatisfy({ TunnelAddressClassifier.isValidDirectDialAddressLiteral($0.address) }) else {
+            pairLog.notice("direct pair candidates rejected reason=\("invalid_candidate", privacy: .public) count=\(pairURL.candidates.count, privacy: .public)")
             throw PairError.directAddressNotLocal
         }
         let canonical = Self.coalesceCandidates(pairURL.candidates)
