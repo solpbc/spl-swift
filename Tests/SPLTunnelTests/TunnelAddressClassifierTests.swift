@@ -117,12 +117,12 @@ struct TunnelAddressClassifierTests {
     }
 
     @Test func validDirectDialAddressCoversPrivateCgnatLoopbackAndPublicIpv4() {
-        // No LAN-only restriction: a direct pair link's trust anchor is the
-        // embedded CA-fingerprint pin, not network locality (removed
-        // 2026-09-18, founder + CSO ruling, req_xhwmvxvn). The direct
-        // pair-link wire forms are IPv4-only, so an IPv6 literal is not a
-        // valid dial target here regardless (it is simply not what the
-        // wire form ever carries) — unrelated to the removed restriction.
+        // proto/pairing.md:117: the private/LAN-only address restriction was
+        // removed 2026-09-18; the trust anchor is the CA-fingerprint pin, not
+        // network locality. Only 0.0.0.0/8, 224.0.0.0/3 and malformed
+        // literals are refused. The direct pair-link wire forms are
+        // IPv4-only, so an IPv6 literal is not a valid dial target here
+        // regardless — unrelated to the removed restriction.
         let cases: [(host: String, expected: Bool)] = [
             ("10.2.3.4", true),
             ("172.16.0.1", true),

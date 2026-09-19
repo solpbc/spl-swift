@@ -116,9 +116,10 @@ public struct PairClient: Sendable {
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
     ) async throws -> StoredPairing {
         let acceptanceStart = ProcessInfo.processInfo.systemUptime
-        // No LAN-only restriction — a public IPv4 is as valid a direct
-        // pairing candidate as a private one (removed 2026-09-18, founder +
-        // CSO ruling, req_xhwmvxvn). `.directAddressNotLocal` is kept as the
+        // The private/LAN-only address restriction was removed 2026-09-18
+        // (proto/pairing.md:117): the trust anchor is the CA-fingerprint pin,
+        // not network locality, so a public IPv4 is as valid a direct pairing
+        // candidate as a private one. `.directAddressNotLocal` is kept as the
         // error case (cross-repo consumer in solstone-swift's
         // PairFailureReason) but now only fires for a genuinely invalid
         // literal (unspecified network, multicast/reserved, malformed).
