@@ -386,14 +386,37 @@ struct TunnelSessionTests {
     @Test func inboundEndDuringDirectInstallThrowsInboundClosedWithoutDurableConnected() async throws {
         let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: 443, scope: "local")
         let tls = FakeTunnelTLS()
+        let gate = KeepaliveTickGate()
+        let latched = TestSignal()
         let connector = ConnectorProbe { _, _, _ in
             await tls.finishInbound()
             return tls
         }
+        // The pump ends during install, and whether `.connected` is published
+        // first is otherwise decided by whether one `Task.yield()` beats it.
+        // Hold the install window until the failure has latched, and gate the
+        // keepalive's clock so its own 20 ms loss cannot latch first and make
+        // this a test about the wrong error.
         let session = TunnelSession(
             pairing: fakePairing(),
             policy: fastKeepalivePolicy(runsOnRelayPath: false),
-            tlsConnector: connector.connector
+            tlsConnector: connector.connector,
+            makeMultiplexer: { tls in
+                Multiplexer(
+                    sink: { data in try await tls.send(data) },
+                    sleeper: { duration in try await gate.sleep(duration) }
+                )
+            },
+            installWindowTestGate: {
+                do {
+                    try await latched.waitWithTimeout()
+                } catch {
+                    Issue.record("inbound close did not latch before publishConnected")
+                }
+            },
+            pendingInstallFailureTestObserver: {
+                await latched.signal()
+            }
         )
         let states = await stateProbe(for: session)
 
@@ -406,19 +429,39 @@ struct TunnelSessionTests {
         #expect(await connector.invocationCount == 1)
         await session.disconnect()
         await states.stop()
+        await gate.cancelAll()
     }
 
     @Test func inboundFaultDuringDirectInstallThrowsInboundClosedFaultWithoutDurableConnected() async throws {
         let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: 443, scope: "local")
         let tls = FakeTunnelTLS()
+        let gate = KeepaliveTickGate()
+        let latched = TestSignal()
         let connector = ConnectorProbe { _, _, _ in
             await tls.finishInbound(throwing: TunnelSessionTestError.fakePumpFault)
             return tls
         }
+        // Same race, same two seams, same reason: see the sibling above.
         let session = TunnelSession(
             pairing: fakePairing(),
             policy: fastKeepalivePolicy(runsOnRelayPath: false),
-            tlsConnector: connector.connector
+            tlsConnector: connector.connector,
+            makeMultiplexer: { tls in
+                Multiplexer(
+                    sink: { data in try await tls.send(data) },
+                    sleeper: { duration in try await gate.sleep(duration) }
+                )
+            },
+            installWindowTestGate: {
+                do {
+                    try await latched.waitWithTimeout()
+                } catch {
+                    Issue.record("inbound fault did not latch before publishConnected")
+                }
+            },
+            pendingInstallFailureTestObserver: {
+                await latched.signal()
+            }
         )
         let states = await stateProbe(for: session)
 
@@ -431,6 +474,7 @@ struct TunnelSessionTests {
         #expect(await connector.invocationCount == 1)
         await session.disconnect()
         await states.stop()
+        await gate.cancelAll()
     }
 
     @Test func pumpFaultPublishesInboundClosedFaultAndDoesNotReconnect() async throws {
