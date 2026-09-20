@@ -82,6 +82,157 @@ struct MuxKeepaliveTests {
         await gate.cancelAll()
     }
 
+    @Test func anOutstandingRequestDefersLossWhileThePeerIsSilentOnTheStream() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveTickGate()
+        let clock = MuxInstantBox()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) },
+            now: { clock.get() }
+        )
+        let stream = try await mux.openStream()
+        await recorder.reset()
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost) }
+
+        // The shape a bulk upload ends in: the body is on the wire and the peer
+        // is writing it durably, so it sends nothing at all on the stream —
+        // no response bytes and no WINDOW grant — until the reply starts.
+        try await stream.write(Data([1, 2, 3]))
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 3, deferralLimit: .seconds(3))
+
+        // Five ticks with nothing inbound. Without the outstanding-request half
+        // the loss lands at three and the keepalive stops there.
+        for tick in 1...5 {
+            await gate.waitForObservedTick(count: tick)
+            clock.advance(.milliseconds(500))
+            await gate.releaseOne()
+            try await expectTick(gate, count: tick + 1)
+            #expect(try await pingFrames(in: recorder).count == tick)
+        }
+
+        // Tick 6 reaches the wall-clock cap and the loss lands there instead.
+        clock.advance(.milliseconds(500))
+        await gate.releaseOne()
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(try await pingFrames(in: recorder).count == 5)
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
+    @Test func anAnsweredRequestStopsDeferringAndTheDarkPathFailsAtTheMissedLimit() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveTickGate()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) }
+        )
+        let stream = try await mux.openStream()
+        await recorder.reset()
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost) }
+
+        // Written, then answered: the peer owes us nothing, so this stream is
+        // not evidence of anything and the ordinary dead-path budget applies.
+        try await stream.write(Data([1, 2, 3]))
+        try await mux.feedInbound(try encodeFrame(buildData(streamID: stream.id, payload: Data([9]))))
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 3)
+
+        for tick in 1...3 {
+            await gate.waitForObservedTick(count: tick)
+            await gate.releaseOne()
+            await gate.waitForObservedTick(count: tick + 1)
+            #expect(try await pingFrames(in: recorder).count == tick)
+        }
+        await gate.releaseOne()
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(try await pingFrames(in: recorder).count == 3)
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
+    @Test func oneStreamsReplyDoesNotVouchForAnotherStreamAwaitingOne() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveTickGate()
+        let clock = MuxInstantBox()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) },
+            now: { clock.get() }
+        )
+        let awaiting = try await mux.openStream()
+        let answered = try await mux.openStream()
+        await recorder.reset()
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost) }
+
+        // Same shape as the test above, except the peer's frame lands on the
+        // *other* stream. It must not clear the one still waiting on a reply.
+        try await awaiting.write(Data([1, 2, 3]))
+        try await mux.feedInbound(try encodeFrame(buildWindow(streamID: answered.id, credit: 1)))
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 3, deferralLimit: .seconds(3))
+
+        for tick in 1...5 {
+            await gate.waitForObservedTick(count: tick)
+            clock.advance(.milliseconds(500))
+            await gate.releaseOne()
+            try await expectTick(gate, count: tick + 1)
+            #expect(try await pingFrames(in: recorder).count == tick)
+        }
+        clock.advance(.milliseconds(500))
+        await gate.releaseOne()
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(try await pingFrames(in: recorder).count == 5)
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
+    @Test func aStreamStrandedAwaitingAReplyStopsDeferringOnceItIsOlderThanTheCap() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveTickGate()
+        let clock = MuxInstantBox()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) },
+            now: { clock.get() }
+        )
+        let stream = try await mux.openStream()
+        await recorder.reset()
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost) }
+
+        // A stream whose reply never comes — the loopback proxy's idle reclaim
+        // cannot retire one of these, so it can outlive everything around it.
+        // It must not hold this carrier's dead-path detection open forever.
+        try await stream.write(Data([1, 2, 3]))
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 3, deferralLimit: .seconds(3))
+
+        // Eight answered ticks: the path is healthy and the stranded stream
+        // ages past the cap while PONGs keep the wall clock fresh.
+        for tick in 1...8 {
+            await gate.waitForObservedTick(count: tick)
+            clock.advance(.milliseconds(500))
+            await gate.releaseOne()
+            try await expectTick(gate, count: tick + 1)
+            let ping = try #require(try await pingFrames(in: recorder).last)
+            try await mux.feedInbound(try encodeFrame(buildPong(nonce: try parseControlNonce(from: ping.payload))))
+        }
+
+        // Now the path goes dark. The stranded stream is 4 s old against a 3 s
+        // cap, so it is no longer evidence and the loss lands at three pings,
+        // not at the cap — the ordinary dead-path budget is intact.
+        for tick in 9...11 {
+            await gate.releaseOne()
+            try await expectTick(gate, count: tick + 1)
+        }
+        await gate.releaseOne()
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(try await pingFrames(in: recorder).count == 11)
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
     @Test func staleStreamActivityDoesNotDeferLoss() async throws {
         let recorder = MuxFrameRecorder()
         let gate = KeepaliveTickGate()
@@ -502,9 +653,11 @@ struct MuxKeepaliveTests {
     @Test func outboundInFlightIsTrueWhenDataIsQueuedAtMissedPingLoss() async throws {
         let sink = SlowFIFOMuxSink(perFrameDelay: .milliseconds(80))
         let gate = KeepaliveTickGate()
+        let clock = MuxInstantBox()
         let mux = Multiplexer(
             sink: { bytes in try await sink.record(bytes) },
-            sleeper: { duration in try await gate.sleep(duration) }
+            sleeper: { duration in try await gate.sleep(duration) },
+            now: { clock.get() }
         )
         var streams: [MuxStream] = []
         for _ in 0..<16 {
@@ -519,10 +672,19 @@ struct MuxKeepaliveTests {
         await sink.waitUntilAcceptedDataCount(1)
 
         let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost) }
-        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 1)
+        // These streams have handed the peer DATA and heard nothing back, which
+        // is now a reason to keep pinging rather than to declare loss. The event
+        // this test is about is still emitted; the wall-clock cap is what emits
+        // it, so the cap is what this drives.
+        await mux.startKeepalive(
+            interval: .milliseconds(500),
+            missedLimit: 1,
+            deferralLimit: .milliseconds(100)
+        )
         await gate.waitForObservedTick(count: 1)
         await gate.releaseOne()
         await gate.waitForObservedTick(count: 2)
+        clock.advance(.seconds(1))
         await gate.releaseOne()
         let event = try await loss.value
         #expect(event.reason == .missedPingLimit)

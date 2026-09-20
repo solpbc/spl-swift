@@ -46,6 +46,16 @@ public final actor MuxStream {
 
     private let sink: @Sendable (Data) async throws -> Void
     private let onTerminal: @Sendable (UInt32) async -> Void
+    private let now: @Sendable () -> ContinuousClock.Instant
+    /// When this stream last handed the peer DATA with nothing back since.
+    ///
+    /// A bulk POST spends its last seconds here: the body is fully on the wire,
+    /// the peer is writing it durably, and it sends nothing on the stream until
+    /// the response starts. That gap is not a dark path, and the keepalive uses
+    /// this to tell the two apart. Cleared by any inbound frame on this stream,
+    /// and read with an age bound, so a stream stranded awaiting a reply that
+    /// never comes cannot hold the carrier's dead-path detection open forever.
+    private var awaitingPeerSince: ContinuousClock.Instant?
     private nonisolated let inboundStream: AsyncThrowingStream<Data, Error>
     private let inboundContinuation: AsyncThrowingStream<Data, Error>.Continuation
     private var inboundFinished = false
@@ -61,12 +71,14 @@ public final actor MuxStream {
         id: UInt32,
         state: StreamState = .open,
         sink: @escaping @Sendable (Data) async throws -> Void,
-        onTerminal: @escaping @Sendable (UInt32) async -> Void
+        onTerminal: @escaping @Sendable (UInt32) async -> Void,
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
     ) {
         self.id = id
         self.state = state
         self.sink = sink
         self.onTerminal = onTerminal
+        self.now = now
 
         var continuation: AsyncThrowingStream<Data, Error>.Continuation!
         let inboundStream = AsyncThrowingStream<Data, Error> { continuation = $0 }
@@ -87,6 +99,7 @@ public final actor MuxStream {
             let chunk = Data(payload[offset..<(offset + count)])
             let frame = try encodeFrame(buildData(streamID: id, payload: chunk))
             try await sink(frame)
+            noteOutboundData()
             offset += count
         }
 
@@ -94,7 +107,33 @@ public final actor MuxStream {
             try ensureWritable()
             let frame = try encodeFrame(buildData(streamID: id, payload: Data()))
             try await sink(frame)
+            noteOutboundData()
         }
+    }
+
+    /// The peer has our bytes and has said nothing since. Keeps the first such
+    /// instant: a reply clears it, and the next write starts the clock again.
+    private func noteOutboundData() {
+        if awaitingPeerSince == nil {
+            awaitingPeerSince = now()
+        }
+    }
+
+    /// Any frame from the peer on this stream is a reply in the sense that
+    /// matters here — a WINDOW grant mid-body counts exactly as a response byte
+    /// does. Called for every inbound frame the multiplexer routes here.
+    func noteInboundActivity() {
+        awaitingPeerSince = nil
+    }
+
+    /// `true` when this stream handed the peer DATA within `limit` and has had
+    /// nothing back since. The bound is what keeps a permanently stranded
+    /// stream from deferring every later loss on the carrier.
+    func isAwaitingPeer(within limit: Duration, asOf instant: ContinuousClock.Instant) -> Bool {
+        guard let since = awaitingPeerSince else {
+            return false
+        }
+        return since.duration(to: instant) < limit
     }
 
     public func close() async throws {

@@ -126,7 +126,8 @@ public actor Multiplexer {
             sink: dataSink,
             onTerminal: { [weak self] streamID in
                 await self?.evictTerminalStream(id: streamID)
-            }
+            },
+            now: now
         )
         let frame = try encodeFrame(buildOpen(streamID: id))
         streams[id] = stream
@@ -223,6 +224,12 @@ public actor Multiplexer {
         streamInboundTick = keepaliveTickIndex
 
         let stream = streams[frame.streamID]
+        // The peer has spoken on this stream, so it owes us nothing right now.
+        // Keyed on this frame's stream: one stream's WINDOW grant must not
+        // vouch for another stream that is still waiting on a reply.
+        if let stream {
+            await stream.noteInboundActivity()
+        }
 
         if !FrameFlags.validCombinations.contains(frame.flags) {
             if let stream {
@@ -339,7 +346,8 @@ public actor Multiplexer {
             sink: dataSink,
             onTerminal: { [weak self] streamID in
                 await self?.evictTerminalStream(id: streamID)
-            }
+            },
+            now: now
         )
 
         if !frame.payload.isEmpty {
@@ -452,11 +460,22 @@ public actor Multiplexer {
             // PONG is late by the buffer's drain time. If the peer has touched an
             // application stream within the same window (a WINDOW grant, a
             // response) the path is demonstrably alive; keep pinging and let the
-            // wall-clock cap decide when late becomes lost. A dark path sends
-            // nothing at all and still fails at the missed limit.
+            // wall-clock cap decide when late becomes lost.
+            //
+            // Inbound activity alone is not enough, because the peer is allowed
+            // to be legitimately silent: between a bulk POST's last body byte
+            // and the first byte of the reply it sends nothing on that stream at
+            // all, which is exactly where a large upload dies. A stream we have
+            // written to and heard nothing back on is that case, and it carries
+            // its own age bound, so a stream stranded awaiting a reply that
+            // never comes cannot defer every later loss on this carrier.
+            //
+            // A dark path with nothing outstanding sends nothing at all and
+            // still fails at the missed limit.
             let sinceLastPong = pongOrigin().duration(to: now())
             let streamRecentlyActive = streamInboundTick.map { $0 + missedLimitTicks > currentTick } ?? false
-            if streamRecentlyActive && sinceLastPong < deferralLimit {
+            let awaitingPeer = await anyStreamAwaitingPeer(within: deferralLimit)
+            if (streamRecentlyActive || awaitingPeer) && sinceLastPong < deferralLimit {
                 logger.notice(
                     "mux keepalive deferred missed_pings=\(effectiveMissedLimit, privacy: .public) since_pong_ms=\(Self.milliseconds(sinceLastPong), privacy: .public)"
                 )
@@ -473,6 +492,18 @@ public actor Multiplexer {
         let nonce = try randomNonce()
         outstandingPings.append(OutstandingPing(nonce: nonce, issuedTick: currentTick))
         try await sendControl(try encodeFrame(buildPing(nonce: nonce)))
+    }
+
+    /// `true` when any open stream handed the peer DATA within `limit` and has
+    /// had nothing back on that stream since.
+    private func anyStreamAwaitingPeer(within limit: Duration) async -> Bool {
+        let instant = now()
+        for stream in streams.values {
+            if await stream.isAwaitingPeer(within: limit, asOf: instant) {
+                return true
+            }
+        }
+        return false
     }
 
     private func sendControl(_ frame: Data) async throws {
