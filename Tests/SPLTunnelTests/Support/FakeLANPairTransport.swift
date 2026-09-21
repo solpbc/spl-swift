@@ -17,6 +17,9 @@ enum FakeLANOutcome: Sendable {
 enum FakeLANPrepareOutcome: Sendable {
     case attempt(FakeLANOutcome)
     case error(any Error & Sendable)
+    /// Never resolves on its own — simulates a silent-drop candidate. Only
+    /// returns if the caller's own timeout cancels the sleep.
+    case hang
 }
 
 struct FakeLANPrepare: Sendable, Equatable {
@@ -88,6 +91,9 @@ actor FakeLANPairTransport: LANPairTransport {
             throw error
         case .attempt(let sendOutcome):
             return FakeLANPairAttempt(prepare: prepare, outcome: sendOutcome, recorder: recorder)
+        case .hang:
+            try await Task.sleep(for: .seconds(60))
+            throw FakeLANPairError.missingOutcome
         }
     }
 }

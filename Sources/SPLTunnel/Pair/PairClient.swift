@@ -7,11 +7,34 @@ import Security
 
 private let pairLog = SPLLogging.logger(for: .pair)
 
+private enum PairDialTimeoutError: Error, Sendable {
+    case exceeded
+}
+
+private func withPairDialTimeout<T: Sendable>(
+    _ timeout: Duration,
+    operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask {
+            try await operation()
+        }
+        group.addTask {
+            try await Task.sleep(for: timeout)
+            throw PairDialTimeoutError.exceeded
+        }
+        let value = try await group.next()!
+        group.cancelAll()
+        return value
+    }
+}
+
 public struct PairClient: Sendable {
     private let session: URLSession
     private let lanTransport: any LANPairTransport
     private let clientInfo: SPLClientInfo
     private let materialGenerator: @Sendable (String) throws -> PairingMaterial
+    private let directDialTimeout: Duration
 
     public init(clientInfo: SPLClientInfo) {
         self.init(session: .shared, lanTransport: CertlessPairExchange(), clientInfo: clientInfo)
@@ -21,12 +44,18 @@ public struct PairClient: Sendable {
         session: URLSession,
         lanTransport: any LANPairTransport = CertlessPairExchange(),
         clientInfo: SPLClientInfo,
-        materialGenerator: @escaping @Sendable (String) throws -> PairingMaterial = Self.generatePairingMaterial
+        materialGenerator: @escaping @Sendable (String) throws -> PairingMaterial = Self.generatePairingMaterial,
+        // why: bounds one candidate's prepare() (TCP connect + TLS handshake + mux
+        // open) on a silent-drop peer. Matches RacePolicy.directConnectTimeout's
+        // default — the only in-library precedent for a LAN direct-dial wait, and
+        // already generous next to the <1s observed happy-path prepare+send.
+        directDialTimeout: Duration = .seconds(5)
     ) {
         self.session = session
         self.lanTransport = lanTransport
         self.clientInfo = clientInfo
         self.materialGenerator = materialGenerator
+        self.directDialTimeout = directDialTimeout
     }
 
     public func pair(
@@ -143,11 +172,16 @@ public struct PairClient: Sendable {
             var attempt: (any LANPairAttempt)?
             var requestCommitted = false
             do {
-                let prepared = try await lanTransport.prepare(
-                    host: candidate.address,
-                    port: candidatePort,
-                    caFingerprintBytes: pairURL.caFingerprintBytes
-                )
+                // Bounded region ends here, before the request write below —
+                // proto/pairing.md's multi-candidate section commits the ceremony
+                // at that write, and a candidate may only be abandoned before it.
+                let prepared = try await withPairDialTimeout(directDialTimeout) {
+                    try await lanTransport.prepare(
+                        host: candidate.address,
+                        port: candidatePort,
+                        caFingerprintBytes: pairURL.caFingerprintBytes
+                    )
+                }
                 attempt = prepared
                 let requestBytes = CertlessPairExchange.encodeRequest(
                     host: candidate.address,

@@ -215,6 +215,75 @@ struct PairClientDirectTests {
         #expect(await transport.requests.isEmpty)
     }
 
+    @Test func perCandidateDialTimeoutAdvancesToNextCandidate() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let fixture = try TestCA.make()
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+            PairCandidate(address: "192.168.0.20", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(prepareOutcomes: [
+            .hang,
+            .attempt(.response(status: 200, body: try Self.pairResponseData(bundle: fixture))),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo,
+            directDialTimeout: .milliseconds(50)
+        )
+
+        let start = ContinuousClock.now
+        _ = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
+        let elapsed = start.duration(to: .now)
+
+        #expect(elapsed < .seconds(5), "a bounded candidate must not wait out the fake's 60s hang")
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10", "192.168.0.20"])
+        #expect(await transport.requestCount == 1)
+    }
+
+    @Test func perCandidateDialTimeoutFailsFastWhenNoCandidatesRemain() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(prepareOutcomes: [
+            .hang,
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: pairClientInfo,
+            directDialTimeout: .milliseconds(50)
+        )
+
+        let start = ContinuousClock.now
+        do {
+            _ = try await client.pair(
+                pairURL: pairURL,
+                deviceLabel: "test phone",
+                relayEndpoint: Self.relayEndpoint
+            )
+            Issue.record("Expected lanRequestFailed")
+        } catch let error as PairError {
+            guard case .lanRequestFailed = error else {
+                Issue.record("Expected lanRequestFailed, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("Expected PairError, got \(error)")
+        }
+        let elapsed = start.duration(to: .now)
+
+        #expect(elapsed < .seconds(5), "a bounded candidate must not wait out the fake's 60s hang")
+        #expect(await transport.prepares.map(\.host) == ["192.168.0.10"])
+        #expect(await transport.requests.isEmpty)
+    }
+
     @Test func immediateWriteThrowAfterRequestCommitIsTerminal() async throws {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let pairURL = try Self.directPairURL(candidates: [
