@@ -7,6 +7,9 @@
 definition bundle 8.0.0 from authority commit `42bdb218001899f55f5bf767ee740540868d63e9`.
 `bundle/manifest.json` is authoritative for the payload inventory and digests;
 `adoption.json` records this consumer's selected authority material.
+The conformance entry in `adoption.json` records the operations bound in CI:
+all 73 `parse_pair_link` vectors, all 9 `derive_jid` vectors, and both singleton
+operations `decode_crockford` and `derive_relay_key`.
 
 ## Re-vendor
 

@@ -6,7 +6,7 @@ import Foundation
 import Testing
 @testable import SPLTunnel
 
-@Suite("JournalIdentityConformance")
+@Suite("SPLConformance")
 struct JournalIdentityConformanceTests {
     private let corpus: JournalIdentityCorpus
 
@@ -23,10 +23,10 @@ struct JournalIdentityConformanceTests {
         // a refusal in-band as a jid.
         // proto/identity.md:69-71 requires all nine published jid vectors to reproduce
         // exactly.
-        #expect(corpus.vectors.count == 9)
+        #expect(corpus.jidVectors.count == 9)
 
         var derivedJIDs: [String: String] = [:]
-        for vector in corpus.vectors {
+        for vector in corpus.jidVectors {
             let spki = try Self.bytes(vector.spkiDERHex)
             switch vector.expected {
             case .jid(let expected):
@@ -49,6 +49,117 @@ struct JournalIdentityConformanceTests {
         #expect(canonical == compressed)
     }
 
+    @Test func parsePairLinkVectorsMatchAuthorityCorpus() throws {
+        let vectors = corpus.vectors.filter { $0.operation == "parse_pair_link" }
+        #expect(vectors.count == 73)
+
+        for vector in vectors {
+            guard let input = vector.input,
+                  case .encoded(let encoding, let value) = input,
+                  let expected = vector.expected else {
+                Issue.record("vector \(vector.id) is missing pair-link input or expected output")
+                continue
+            }
+
+            let observed = Self.observePairLink(encoding: encoding, value: value)
+            switch expected.result {
+            case "error":
+                guard case .error(let kind) = observed else {
+                    Issue.record("vector \(vector.id) expected a refusal")
+                    continue
+                }
+                #expect(kind == expected.error?.kind, "vector \(vector.id)")
+            case "direct":
+                guard case .direct(let pairURL, let candidates) = observed else {
+                    Issue.record("vector \(vector.id) expected direct, got \(observed)")
+                    continue
+                }
+                #expect(pairURL.kind == .direct, "vector \(vector.id)")
+                #expect(candidates == expected.candidates?.map { PairCandidate(address: $0.host, port: UInt16($0.port)) }, "vector \(vector.id)")
+                #expect(Self.hex(pairURL.nonceBytes) == expected.nonceHex, "vector \(vector.id)")
+                #expect(Self.hex(pairURL.caFingerprintBytes) == expected.caFpHex, "vector \(vector.id)")
+            case "relay":
+                guard case .relay(let pairURL) = observed else {
+                    Issue.record("vector \(vector.id) expected relay, got \(observed)")
+                    continue
+                }
+                #expect(pairURL.kind == .relay, "vector \(vector.id)")
+                #expect(Self.hex(pairURL.sBytes) == expected.secretHex, "vector \(vector.id)")
+                #expect(Self.hex(pairURL.caFingerprintBytes) == expected.caFpSpkiHex, "vector \(vector.id)")
+                #expect(pairURL.relayOrigin?.resolved().absoluteString == expected.relayOrigin, "vector \(vector.id)")
+            default:
+                Issue.record("vector \(vector.id) has an unknown result \(expected.result)")
+            }
+        }
+    }
+
+    @Test func decodeCrockfordVectorMatchesAuthorityCorpus() throws {
+        let vector = try #require(corpus.vectors.first { $0.operation == "decode_crockford" })
+        guard case .text(let input) = try #require(vector.input),
+              let expected = vector.expectedHex else {
+            Issue.record("decode_crockford vector is missing input or expected bytes")
+            return
+        }
+        #expect(try Crockford32.decode(input) == Self.bytes(expected), "vector \(vector.id)")
+    }
+
+    @Test func deriveRelayKeyVectorMatchesAuthorityCorpus() throws {
+        let vector = try #require(corpus.vectors.first { $0.operation == "derive_relay_key" })
+        guard let secretHex = vector.secretHex,
+              let expectedHex = vector.expectedHex else {
+            Issue.record("derive_relay_key vector is missing input or expected bytes")
+            return
+        }
+        let key = try PairWindowRelayKey(sBytes: Self.bytes(secretHex))
+        #expect(key.secPairKeyHeaderValue == expectedHex, "vector \(vector.id)")
+    }
+
+    private static func observePairLink(encoding: String, value: String) -> PairLinkObservation {
+        let url: URL
+        let payload: [UInt8]
+        switch encoding {
+        case "link":
+            guard let parsedURL = URL(string: value),
+                  let components = URLComponents(url: parsedURL, resolvingAgainstBaseURL: false),
+                  let fragment = components.percentEncodedFragment,
+                  let decoded = try? Crockford32.decode(fragment) else {
+                return .error("truncated")
+            }
+            url = parsedURL
+            payload = decoded
+        case "blob_hex":
+            guard let decoded = try? bytes(value),
+                  let link = URL(string: "https://go.solstone.app/p#\(Crockford32TestEncoding.encode(decoded))") else {
+                return .error("truncated")
+            }
+            url = link
+            payload = decoded
+        default:
+            return .error("truncated")
+        }
+
+        do {
+            let pairURL = try PairURL.parse(url)
+            if pairURL.kind == .direct {
+                guard pairURL.candidates.allSatisfy({
+                    TunnelAddressClassifier.isValidDirectDialAddressLiteral($0.address)
+                }) else {
+                    return .error("disallowed_direct_ipv4")
+                }
+                return .direct(pairURL, PairClient.coalesceCandidates(pairURL.candidates))
+            }
+            return .relay(pairURL)
+        } catch let error as PairURLError {
+            return .error(error.kind(for: payload))
+        } catch {
+            return .error("invalid_pair_link")
+        }
+    }
+
+    private static func hex(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
     private static func bytes(_ hex: String) throws -> [UInt8] {
         guard hex.count.isMultiple(of: 2) else {
             throw JournalIdentityCorpusError.invalidHex(hex)
@@ -65,7 +176,8 @@ struct JournalIdentityConformanceTests {
 }
 
 private struct JournalIdentityCorpus {
-    let vectors: [JournalIdentityVector]
+    let vectors: [RawVector]
+    let jidVectors: [JournalIdentityVector]
 
     static func load() throws -> JournalIdentityCorpus {
         let decoder = JSONDecoder()
@@ -88,13 +200,17 @@ private struct JournalIdentityCorpus {
 
         let vectorsData = try Data(contentsOf: bundle.appending(path: "vectors.json"))
         let document = try decoder.decode(VectorDocument.self, from: vectorsData)
+        let histogram = Dictionary(grouping: document.vectors, by: \.operation).mapValues(\.count)
+        guard histogram == Constants.operationHistogram else {
+            throw JournalIdentityCorpusError.operationHistogramMismatch(histogram)
+        }
         let jidVectors = try document.vectors
             .filter { $0.operation == "derive_jid" }
             .map(JournalIdentityVector.init)
         guard jidVectors.count == 9 else {
             throw JournalIdentityCorpusError.unexpectedVectorCount(jidVectors.count)
         }
-        return JournalIdentityCorpus(vectors: jidVectors)
+        return JournalIdentityCorpus(vectors: document.vectors, jidVectors: jidVectors)
     }
 
     private static func verifyManifestConstants(_ manifest: Manifest) throws {
@@ -133,7 +249,10 @@ private struct JournalIdentityCorpus {
               adoption.authorityCommit == Constants.authorityCommit,
               adoption.bundleSemver == Constants.bundleSemver,
               adoption.authorityManifestPath == Constants.authorityManifestPath,
-              adoption.authorityManifestSha256 == Constants.authorityManifestSHA256 else {
+              adoption.authorityManifestSha256 == Constants.authorityManifestSHA256,
+              adoption.conformance.test == Constants.conformanceTest,
+              adoption.conformance.boundOperations == Constants.boundOperations,
+              adoption.conformance.notImplemented.isEmpty else {
             throw JournalIdentityCorpusError.adoptionMetadataMismatch
         }
         let adoptionPaths = try validatedPaths(adoption.bundleFiles)
@@ -166,6 +285,14 @@ private extension JournalIdentityCorpus {
         static let consumerIdentifier = "solpbc/spl-swift"
         static let authorityRepository = "https://github.com/solpbc/spl"
         static let authorityManifestPath = "proto/definition/bundle/manifest.json"
+        static let conformanceTest = "Tests/SPLTunnelTests/Conformance/JournalIdentityConformanceTests.swift"
+        static let boundOperations = ["derive_jid", "parse_pair_link", "decode_crockford", "derive_relay_key"]
+        static let operationHistogram = [
+            "parse_pair_link": 73,
+            "derive_jid": 9,
+            "decode_crockford": 1,
+            "derive_relay_key": 1,
+        ]
     }
 
     struct Manifest: Decodable {
@@ -184,6 +311,18 @@ private extension JournalIdentityCorpus {
         let authorityManifestPath: String
         let authorityManifestSha256: String
         let bundleFiles: [FileDigest]
+        let conformance: AdoptionConformance
+    }
+
+    struct AdoptionConformance: Decodable {
+        let test: String
+        let boundOperations: [String]
+        let notImplemented: [AdoptionOmission]
+    }
+
+    struct AdoptionOmission: Decodable {
+        let operation: String
+        let reason: String
     }
 
     struct FileDigest: Decodable, Equatable {
@@ -200,11 +339,89 @@ private extension JournalIdentityCorpus {
         let operation: String
         let spkiDerHex: String?
         let expected: RawExpected?
+        let input: RawInput?
+        let expectedHex: String?
+        let secretHex: String?
     }
 
     struct RawExpected: Decodable {
         let result: String
         let jid: String?
+        let error: RawVectorError?
+        let candidates: [RawCandidate]?
+        let nonceHex: String?
+        let caFpHex: String?
+        let caFpSpkiHex: String?
+        let relayOrigin: String?
+        let secretHex: String?
+    }
+
+    enum RawInput: Decodable {
+        case text(String)
+        case encoded(String, String)
+
+        private enum CodingKeys: String, CodingKey {
+            case encoding
+            case value
+        }
+
+        init(from decoder: Decoder) throws {
+            if let value = try? decoder.singleValueContainer().decode(String.self) {
+                self = .text(value)
+                return
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self = .encoded(
+                try container.decode(String.self, forKey: .encoding),
+                try container.decode(String.self, forKey: .value)
+            )
+        }
+    }
+
+    struct RawVectorError: Decodable {
+        let kind: String
+    }
+
+    struct RawCandidate: Decodable {
+        let host: String
+        let port: UInt16
+    }
+}
+
+private enum PairLinkObservation: CustomStringConvertible {
+    case direct(PairURL, [PairCandidate])
+    case relay(PairURL)
+    case error(String)
+
+    var description: String {
+        switch self {
+        case .direct(_, _): "direct"
+        case .relay(_): "relay"
+        case .error(let kind): "error \(kind)"
+        }
+    }
+}
+
+private extension PairURLError {
+    func kind(for payload: [UInt8]) -> String {
+        switch self {
+        case .missingFragment:
+            return "truncated"
+        case .invalidLength(_):
+            if payload.first == 0x05, payload.count >= 3,
+               !(1...4).contains(Int(payload[2])) {
+                return "invalid_candidate_count"
+            }
+            return "truncated"
+        case .unsupportedAddrType(_):
+            return "unsupported_address_type"
+        case .unsupportedCAFingerprintTag(_):
+            return "unknown_ca_fp_tag"
+        case .invalidRelayOrigin:
+            return "bad_relay_origin"
+        default:
+            return "invalid_pair_link"
+        }
     }
 }
 
@@ -247,6 +464,7 @@ private enum JournalIdentityCorpusError: Error {
     case adoptionFilesMismatch
     case invalidBundlePath(String)
     case unexpectedVectorCount(Int)
+    case operationHistogramMismatch([String: Int])
     case invalidJIDVector(String)
     case unrecognizedJIDResult(String)
     case invalidHex(String)

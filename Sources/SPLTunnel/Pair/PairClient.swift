@@ -318,7 +318,7 @@ public struct PairClient: Sendable {
         )
     }
 
-    private static func coalesceCandidates(_ candidates: [PairCandidate]) -> [PairCandidate] {
+    static func coalesceCandidates(_ candidates: [PairCandidate]) -> [PairCandidate] {
         var seen: Set<PairCandidate> = []
         var result: [PairCandidate] = []
         result.reserveCapacity(candidates.count)
