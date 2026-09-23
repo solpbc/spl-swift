@@ -277,9 +277,9 @@ private struct JournalIdentityCorpus {
 
 private extension JournalIdentityCorpus {
     enum Constants {
-        static let authorityCommit = "42bdb218001899f55f5bf767ee740540868d63e9"
-        static let authorityManifestSHA256 = "8e2dc3f9f0eed57bc0f813654f5ff6dac1f5dbbb254c1dd05ee67bf5707202a9"
-        static let bundleSemver = "8.0.0"
+        static let authorityCommit = "bc0eec0ac4230df023abb0d88bee812358b3fe60"
+        static let authorityManifestSHA256 = "5dc0c160ed9781964de2c6debe0b6e93f6b9d72e040a2b614356d1355b26dc64"
+        static let bundleSemver = "8.0.1"
         static let bundleSchemaIdentity = "spl.pair-link-definition-bundle.schema.v1"
         static let adoptionSchemaVersion = 1
         static let consumerIdentifier = "solpbc/spl-swift"
