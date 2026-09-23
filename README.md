@@ -41,6 +41,8 @@ The library reports connection progress through `TunnelState` and `stateUpdates`
 
 `LoopbackProxy(opener:)` accepts any `MuxStreamOpening` implementation, so apps can hand it a `TunnelSession` for a single connection lifecycle or a `TunnelSupervisor` when reconnect behavior should preserve the loopback port.
 
+The proxy speaks HTTP/1.1 and admits a local connection only when its first request carries the process's `LoopbackCapability` as a cookie. Any process on the machine can reach `127.0.0.1`, and what the proxy forwards reaches the journal as the paired device. Add `LoopbackCapability.process.cookieHeaderValue` to the `Cookie` header of URLSession requests to the proxy, with `httpShouldHandleCookies` off so the cookie store cannot replace it, and set `LoopbackCapability.process.httpCookie()` in a web view's cookie store before loading the journal. A connection without it gets a `403` carrying an `X-SPL-Loopback-Refused` header and never opens a tunnel stream.
+
 ## Privacy
 
 This library contains no telemetry, analytics, or crash reporting, and never will. It talks only to the owner's own journal and the relay endpoint the owner's pairing names.

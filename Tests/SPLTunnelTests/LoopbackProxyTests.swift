@@ -202,7 +202,7 @@ struct LoopbackProxyTests {
 
     @Test func bidirectionalRoundTripThroughInMemoryOpener() async throws {
         // Loopback proxy must pump bidirectionally between TCP and MuxStream.
-        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\(admittingCookieLine)\r\n".utf8)
         let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
         let opener = InMemoryLoopbackOpener(response: response)
 
@@ -246,7 +246,7 @@ struct LoopbackProxyTests {
     @Test func idlePreconnectionsDoNotConsumeRemoteStreamCapacity() async throws {
         // This capped opener is an eight-slot test fixture, not the current
         // Journal policy. Real TCP preconnections must not consume its slots.
-        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\(admittingCookieLine)\r\n".utf8)
         let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
         let opener = CappedLoopbackOpener(limit: 8, response: response)
         try await Self.withLoopbackProxy(opener: opener) { proxy, port in
@@ -323,7 +323,7 @@ struct LoopbackProxyTests {
 
     @Test func firstChunkAndLaterChunkPreserveOrderBeforeHalfClose() async throws {
         // session.md: TCP EOF maps to stream CLOSE; response remains readable after it.
-        let first = Data("first request chunk".utf8)
+        let first = Data("POST / HTTP/1.1\r\nHost: localhost\r\n\(admittingCookieLine)\r\nfirst body chunk".utf8)
         let second = Data("second request chunk".utf8)
         let response = Data("response after request EOF".utf8)
         let opener = InMemoryLoopbackOpener(response: response)
@@ -356,7 +356,7 @@ struct LoopbackProxyTests {
         // halves close. In this eight-slot fixture, eight idle persistent
         // connections therefore pin the full cap until reclamation; this
         // fixture does not declare the current Journal policy.
-        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\(admittingCookieLine)\r\n".utf8)
         let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
         let opener = KeepAliveLoopbackOpener(limit: 8, response: response)
         try await Self.withLoopbackProxy(opener: opener, idleReclaimAfter: .milliseconds(1500)) { proxy, port in
@@ -393,7 +393,7 @@ struct LoopbackProxyTests {
         // The reclaim must never fire while the journal is still working: a
         // large ingest is silent on both halves for far longer than the
         // deadline, and killing it would be a worse bug than the one this fixes.
-        let request = Data("POST /ingest HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let request = Data("POST /ingest HTTP/1.1\r\nHost: localhost\r\n\(admittingCookieLine)\r\n".utf8)
         let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
         let opener = KeepAliveLoopbackOpener(limit: 8, response: response, responseDelay: .milliseconds(900))
         try await Self.withLoopbackProxy(opener: opener, idleReclaimAfter: .milliseconds(200)) { proxy, port in
@@ -411,7 +411,7 @@ struct LoopbackProxyTests {
         // A door that refuses stream nine resets it; the proxy used to cancel
         // the TCP connection and discard the reason, leaving the owner with an
         // unexplained -1005 and us with no record at all.
-        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\(admittingCookieLine)\r\n".utf8)
         let opener = ResettingLoopbackOpener(reason: .streamLimitExceeded, rawByte: 0x03)
         try await Self.withLoopbackProxy(opener: opener) { proxy, port in
             let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
@@ -440,7 +440,7 @@ struct LoopbackProxyTests {
         // harness, same request, only the wire reason differs -- so a consumer
         // reading streamLimitRefusals can tell them apart, and one reading the
         // deliberately reason-blind streamResets cannot.
-        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\(admittingCookieLine)\r\n".utf8)
         let opener = ResettingLoopbackOpener(reason: reason, rawByte: rawByte)
         try await Self.withLoopbackProxy(opener: opener) { proxy, port in
             let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
@@ -460,7 +460,7 @@ struct LoopbackProxyTests {
         // reconnect, so its tally starts over while the owner's problem does
         // not. The observer is how a consumer writes a durable record at the
         // moment the refusal arrives.
-        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\(admittingCookieLine)\r\n".utf8)
         let opener = ResettingLoopbackOpener(reason: .streamLimitExceeded, rawByte: 0x03)
         let observed = OSAllocatedUnfairLock(initialState: [ResetReason]())
         try await Self.withLoopbackProxy(
@@ -482,7 +482,7 @@ struct LoopbackProxyTests {
         // The negative control the contrast needs: a request that succeeds must
         // leave every refusal instrument at zero, or a nonzero reading proves
         // nothing.
-        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let request = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\(admittingCookieLine)\r\n".utf8)
         let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
         let opener = InMemoryLoopbackOpener(response: response)
         let observed = OSAllocatedUnfairLock(initialState: [ResetReason]())
@@ -533,7 +533,7 @@ struct LoopbackProxyTests {
                 let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
                 clients.append(client)
                 try await startAndReturnReadyWaiter(client).wait()
-                try await LoopbackProxy.send(Data([0x41]), to: client)
+                try await LoopbackProxy.send(Data("GET / HTTP/1.1\r\n\(admittingCookieLine)\r\n".utf8), to: client)
             }
 
             // 200 real loopback connections need more than the 500 ms default: the
@@ -595,6 +595,198 @@ struct LoopbackProxyTests {
         }
     }
 
+    @Test(arguments: [
+        "GET /api/system/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "GET /api/system/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: spl_loopback=ffffffffffffffffffffffffffffffff\r\n\r\n",
+        "POST /api/push/register HTTP/1.1\r\nHost: evil.example\r\nOrigin: https://evil.example\r\nContent-Length: 2\r\n\r\n{}",
+    ])
+    func aConnectionWithoutTheCapabilityIsRefusedBeforeAnyStreamOpens(request: String) async throws {
+        // Another app or a web page on the same machine can reach this port.
+        // Without the capability it must get a refusal and never a tunnel
+        // stream: what a stream carries reaches the journal as the owner.
+        let opener = CappedLoopbackOpener(limit: 8, response: Data("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".utf8))
+        try await Self.withLoopbackProxy(opener: opener) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            try await LoopbackProxy.send(Data(request.utf8), to: client)
+            let response = String(decoding: await Self.boundedResponse(from: client), as: UTF8.self)
+            #expect(response.hasPrefix("HTTP/1.1 403 Forbidden\r\n"))
+            #expect(response.contains("\r\nContent-Type: text/plain; charset=utf-8\r\n"))
+            #expect(response.contains("\r\nX-SPL-Loopback-Refused: "))
+            #expect(response.hasSuffix("\n") && !response.hasSuffix("\r\n\r\n"))
+            #expect(!response.contains(loopbackTestCapability.token))
+            // The proxy drains a refused client until it closes; close it.
+            client.cancel()
+            #expect(await waitUntil("refused handler completes") {
+                await proxy.connectionTaskCount() == 0
+            })
+            #expect(await proxy.stats().capabilityRefusals == 1)
+            #expect(await opener.openCount() == 0)
+            #expect(await opener.capturedRequest().isEmpty)
+        }
+    }
+
+    @Test func aRefusedUploadReadsTheRefusalRatherThanAReset() async throws {
+        // A client still writing a body when the proxy refuses must read the
+        // 403. A body larger than the socket buffers stalls the client's write
+        // unless the proxy keeps reading; without the drain a client that reads
+        // only after writing never finishes sending and never sees the refusal.
+        let body = Data(repeating: 0x42, count: 8 * 1024 * 1024)
+        var request = Data("POST /app/observer/ingest HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
+        request.append(body)
+        let opener = CappedLoopbackOpener(limit: 8, response: Data())
+        try await Self.withLoopbackProxy(opener: opener) { _, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            // Send the whole body before reading, the way a client that only
+            // reads once its request is written behaves.
+            let upload = request
+            let sent = AsyncResultBox<Bool>()
+            let sender = Task {
+                await sent.store((try? await LoopbackProxy.send(upload, to: client)) != nil)
+            }
+            defer { sender.cancel() }
+            #expect(await waitUntil("refused body fully written", timeout: .seconds(3)) {
+                await sent.snapshot() == true
+            })
+            let response = String(decoding: await Self.boundedResponse(from: client), as: UTF8.self)
+            #expect(response.hasPrefix("HTTP/1.1 403 Forbidden\r\n"))
+            #expect(response.contains("\r\nX-SPL-Loopback-Refused: missing\r\n"))
+            #expect(await opener.openCount() == 0)
+        }
+    }
+
+    @Test func anOversizedHeadIsRefusedWithoutOpeningAStream() async throws {
+        let opener = CappedLoopbackOpener(limit: 8, response: Data())
+        try await Self.withLoopbackProxy(opener: opener) { _, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            let flood = "GET / HTTP/1.1\r\nX-Pad: " + String(repeating: "a", count: LoopbackCapability.maxRequestHeadBytes + 1)
+            try await LoopbackProxy.send(Data(flood.utf8), to: client)
+            let response = String(decoding: await Self.boundedResponse(from: client), as: UTF8.self)
+            #expect(response.hasPrefix("HTTP/1.1 403 Forbidden\r\n"))
+            #expect(response.contains("\r\nX-SPL-Loopback-Refused: oversize\r\n"))
+            #expect(await opener.openCount() == 0)
+        }
+    }
+
+    @Test func aSmallHeadAndALargeBodyInOneWriteAreAdmittedWhole() async throws {
+        // The 16 KiB bound is the head's length. URLSession often writes a head
+        // and its body together, and bounding the bytes read instead would
+        // refuse every large upload.
+        let body = Data(repeating: 0x5A, count: 48 * 1024)
+        var request = Data("POST /app/observer/ingest HTTP/1.1\r\nHost: 127.0.0.1\r\n\(admittingCookieLine)Content-Length: \(body.count)\r\n\r\n".utf8)
+        request.append(body)
+        let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
+        let opener = InMemoryLoopbackOpener(response: response)
+        try await Self.withLoopbackProxy(opener: opener) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            let responseBox = AsyncResultBox<Data>()
+            let receiver = Task {
+                await responseBox.store((try? await Self.collectResponse(from: client)) ?? Data())
+            }
+            defer { receiver.cancel() }
+            try await Self.sendFinal(request, to: client)
+            #expect(await waitUntil("large admitted request answered", timeout: .seconds(5)) {
+                await responseBox.snapshot() != nil
+            })
+            #expect(await opener.capturedRequest() == request)
+            #expect(await responseBox.snapshot() == response)
+            #expect(await proxy.stats().capabilityRefusals == 0)
+        }
+    }
+
+    @Test func laterRequestsOnAnAdmittedConnectionAreForwardedUnchecked() async throws {
+        // One check per connection, by design: only the process that opened a
+        // TCP connection can write into it. A later request is forwarded
+        // byte-for-byte, never re-parsed.
+        let first = Data("GET /one HTTP/1.1\r\nHost: 127.0.0.1\r\n\(admittingCookieLine)\r\n".utf8)
+        let second = Data("GET /two HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".utf8)
+        let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
+        let opener = InMemoryLoopbackOpener(response: response)
+        try await Self.withLoopbackProxy(opener: opener) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            try await LoopbackProxy.send(first, to: client)
+            #expect(await waitUntil("first request forwarded") {
+                await opener.capturedRequest() == first
+            })
+            try await LoopbackProxy.send(second, to: client)
+            #expect(await waitUntil("second request forwarded unchanged") {
+                await opener.capturedRequest() == first + second
+            })
+            #expect(await opener.openCount() == 1)
+            #expect(await proxy.stats().capabilityRefusals == 0)
+        }
+    }
+
+    @Test func aHeadSplitAcrossWritesIsAdmittedAndForwardedByteForByte() async throws {
+        let parts = [
+            "POST /app/observer/ingest HTTP/1.1\r\nHost: 127.0.0.1\r\nCoo",
+            "kie: other=1; spl_loopback=\(loopbackTestCapability.token)",
+            "\r\nContent-Length: 4\r\n\r",
+            "\nbody",
+        ]
+        let response = Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".utf8)
+        let opener = InMemoryLoopbackOpener(response: response)
+        try await Self.withLoopbackProxy(opener: opener) { _, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            let responseBox = AsyncResultBox<Data>()
+            let receiver = Task {
+                await responseBox.store((try? await Self.collectResponse(from: client)) ?? Data())
+            }
+            defer { receiver.cancel() }
+            for part in parts.dropLast() {
+                try await LoopbackProxy.send(Data(part.utf8), to: client)
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            try await Self.sendFinal(Data(parts.last!.utf8), to: client)
+            #expect(await waitUntil("admitted response arrives") {
+                await responseBox.snapshot() != nil
+            })
+            #expect(await opener.capturedRequest() == Data(parts.joined().utf8))
+            #expect(await responseBox.snapshot() == response)
+        }
+    }
+
+    @Test func aClientThatClosesBeforeFinishingItsHeadGetsNoStreamAndNoResponse() async throws {
+        let opener = CappedLoopbackOpener(limit: 8, response: Data())
+        try await Self.withLoopbackProxy(opener: opener) { proxy, port in
+            let endpointPort = try #require(NWEndpoint.Port(rawValue: port))
+            let client = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
+            defer { client.cancel() }
+            try await startAndReturnReadyWaiter(client).wait()
+            let responseBox = AsyncResultBox<Data>()
+            let receiver = Task {
+                await responseBox.store((try? await Self.collectResponse(from: client)) ?? Data())
+            }
+            defer { receiver.cancel() }
+            try await Self.sendFinal(Data("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n".utf8), to: client)
+            #expect(await waitUntil("half-open head handler completes") {
+                await proxy.connectionTaskCount() == 0
+            })
+            #expect(await waitUntil("client sees the close") {
+                await responseBox.snapshot() != nil
+            })
+            #expect(await responseBox.snapshot() == Data())
+            #expect(await opener.openCount() == 0)
+        }
+    }
+
     private static func withLoopbackProxy<T: Sendable>(
         opener: any MuxStreamOpening,
         idleReclaimAfter: Duration = LoopbackProxy.defaultIdleReclaim,
@@ -604,7 +796,8 @@ struct LoopbackProxyTests {
         let proxy = LoopbackProxy(
             opener: opener,
             idleReclaimAfter: idleReclaimAfter,
-            onPeerStreamReset: onPeerStreamReset
+            onPeerStreamReset: onPeerStreamReset,
+            capability: loopbackTestCapability
         )
         do {
             let port = try await proxy.start()
@@ -654,6 +847,21 @@ struct LoopbackProxyTests {
         return collected
     }
 
+    /// Collects a response that must arrive promptly. A regression that opens a
+    /// stream instead of refusing leaves the connection open, and this returns
+    /// what it has rather than hanging the suite.
+    private static func boundedResponse(from connection: NWConnection) async -> Data {
+        let box = AsyncResultBox<Data>()
+        let receiver = Task {
+            await box.store((try? await collectResponse(from: connection)) ?? Data())
+        }
+        defer { receiver.cancel() }
+        _ = await waitUntil("bounded response", timeout: .seconds(3)) {
+            await box.snapshot() != nil
+        }
+        return await box.snapshot() ?? Data()
+    }
+
     private static func collectResponse(from connection: NWConnection) async throws -> Data {
         var response = Data()
         while true {
@@ -669,6 +877,9 @@ struct LoopbackProxyTests {
 }
 
 private struct LoopbackTestError: Error, Sendable {}
+
+let loopbackTestCapability = LoopbackCapability(token: "0123456789abcdef0123456789abcdef")
+private let admittingCookieLine = "Cookie: \(loopbackTestCapability.cookieHeaderValue)\r\n"
 
 private func loopbackPairing(
     from fixture: TestCA.Bundle,
@@ -707,12 +918,14 @@ private actor InMemoryLoopbackOpener: MuxStreamOpening {
     private var decoder = FrameDecoder()
     private var stream: MuxStream?
     private var nextStreamID: UInt32 = 1
+    private var opens = 0
 
     init(response: Data) {
         self.response = response
     }
 
     func openStream() async throws -> MuxStream {
+        opens += 1
         let streamID = nextStreamID
         nextStreamID &+= 2
         let stream = MuxStream(
@@ -728,6 +941,10 @@ private actor InMemoryLoopbackOpener: MuxStreamOpening {
 
     func capturedRequest() -> Data {
         request
+    }
+
+    func openCount() -> Int {
+        opens
     }
 
     private func acceptOutbound(_ bytes: Data) async throws {

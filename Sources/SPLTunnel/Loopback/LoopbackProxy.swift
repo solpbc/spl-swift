@@ -38,17 +38,25 @@ public struct LoopbackProxyStats: Sendable, Equatable {
     /// distinguishable from a genuine transport death, because both reach a
     /// URLSession client as `NSURLErrorNetworkConnectionLost` (-1005).
     public var streamLimitRefusals: Int
+    /// Local connections this proxy refused because their first request did
+    /// not carry the process's `LoopbackCapability`.
+    ///
+    /// Either another process on the machine knocked, or one of our own call
+    /// sites forgot the capability. Neither reached the tunnel.
+    public var capabilityRefusals: Int
 
     public init(
         streamOpenFailures: Int = 0,
         idleReclaims: Int = 0,
         streamResets: Int = 0,
-        streamLimitRefusals: Int = 0
+        streamLimitRefusals: Int = 0,
+        capabilityRefusals: Int = 0
     ) {
         self.streamOpenFailures = streamOpenFailures
         self.idleReclaims = idleReclaims
         self.streamResets = streamResets
         self.streamLimitRefusals = streamLimitRefusals
+        self.capabilityRefusals = capabilityRefusals
     }
 }
 
@@ -70,6 +78,7 @@ final class LoopbackProxyCounters: @unchecked Sendable {
 
     func noteStreamOpenFailure() { state.withLock { $0.streamOpenFailures += 1 } }
     func noteIdleReclaim() { state.withLock { $0.idleReclaims += 1 } }
+    func noteCapabilityRefusal() { state.withLock { $0.capabilityRefusals += 1 } }
 
     /// A peer reset carries its reason on the wire; record which one it was.
     ///
@@ -143,17 +152,20 @@ public actor LoopbackProxy {
     private let idleReclaimAfter: Duration
     private let counters = LoopbackProxyCounters()
     private let onPeerStreamReset: PeerStreamResetObserver?
+    private let capability: LoopbackCapability
     private var listener: NWListener?
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
 
     public init(
         opener: any MuxStreamOpening,
         idleReclaimAfter: Duration = LoopbackProxy.defaultIdleReclaim,
-        onPeerStreamReset: PeerStreamResetObserver? = nil
+        onPeerStreamReset: PeerStreamResetObserver? = nil,
+        capability: LoopbackCapability = .process
     ) {
         self.opener = opener
         self.idleReclaimAfter = idleReclaimAfter
         self.onPeerStreamReset = onPeerStreamReset
+        self.capability = capability
     }
 
     /// Tunnel-side failures seen since this proxy was created.
@@ -226,6 +238,7 @@ public actor LoopbackProxy {
         let counters = self.counters
         let idleReclaimAfter = self.idleReclaimAfter
         let onPeerStreamReset = self.onPeerStreamReset
+        let capability = self.capability
         let id = UUID()
         let task = Task {
             await Self.handle(
@@ -233,7 +246,8 @@ public actor LoopbackProxy {
                 opener: opener,
                 counters: counters,
                 idleReclaimAfter: idleReclaimAfter,
-                onPeerStreamReset: onPeerStreamReset
+                onPeerStreamReset: onPeerStreamReset,
+                capability: capability
             )
             self.removeConnectionTask(id)
         }
@@ -253,7 +267,8 @@ public actor LoopbackProxy {
         opener: any MuxStreamOpening,
         counters: LoopbackProxyCounters,
         idleReclaimAfter: Duration,
-        onPeerStreamReset: PeerStreamResetObserver?
+        onPeerStreamReset: PeerStreamResetObserver?,
+        capability: LoopbackCapability
     ) async {
         var bytesIn = 0
         var bytesOut = 0
@@ -267,15 +282,34 @@ public actor LoopbackProxy {
         let firstRead: (Data, Bool)
         do {
             // Browser preconnections can remain idle. Allocate a remote stream only
-            // when this TCP connection has bytes to forward, preserving its first read.
-            while true {
+            // once this TCP connection has sent a request head carrying the
+            // capability, preserving every byte read so far.
+            var buffered = Data()
+            admission: while true {
                 let (chunk, isComplete) = try await receive(from: connection)
                 try Task.checkCancellation()
-                if let chunk, !chunk.isEmpty {
-                    firstRead = (chunk, isComplete)
-                    break
+                if let chunk {
+                    buffered.append(chunk)
                 }
-                if isComplete || chunk == nil { return }
+                switch capability.admission(of: buffered) {
+                case .admitted:
+                    firstRead = (buffered, isComplete)
+                    break admission
+                case .refused(let refusal):
+                    // notice, not debug: a refusal is either a missed call site in
+                    // our own app or another process knocking, and both must
+                    // survive to a post-hoc log read. Never the header values.
+                    counters.noteCapabilityRefusal()
+                    logger.notice("loopback connection refused: capability \(refusal.rawValue, privacy: .public)")
+                    try? await send(forbiddenResponse(refusal), to: connection)
+                    try? await sendEOF(to: connection)
+                    if !isComplete {
+                        await drainRefused(connection)
+                    }
+                    return
+                case .incomplete:
+                    if isComplete || chunk == nil { return }
+                }
             }
             stream = try await opener.openStream()
         } catch is CancellationError {
@@ -321,6 +355,26 @@ public actor LoopbackProxy {
                 bytesIn += stats.bytesIn
                 bytesOut += stats.bytesOut
             }
+        }
+    }
+
+    /// Reads and discards what a refused client is still sending, until it
+    /// closes or a short bound passes.
+    ///
+    /// Closing a socket with unread bytes resets it, and a client that is still
+    /// writing a request body would then see a lost connection instead of the
+    /// 403 already sent: a refusal that reads as a transient network failure.
+    private nonisolated static func drainRefused(_ connection: NWConnection) async {
+        let bound = Task {
+            try? await Task.sleep(for: .seconds(2))
+            connection.cancel()
+        }
+        defer { bound.cancel() }
+        var drained = 0
+        while drained < 64 * 1024 * 1024 {
+            guard let (chunk, isComplete) = try? await receive(from: connection) else { return }
+            drained += chunk?.count ?? 0
+            if isComplete || chunk == nil { return }
         }
     }
 
@@ -478,6 +532,25 @@ public actor LoopbackProxy {
             connection.cancel()
         }
     }
+}
+
+/// What a connection without the capability gets back. It never reaches the
+/// tunnel: no stream is opened for it.
+///
+/// A plain-text body, not an empty one: an empty 403 renders as a blank page in
+/// a web view, or is cancelled as an unshowable MIME type, and either way the
+/// refusal is invisible. The marker header lets a client tell this refusal from
+/// a journal 403.
+private func forbiddenResponse(_ refusal: LoopbackRefusal) -> Data {
+    let body = "refused: this connection is missing the solstone app's local secret\n"
+    return Data((
+        "HTTP/1.1 403 Forbidden\r\n"
+            + "Content-Type: text/plain; charset=utf-8\r\n"
+            + "X-SPL-Loopback-Refused: \(refusal.rawValue)\r\n"
+            + "Content-Length: \(body.utf8.count)\r\n"
+            + "Connection: close\r\n\r\n"
+            + body
+    ).utf8)
 }
 
 private struct LoopbackPumpStats: Sendable {

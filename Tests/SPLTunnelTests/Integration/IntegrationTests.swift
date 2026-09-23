@@ -348,6 +348,7 @@ struct IntegrationTests {
         let head = [
             "POST /app/observer/ingest HTTP/1.1",
             "Host: 127.0.0.1",
+            "Cookie: \(LoopbackCapability.process.cookieHeaderValue)",
             "Content-Type: multipart/form-data; boundary=\(boundary)",
             "Content-Length: \(body.count)",
             "Connection: close",
@@ -364,6 +365,7 @@ struct IntegrationTests {
         let request = Data([
             "GET \(path) HTTP/1.1",
             "Host: 127.0.0.1",
+            "Cookie: \(LoopbackCapability.process.cookieHeaderValue)",
             "Connection: close",
             "",
             "",
