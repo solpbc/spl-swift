@@ -75,7 +75,17 @@ public struct PairClient: Sendable {
                 orderCandidates: orderCandidates
             )
         case .relay:
-            let preparationStart = ProcessInfo.processInfo.systemUptime
+            // why: every ceremony in this file ages the caller's `now` by the
+            // wall-clock time the ceremony took, so a capability issued during
+            // it is checked against the moment it arrived. Wall clock is correct
+            // here and a monotonic clock is not needed: the expiries that bound
+            // pairing are enforced by the far side on its own clock (the home
+            // refuses an expired pairing nonce, the relay an expired attestation
+            // or device token), and this check only decides whether a received
+            // capability is worth caching. Do not switch back to the boot-time
+            // clock APIs: Apple lists them as required-reason APIs (system boot
+            // time), and `make hygiene` names and forbids them.
+            let preparationStart = Date()
             let generated = try materialGenerator(deviceLabel)
             let validatedRelayEndpoint = try Self.validatedRelayEndpoint(relayEndpoint)
             return try await pairViaRelay(
@@ -83,7 +93,7 @@ public struct PairClient: Sendable {
                 generated: generated,
                 deviceLabel: deviceLabel,
                 defaultRelayEndpoint: validatedRelayEndpoint,
-                now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - preparationStart)
+                now: now.addingTimeInterval(Date().timeIntervalSince(preparationStart))
             )
         }
     }
@@ -106,14 +116,14 @@ public struct PairClient: Sendable {
                 orderCandidates: orderCandidates
             )
         case .relay:
-            let preparationStart = ProcessInfo.processInfo.systemUptime
+            let preparationStart = Date()
             let generated = try materialGenerator(deviceLabel)
             return try await pairViaRelay(
                 pairURL: pairURL,
                 generated: generated,
                 deviceLabel: deviceLabel,
                 defaultRelayEndpoint: relayEndpoint,
-                now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - preparationStart)
+                now: now.addingTimeInterval(Date().timeIntervalSince(preparationStart))
             )
         }
     }
@@ -144,7 +154,7 @@ public struct PairClient: Sendable {
         now: Date,
         orderCandidates: @Sendable ([PairCandidate]) -> [PairCandidate]
     ) async throws -> StoredPairing {
-        let acceptanceStart = ProcessInfo.processInfo.systemUptime
+        let acceptanceStart = Date()
         // The private/LAN-only address restriction was removed 2026-09-18
         // (proto/pairing.md:117): the trust anchor is the CA-fingerprint pin,
         // not network locality, so a public IPv4 is as valid a direct pairing
@@ -207,7 +217,7 @@ public struct PairClient: Sendable {
                            envelope,
                            expectedInstanceID: lanResponse.instanceID,
                            expectedOrigin: enrollmentEndpoint,
-                           now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - acceptanceStart)
+                           now: now.addingTimeInterval(Date().timeIntervalSince(acceptanceStart))
                        ) {
                         relayEnrollment = .enrolled(deviceToken: capability.deviceToken, expiresAt: capability.expiresAt)
                     } else {
@@ -257,7 +267,7 @@ public struct PairClient: Sendable {
         defaultRelayEndpoint: RelayEndpoint,
         now: Date
     ) async throws -> StoredPairing {
-        let acceptanceStart = ProcessInfo.processInfo.systemUptime
+        let acceptanceStart = Date()
         let pairKey: PairWindowRelayKey
         do {
             pairKey = try PairWindowRelayKey(sBytes: pairURL.sBytes)
@@ -297,7 +307,7 @@ public struct PairClient: Sendable {
                     envelope,
                     expectedInstanceID: lanResponse.instanceID,
                     expectedOrigin: relayEndpoint,
-                    now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - acceptanceStart)
+                    now: now.addingTimeInterval(Date().timeIntervalSince(acceptanceStart))
                 )
                 relayEnrollment = .enrolled(deviceToken: capability.deviceToken, expiresAt: capability.expiresAt)
             } catch {
@@ -308,7 +318,7 @@ public struct PairClient: Sendable {
             pairLog.notice("relay access malformed on off-LAN pair")
             throw PairError.relayAccessInvalid
         case .omitted:
-            relayEnrollment = await optionalRelayEnrollment(relayEndpoint: relayEndpoint, lanResponse: lanResponse, now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - acceptanceStart))
+            relayEnrollment = await optionalRelayEnrollment(relayEndpoint: relayEndpoint, lanResponse: lanResponse, now: now.addingTimeInterval(Date().timeIntervalSince(acceptanceStart)))
         }
         return try Self.makeStoredPairing(
             lanResponse: lanResponse,
@@ -382,7 +392,7 @@ public struct PairClient: Sendable {
     }
 
     private func postRelay(relayEndpoint: RelayEndpoint, lanResponse: LANPairResponse, now: Date) async throws -> ValidatedCapability {
-        let acceptanceStart = ProcessInfo.processInfo.systemUptime
+        let acceptanceStart = Date()
         let request = try Self.makeRelayRequest(
             relayEndpoint: relayEndpoint,
             response: lanResponse
@@ -404,7 +414,7 @@ public struct PairClient: Sendable {
                     expectedInstanceID: lanResponse.instanceID,
                     expectedOrigin: relayEndpoint,
                     currentIsV2: false,
-                    now: now.addingTimeInterval(ProcessInfo.processInfo.systemUptime - acceptanceStart)
+                    now: now.addingTimeInterval(Date().timeIntervalSince(acceptanceStart))
                 )
             } catch {
                 throw PairError.relayResponseInvalid(status: status)

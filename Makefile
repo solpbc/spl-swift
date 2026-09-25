@@ -56,6 +56,8 @@ hygiene:
 		|| { echo 'hygiene: nonisolated(unsafe) is forbidden'; exit 1; }
 	@! grep -rn --include='*.swift' 'DispatchQueue.main.async' Sources/ \
 		|| { echo 'hygiene: DispatchQueue.main.async is forbidden'; exit 1; }
+	@! grep -rn --include='*.swift' -E 'systemUptime|mach_absolute_time' Sources/ \
+		|| { echo 'hygiene: boot-time APIs are forbidden (Apple required-reason API, SystemBootTime); use Date() — peers enforce expiry on their own clocks'; exit 1; }
 	@! grep -rn --include='*.swift' -E '(^|[^_[:alnum:]])print\(' Sources/ \
 		|| { echo 'hygiene: print() is forbidden in package sources (use os.Logger via SPLLogging)'; exit 1; }
 	@os_count=$$(grep -Ern --include='*.swift' '#if[[:space:]]+os\(' Sources/ | wc -l | tr -d ' '); \

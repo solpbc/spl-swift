@@ -18,7 +18,10 @@ public struct DeviceTokenRefresher: Sendable {
         self.init(session: .shared, clientInfo: clientInfo)
     }
 
-    init(session: URLSession, clientInfo: SPLClientInfo, elapsedSeconds: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+    // why: wall clock, for the same reason as PairClient's ceremonies — the
+    // relay enforces the token's expiry on its own clock, and this only ages
+    // `now` across the refresh request before the replacement is cached.
+    init(session: URLSession, clientInfo: SPLClientInfo, elapsedSeconds: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 }) {
         self.session = session
         self.elapsedSeconds = elapsedSeconds
     }
