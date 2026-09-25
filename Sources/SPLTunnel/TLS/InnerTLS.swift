@@ -83,7 +83,8 @@ public actor InnerTLS {
         let verifyFailure = TLSVerifyFailure()
         let options = try makeTLSOptions(pairing: pairing, verifyFailure: verifyFailure)
         let parameters = makeLANParameters(tls: options, host: host, unpinnedInterface: unpinnedInterface)
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: parameters)
+        let dialHost = await NAT64Synthesis.dialHost(host, port: nwPort.rawValue)
+        let connection = NWConnection(host: dialHost, port: nwPort, using: parameters)
         let startedAt = ContinuousClock.now
         do {
             try await startAndWaitReady(connection)
@@ -122,7 +123,8 @@ public actor InnerTLS {
         let verifyFailure = TLSVerifyFailure()
         let options = makeCertlessTLSOptions(caFingerprintBytes: caFingerprintBytes, verifyFailure: verifyFailure)
         let parameters = makeLANParameters(tls: options, host: host, unpinnedInterface: unpinnedInterface)
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: parameters)
+        let dialHost = await NAT64Synthesis.dialHost(host, port: nwPort.rawValue)
+        let connection = NWConnection(host: dialHost, port: nwPort, using: parameters)
         let startedAt = ContinuousClock.now
         do {
             try await startAndWaitReady(connection)

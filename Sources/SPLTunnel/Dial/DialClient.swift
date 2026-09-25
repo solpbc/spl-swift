@@ -68,7 +68,8 @@ public enum DialClient {
         }
 
         let startedAt = ContinuousClock.now
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        let dialHost = await NAT64Synthesis.dialHost(host, port: nwPort.rawValue)
+        let connection = NWConnection(host: dialHost, port: nwPort, using: .tcp)
         let transport = LANTransport(connection: connection)
 
         do {
