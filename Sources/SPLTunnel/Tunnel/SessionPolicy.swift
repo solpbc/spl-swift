@@ -87,12 +87,18 @@ public struct ProbeWatchdogPolicy: Sendable, Equatable {
 public struct SessionPolicy: Sendable, Equatable {
     public let race: RacePolicy
     public let keepalive: KeepalivePolicy
+    /// Whether a supervisor connected on a path some planned candidate outranks
+    /// keeps trying the better paths and moves onto one that connects. Off unless
+    /// the app opts in.
+    public let returnsToBetterPath: Bool
 
     public init(
         race: RacePolicy = RacePolicy(),
-        keepalive: KeepalivePolicy = KeepalivePolicy()
+        keepalive: KeepalivePolicy = KeepalivePolicy(),
+        returnsToBetterPath: Bool = false
     ) {
         self.race = race
         self.keepalive = keepalive
+        self.returnsToBetterPath = returnsToBetterPath
     }
 }

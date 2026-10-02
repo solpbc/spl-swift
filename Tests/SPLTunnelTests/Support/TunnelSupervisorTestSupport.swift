@@ -132,6 +132,8 @@ actor FakeGeneration: TunnelGeneration {
     private var endpoint: TransportEndpoint?
     private(set) var connectionMode: ConnectionMode?
     private var successfulOpenStreamCount = 0
+    private(set) var disconnectCount = 0
+    private var transferring = false
 
     init(script: FakeGenerationScript) {
         self.script = script
@@ -169,7 +171,16 @@ actor FakeGeneration: TunnelGeneration {
         }
     }
 
+    func setTransferring(_ value: Bool) {
+        transferring = value
+    }
+
+    func isTransferring(quiet _: Duration, pendingLimit _: Duration) async -> Bool {
+        transferring
+    }
+
     func disconnect() async {
+        disconnectCount += 1
         await script.disconnectSignal?.signal()
         if let gate = script.disconnectGate {
             await gate.wait()
@@ -502,13 +513,17 @@ func fakeSupervisor(
     factory: FakeGenerationFactory,
     reconnectBackoff: ReconnectBackoff = ReconnectBackoff(schedule: .table([.milliseconds(1)]), random: { _ in 1.0 }),
     sleeper: @escaping @Sendable (Duration) async throws -> Void = { _ in },
+    upgradeSleeper: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+    policy: SessionPolicy = SessionPolicy(),
     retirementCommitTestGate: (@Sendable (UInt64, TunnelSupervisor.RetirementCommitCaller) async -> Void)? = nil
 ) -> TunnelSupervisor {
     TunnelSupervisor(
         pairing: fakePairing(),
         clientInfo: supervisorTestClientInfo,
+        policy: policy,
         reconnectBackoff: reconnectBackoff,
         sleeper: sleeper,
+        upgradeSleeper: upgradeSleeper,
         makeSession: { _, _, _ in
             await factory.makeSession()
         },

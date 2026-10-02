@@ -225,6 +225,13 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening, TunnelAttemptObs
         activeEndpoint
     }
 
+    func isTransferring(quiet: Duration, pendingLimit: Duration) async -> Bool {
+        guard let multiplexer else {
+            return false
+        }
+        return await multiplexer.isTransferring(quiet: quiet, pendingLimit: pendingLimit)
+    }
+
     private func connectOnce(
         endpoints: [TransportEndpoint],
         preferredEndpoint: TransportEndpoint?

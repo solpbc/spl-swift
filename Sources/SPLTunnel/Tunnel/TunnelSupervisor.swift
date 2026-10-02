@@ -28,6 +28,7 @@ protocol TunnelGeneration: TunnelSessioning {
     @discardableResult
     func connect(endpoints: [TransportEndpoint], preferredEndpoint: TransportEndpoint?) async throws -> ConnectedVia
     func connectedEndpoint() async -> TransportEndpoint?
+    func isTransferring(quiet: Duration, pendingLimit: Duration) async -> Bool
 }
 
 extension TunnelSession: TunnelGeneration {}
@@ -109,11 +110,21 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     // generations live ~32 s, proving a 10 s dial-cycle floor was too low.
     private static let stableGenerationInterval: Duration = .seconds(60)
 
+    // A carrier on a worse path than the pairing offers tries the better paths
+    // again after these delays (the last repeats). An interface change tries at
+    // once. A better carrier takes new streams; the old one drains.
+    private static let upgradeDelays: [Duration] = [.seconds(30), .seconds(120), .seconds(600)]
+    private static let drainQuiet: Duration = .seconds(5)
+    private static let drainPendingLimit: Duration = .seconds(30)
+    private static let drainCap: Duration = .seconds(120)
+    private static let drainPoll: Duration = .seconds(1)
+
     private let pairing: StoredPairing
     private let clientInfo: SPLClientInfo
     private let policy: SessionPolicy
     private let makeSession: TunnelGenerationFactory
     private let sleeper: @Sendable (Duration) async throws -> Void
+    private let upgradeSleeper: @Sendable (Duration) async throws -> Void
     private let now: @Sendable () -> ContinuousClock.Instant
     private let retirementCommitTestGate: (@Sendable (UInt64, RetirementCommitCaller) async -> Void)?
     private let stateEmissionTestObserver: @Sendable (TunnelState) -> Void
@@ -145,6 +156,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private var generationFailure: (token: UInt64, error: SessionError)?
     private var plannedEndpoints: [TransportEndpoint] = []
     private var currentVia: ConnectedVia?
+    private var currentEndpoint: TransportEndpoint?
+    private var upgradeTask: Task<Void, Never>?
+    private var upgradeAttempts = 0
+    private var upgradeDialing = false
+    private var draining: [UInt64: (session: any TunnelGeneration, task: Task<Void, Never>)] = [:]
     private var planner = DialPlanner()
     private var backoff = ReconnectBackoff()
     private var pendingRetryStep: ReconnectBackoff.Step?
@@ -172,6 +188,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         policy: SessionPolicy = SessionPolicy(),
         reconnectBackoff: ReconnectBackoff = ReconnectBackoff(),
         sleeper: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        upgradeSleeper: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
         now: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
         makeSession: @escaping TunnelGenerationFactory = { pairing, clientInfo, policy in
             TunnelSession(pairing: pairing, clientInfo: clientInfo, policy: policy)
@@ -186,6 +203,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         self.policy = policy
         self.backoff = reconnectBackoff
         self.sleeper = sleeper
+        self.upgradeSleeper = upgradeSleeper
         self.now = now
         self.makeSession = makeSession
         self.retirementCommitTestGate = retirementCommitTestGate
@@ -260,6 +278,8 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
 
     public func disconnect() async {
         lifecycle = .idle
+        cancelUpgrade()
+        await disconnectDraining()
         pendingRedrive = nil
         redriveSourceToken = nil
         redriveTask?.cancel()
@@ -271,6 +291,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         pendingRetryStep = nil
         setReconnectStatus(nil)
         currentVia = nil
+        currentEndpoint = nil
         publishAttemptState(.idle)
         await clearGeneration(disconnect: true)
         setConnectionMode(nil)
@@ -282,6 +303,17 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             return
         }
         requestRedrive(reason: nil, userInitiated: false, sourceToken: redriveSourceToken ?? currentGenerationToken())
+    }
+
+    /// Try the pairing's better paths now. Does nothing unless a carrier is up on
+    /// a path some other candidate outranks. The current carrier keeps working
+    /// unless a better one connects.
+    public func requestUpgrade() async {
+        guard lifecycle == .running, let current = generation, currentVia != nil, !upgradeDialing else {
+            return
+        }
+        upgradeAttempts = 0
+        scheduleUpgrade(from: current.token, connectedTo: currentEndpoint, immediately: true)
     }
 
     public func openStream() async throws -> MuxStream {
@@ -468,14 +500,17 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             throw SessionError.notConnected
         }
         publishAttemptState(.connected)
+        currentEndpoint = connected.endpoint
         planner.noteConnected(endpoint: connected.endpoint, now: now())
         armStabilityTimer(for: token)
+        scheduleUpgrade(from: token, connectedTo: connected.endpoint, immediately: false)
         supervisorLog.notice("supervisor connected generation=\(token, privacy: .public)")
         return connected.via
     }
 
     private func installGeneration(_ session: any TunnelGeneration, token: UInt64) async {
         cancelStabilityTimer()
+        cancelUpgrade()
         let outgoing = generation
         let shouldRetireOutgoing = outgoing.map { generationFailure?.token == $0.token } ?? false
         if shouldRetireOutgoing, retiringGeneration == nil, let outgoing {
@@ -485,6 +520,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         }
         generation = Generation(token: token, session: session)
         currentVia = nil
+        currentEndpoint = nil
         generationFailure = nil
         stateTask = Task { [session] in
             for await state in session.stateUpdates {
@@ -612,6 +648,9 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         pendingRetryStep = nil
         stabilityTask = nil
         activeStabilityToken = nil
+        if let currentEndpoint, betterCandidates(than: currentEndpoint).isEmpty {
+            upgradeAttempts = 0
+        }
     }
 
     private func handleChildState(_ childState: TunnelState, token: UInt64) async {
@@ -645,6 +684,8 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             publish(childState)
         case .failed(let error):
             currentVia = nil
+            currentEndpoint = nil
+            cancelUpgrade()
             let alreadyRecorded = generationFailure?.token == token
             generationFailure = (token: token, error: error)
             cancelStabilityTimer()
@@ -720,6 +761,8 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             return
         }
         lifecycle = .paused
+        cancelUpgrade()
+        await disconnectDraining()
         pendingRedrive = nil
         redriveSourceToken = nil
         redriveTask?.cancel()
@@ -731,6 +774,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         pendingRetryStep = nil
         planner.noteTerminalPause()
         currentVia = nil
+        currentEndpoint = nil
         publishAttemptState(.terminal(error.attemptFailureClass))
         await clearGeneration(disconnect: true)
         setConnectionMode(nil)
@@ -741,6 +785,164 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             terminalPause: true
         ))
         publish(.failed(error))
+    }
+
+    private func betterCandidates(than endpoint: TransportEndpoint) -> [TransportEndpoint] {
+        let currentRank = CandidateOrdering.rank(endpoint)
+        return plannedEndpoints.filter { CandidateOrdering.rank($0) < currentRank }
+    }
+
+    private func cancelUpgrade() {
+        upgradeTask?.cancel()
+        upgradeTask = nil
+    }
+
+    private func scheduleUpgrade(from token: UInt64, connectedTo endpoint: TransportEndpoint?, immediately: Bool) {
+        cancelUpgrade()
+        guard policy.returnsToBetterPath, let endpoint, !betterCandidates(than: endpoint).isEmpty else {
+            return
+        }
+        let delay = immediately
+            ? Duration.zero
+            : Self.upgradeDelays[min(upgradeAttempts, Self.upgradeDelays.count - 1)]
+        let upgradeSleeper = upgradeSleeper
+        upgradeTask = Task {
+            if delay > .zero {
+                do {
+                    try await upgradeSleeper(delay)
+                } catch {
+                    return
+                }
+            }
+            await self.attemptUpgrade(from: token)
+        }
+    }
+
+    private func isCurrentHealthyGeneration(_ token: UInt64) -> Bool {
+        !Task.isCancelled && lifecycle == .running && generation?.token == token && currentVia != nil
+    }
+
+    private func attemptUpgrade(from token: UInt64) async {
+        guard isCurrentHealthyGeneration(token), let current = generation, let endpoint = currentEndpoint else {
+            return
+        }
+        let better = betterCandidates(than: endpoint)
+        guard !better.isEmpty else {
+            return
+        }
+        upgradeAttempts += 1
+        upgradeDialing = true
+        defer { upgradeDialing = false }
+        supervisorLog.notice("supervisor upgrade attempt generation=\(token, privacy: .public) from=\(endpoint.logDescription, privacy: .public) candidates=\(better.count, privacy: .public)")
+        let candidate = await makeSession(pairing, clientInfo, policy)
+        guard isCurrentHealthyGeneration(token) else {
+            await candidate.disconnect()
+            return
+        }
+        let via: ConnectedVia
+        do {
+            via = try await candidate.connect(endpoints: better, preferredEndpoint: nil)
+        } catch {
+            await candidate.disconnect()
+            supervisorLog.notice("supervisor upgrade found no better path; keeping generation=\(token, privacy: .public)")
+            if isCurrentHealthyGeneration(token) {
+                scheduleUpgrade(from: token, connectedTo: endpoint, immediately: false)
+            }
+            return
+        }
+        let upgradedEndpoint = await candidate.connectedEndpoint()
+        guard isCurrentHealthyGeneration(token) else {
+            await candidate.disconnect()
+            return
+        }
+        promote(candidate, via: via, endpoint: upgradedEndpoint, replacing: current)
+    }
+
+    /// Makes an already-connected carrier the generation new streams use, and
+    /// lets the one it replaces finish what it is carrying.
+    private func promote(
+        _ session: any TunnelGeneration,
+        via: ConnectedVia,
+        endpoint: TransportEndpoint?,
+        replacing old: Generation
+    ) {
+        cancelStabilityTimer()
+        stateTask?.cancel()
+        stateTask = nil
+        modeTask?.cancel()
+        modeTask = nil
+        nextGenerationToken += 1
+        let token = nextGenerationToken
+        generation = Generation(token: token, session: session)
+        generationFailure = nil
+        currentVia = via
+        currentEndpoint = endpoint
+        // The new carrier's dial progress is already buffered in its streams;
+        // replaying it would announce a reconnect that never happened.
+        stateTask = Task { [session] in
+            var connected = false
+            for await state in session.stateUpdates {
+                if !connected {
+                    if case .connected = state {
+                        connected = true
+                    }
+                    continue
+                }
+                await self.handleChildState(state, token: token)
+            }
+        }
+        modeTask = Task { [session] in
+            for await mode in session.connectionModeUpdates where mode != nil {
+                await self.handleChildMode(mode, token: token)
+            }
+        }
+        drain(old)
+        setConnectionMode(endpoint?.isDirect == false ? .plViaSpl : .plDirect)
+        planner.noteConnected(endpoint: endpoint, now: now())
+        armStabilityTimer(for: token)
+        publish(.connected(via: via))
+        supervisorLog.notice("supervisor upgraded generation=\(token, privacy: .public) endpoint=\(endpoint?.logDescription ?? "unknown", privacy: .public) draining=\(old.token, privacy: .public)")
+        scheduleUpgrade(from: token, connectedTo: endpoint, immediately: false)
+    }
+
+    private func drain(_ old: Generation) {
+        let token = old.token
+        let session = old.session
+        let start = now()
+        let now = now
+        let poll = upgradeSleeper
+        let task = Task {
+            while true {
+                let busy = await session.isTransferring(quiet: Self.drainQuiet, pendingLimit: Self.drainPendingLimit)
+                if !busy || start.duration(to: now()) >= Self.drainCap {
+                    break
+                }
+                do {
+                    try await poll(Self.drainPoll)
+                } catch {
+                    break
+                }
+            }
+            await self.finishDrain(token)
+        }
+        draining[token] = (session, task)
+    }
+
+    private func finishDrain(_ token: UInt64) async {
+        guard let entry = draining.removeValue(forKey: token) else {
+            return
+        }
+        supervisorLog.notice("supervisor drained generation=\(token, privacy: .public)")
+        await entry.session.disconnect()
+    }
+
+    private func disconnectDraining() async {
+        let entries = draining
+        draining.removeAll()
+        for (_, entry) in entries {
+            entry.task.cancel()
+            await entry.session.disconnect()
+        }
     }
 
     private func publishAttemptState(_ new: TunnelSupervisorAttemptState) {

@@ -1519,6 +1519,10 @@ private actor GatedOpenGeneration: TunnelGeneration {
         try await base.connect(endpoints: endpoints, preferredEndpoint: preferredEndpoint)
     }
 
+    func isTransferring(quiet _: Duration, pendingLimit _: Duration) async -> Bool {
+        false
+    }
+
     func connectedEndpoint() async -> TransportEndpoint? {
         await base.connectedEndpoint()
     }

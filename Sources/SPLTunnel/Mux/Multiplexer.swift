@@ -78,6 +78,7 @@ public actor Multiplexer {
     /// arrived. `nil` until the first one after `startKeepalive`.
     private var streamInboundTick: UInt64?
     private var lastMatchedPongAt: ContinuousClock.Instant?
+    private var lastStreamInboundAt: ContinuousClock.Instant?
     private var keepaliveStartedAt: ContinuousClock.Instant?
 
     public init(sink: @escaping @Sendable (Data) async throws -> Void, role: Role = .dialer) {
@@ -193,6 +194,19 @@ public actor Multiplexer {
         inboundActivityCounter
     }
 
+    /// Whether application traffic is still moving on this carrier: the peer
+    /// spoke on a stream within `quiet`, or a stream is waiting on a reply it
+    /// was sent within `pendingLimit`. Idle keep-alive streams do not count.
+    public func isTransferring(quiet: Duration, pendingLimit: Duration) async -> Bool {
+        guard !streams.isEmpty else {
+            return false
+        }
+        if let lastStreamInboundAt, lastStreamInboundAt.duration(to: now()) < quiet {
+            return true
+        }
+        return await anyStreamAwaitingPeer(within: pendingLimit)
+    }
+
     func queuedInboundByteCount() async -> Int {
         var total = 0
         for stream in streams.values {
@@ -222,6 +236,7 @@ public actor Multiplexer {
         // behind a full send buffer from a path that has gone dark: a dark path
         // sends nothing at all, control frames included.
         streamInboundTick = keepaliveTickIndex
+        lastStreamInboundAt = now()
 
         let stream = streams[frame.streamID]
         // The peer has spoken on this stream, so it owes us nothing right now.
