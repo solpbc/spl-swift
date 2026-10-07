@@ -45,6 +45,27 @@ struct ErrorMappingTests {
         #expect(RaceCoordinator<Int>.sessionError(from: NWError.tls(-9832)) == .revoked)
     }
 
+    @Test func directConnectFailuresBeforeTLSDoNotReadAsTLS() {
+        // A direct address that refuses or never answers has not proved anything about the peer.
+        for error in [NWError.posix(.ECONNREFUSED), NWError.posix(.ECONNRESET), NWError.posix(.ECONNABORTED)] {
+            let mapped = RaceCoordinator<Int>.sessionError(from: innerTLSError(for: error))
+            #expect(mapped == .transportFailed("connect refused"))
+            #expect(mapped.attemptFailureClass == .transport)
+        }
+        for error in [
+            NWError.posix(.EHOSTUNREACH),
+            NWError.posix(.ENETUNREACH),
+            NWError.posix(.ETIMEDOUT),
+            NWError.dns(-65554),
+        ] {
+            let mapped = RaceCoordinator<Int>.sessionError(from: innerTLSError(for: error))
+            #expect(mapped == .unreachable)
+            #expect(mapped.attemptFailureClass == .unreachable)
+        }
+        let tls = RaceCoordinator<Int>.sessionError(from: innerTLSError(for: NWError.tls(-9800)))
+        #expect(tls.attemptFailureClass == .tls)
+    }
+
     @Test func otherDialErrorMapsToUnreachable() {
         // Other dial errors must fall back to unreachable session errors.
         #expect(RaceCoordinator<Int>.sessionError(from: DialError.connectTimeout) == .unreachable)

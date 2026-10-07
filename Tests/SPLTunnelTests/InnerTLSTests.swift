@@ -27,12 +27,38 @@ struct InnerTLSTests {
             #expect(RaceCoordinator<Int>.sessionError(from: innerTLSError(for: error)) == .revoked)
         }
 
-        for error in [NWError.tls(-9838), NWError.tls(-9800), NWError.posix(.ECONNREFUSED)] {
+        for error in [NWError.tls(-9838), NWError.tls(-9800)] {
             guard let tlsError = innerTLSError(for: error) as? InnerTLSError,
                   case .handshakeFailed = tlsError else {
                 Issue.record("Expected generic handshake failure")
                 continue
             }
+        }
+    }
+
+    @Test func refusedDirectDialReportsTransportNotTLS() async throws {
+        // A real refused connect on loopback must reach the race as a connect failure.
+        let fixture = try TestCA.make()
+        let listener = try NWListener(using: .tcp, on: .any)
+        let ready = AsyncStream<UInt16>.makeStream()
+        listener.stateUpdateHandler = { state in
+            if case .ready = state, let port = listener.port?.rawValue {
+                ready.continuation.yield(port)
+                ready.continuation.finish()
+            }
+        }
+        listener.newConnectionHandler = { $0.cancel() }
+        listener.start(queue: .global())
+        var iterator = ready.stream.makeAsyncIterator()
+        let port = try #require(await iterator.next())
+        listener.cancel()
+
+        do {
+            _ = try await InnerTLS.connectLAN(host: "127.0.0.1", port: Int(port), pairing: fixture.pairing)
+            Issue.record("Expected the refused connect to fail")
+        } catch {
+            let mapped = RaceCoordinator<Int>.sessionError(from: error)
+            #expect(mapped.attemptFailureClass == .transport, "got \(mapped)")
         }
     }
 

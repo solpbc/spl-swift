@@ -39,9 +39,15 @@ public struct RacePolicy: Sendable, Equatable {
     public init(
         stagger: Duration = .milliseconds(50),
         loserGrace: Duration = .milliseconds(250),
-        budget: Duration = .seconds(8),
+        // why: the budget ends a race in which no candidate has connected or reached the
+        // broker, so it must outlast the slowest single open plus its stagger; otherwise it
+        // cuts off a relay open that its own timeout still allows.
+        budget: Duration = .seconds(15),
         directConnectTimeout: Duration = .seconds(5),
-        relayOpenTimeout: Duration = .seconds(5),
+        // why: the relay open is DNS, TCP, TLS and the WebSocket upgrade on a fresh session,
+        // and a slow public network takes 4-5 s for it; a 5 s cap failed opens that were
+        // about to succeed.
+        relayOpenTimeout: Duration = .seconds(12),
         // why: proto/session.md:344 makes waiting-phase timeout client-owned, not relay-owned.
         heldRelayTimeout: Duration = .seconds(600)
     ) {

@@ -11,6 +11,13 @@ private struct RaceTestTimeout: Error, Sendable {}
 
 @Suite("RaceCoordinator", .serialized)
 struct RaceCoordinatorTests {
+    @Test func defaultBudgetOutlastsEachSingleOpen() {
+        // The budget must not end a race while an open its own timeout still allows is in flight.
+        let policy = RacePolicy()
+        #expect(policy.budget > policy.relayOpenTimeout + policy.stagger)
+        #expect(policy.budget > policy.directConnectTimeout + policy.stagger)
+    }
+
     @Test func sortsRFC1918ThenULAThenOtherDirectThenRelay() {
         let relay = TransportEndpoint.relay(
             endpoint: URL(string: "wss://relay.example/session")!,

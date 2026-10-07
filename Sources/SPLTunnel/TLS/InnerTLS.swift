@@ -710,6 +710,22 @@ func innerTLSError(for error: any Error) -> any Error {
     if isPeerAccessDenied(error) {
         return PeerAccessDeniedError()
     }
+    if let sessionError = error as? SessionError {
+        return sessionError
+    }
+    // why: a connection that never reached TLS says nothing about the peer's identity, so
+    // only a TLS-layer failure may read as one; a refusal is a connect failure, and no route,
+    // a timeout or a DNS miss is an address that did not answer.
+    if let networkError = error as? NWError {
+        switch networkError {
+        case .tls:
+            break
+        case .posix(.ECONNREFUSED), .posix(.ECONNRESET), .posix(.ECONNABORTED):
+            return SessionError.transportFailed("connect refused")
+        default:
+            return SessionError.unreachable
+        }
+    }
     return InnerTLSError.handshakeFailed(error.localizedDescription)
 }
 
