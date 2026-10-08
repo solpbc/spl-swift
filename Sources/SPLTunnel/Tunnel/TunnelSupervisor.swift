@@ -160,6 +160,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private var upgradeTask: Task<Void, Never>?
     private var upgradeAttempts = 0
     private var upgradeDialing = false
+    private var lastPromotedToken: UInt64?
     private var draining: [UInt64: (session: any TunnelGeneration, task: Task<Void, Never>)] = [:]
     private var planner = DialPlanner()
     private var backoff = ReconnectBackoff()
@@ -298,11 +299,21 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         publish(.disconnected)
     }
 
+    /// Replace the current carrier. The request names no carrier, so it means
+    /// the one current when it arrives: a caller that saw a failure on a carrier
+    /// a better path has since replaced should not make it. A request that is
+    /// still waiting to retry when a better path takes over is dropped.
     public func requestReconnect() async {
         guard lifecycle == .running else {
             return
         }
-        requestRedrive(reason: nil, userInitiated: false, sourceToken: redriveSourceToken ?? currentGenerationToken())
+        // A recovery already in flight answers this request, unless a better
+        // path has since replaced the carrier it was raised against.
+        let current = currentGenerationToken()
+        let inFlight = redriveSourceToken.flatMap { source in
+            current == lastPromotedToken && current != source ? nil : source
+        }
+        requestRedrive(reason: nil, userInitiated: false, sourceToken: inFlight ?? current)
     }
 
     /// Try the pairing's better paths now. Does nothing unless a carrier is up on
@@ -355,8 +366,12 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         return await session.inboundActivitySnapshot()
     }
 
-    private func establish(reason: SessionError?, userInitiated: Bool) async throws -> ConnectedVia {
-        let current = ensureEstablishment(reason: reason, userInitiated: userInitiated)
+    private func establish(
+        reason: SessionError?,
+        userInitiated: Bool,
+        sourceToken: UInt64? = nil
+    ) async throws -> ConnectedVia {
+        let current = ensureEstablishment(reason: reason, userInitiated: userInitiated, sourceToken: sourceToken)
         do {
             let via = try await current.task.value
             clearEstablishment(token: current.token)
@@ -367,7 +382,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         }
     }
 
-    private func ensureEstablishment(reason: SessionError?, userInitiated: Bool) -> Establishment {
+    private func ensureEstablishment(
+        reason: SessionError?,
+        userInitiated: Bool,
+        sourceToken: UInt64?
+    ) -> Establishment {
         if let establishment {
             return establishment
         }
@@ -375,7 +394,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         nextEstablishmentToken += 1
         let token = nextEstablishmentToken
         let task = Task {
-            try await self.connectUntilEstablished(reason: reason, userInitiated: userInitiated)
+            try await self.connectUntilEstablished(
+                reason: reason,
+                userInitiated: userInitiated,
+                sourceToken: sourceToken
+            )
         }
         let establishment = Establishment(token: token, task: task)
         self.establishment = establishment
@@ -394,9 +417,14 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         establishment = nil
     }
 
-    private func connectUntilEstablished(reason: SessionError?, userInitiated: Bool) async throws -> ConnectedVia {
+    private func connectUntilEstablished(
+        reason: SessionError?,
+        userInitiated: Bool,
+        sourceToken: UInt64?
+    ) async throws -> ConnectedVia {
         var nextReason = reason
         var nextUserInitiated = userInitiated
+        var source = sourceToken
         while lifecycle == .running {
             if !nextUserInitiated {
                 let step = consumeRetryStep()
@@ -419,6 +447,14 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
                 ))
             }
 
+            if let source, let via = supersedingCarrier(of: source) {
+                let current = generation?.token ?? 0
+                supervisorLog.notice("supervisor recovery superseded source=\(source, privacy: .public) generation=\(current, privacy: .public)")
+                setReconnectStatus(nil)
+                publishAttemptState(.connected)
+                return via
+            }
+
             do {
                 let via = try await startGeneration()
                 setReconnectStatus(nil)
@@ -431,9 +467,23 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
                 publishRetryingUnavailable(error)
                 nextReason = error
                 nextUserInitiated = false
+                source = generation?.token
             }
         }
         throw SessionError.notConnected
+    }
+
+    /// A recovery replaces the carrier it was raised against. When a better
+    /// path has already put a healthy carrier in that one's place, there is
+    /// nothing left to recover, and dialing anyway would close the healthy one.
+    private func supersedingCarrier(of source: UInt64) -> ConnectedVia? {
+        guard lifecycle == .running,
+              let current = generation,
+              current.token != source,
+              generationFailure?.token != current.token else {
+            return nil
+        }
+        return currentVia
     }
 
     private func startGeneration() async throws -> ConnectedVia {
@@ -745,7 +795,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             pendingRedrive = nil
             redriveSourceToken = request.sourceToken
             do {
-                _ = try await establish(reason: request.reason, userInitiated: request.userInitiated)
+                _ = try await establish(
+                    reason: request.reason,
+                    userInitiated: request.userInitiated,
+                    sourceToken: request.sourceToken
+                )
             } catch {
                 if !Self.isTerminalPause(error) {
                     supervisorLog.notice("supervisor redrive stopped")
@@ -873,6 +927,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         modeTask = nil
         nextGenerationToken += 1
         let token = nextGenerationToken
+        lastPromotedToken = token
         generation = Generation(token: token, session: session)
         generationFailure = nil
         currentVia = via
@@ -900,6 +955,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         setConnectionMode(endpoint?.isDirect == false ? .plViaSpl : .plDirect)
         planner.noteConnected(endpoint: endpoint, now: now())
         armStabilityTimer(for: token)
+        publishAttemptState(.connected)
         publish(.connected(via: via))
         supervisorLog.notice("supervisor upgraded generation=\(token, privacy: .public) endpoint=\(endpoint?.logDescription ?? "unknown", privacy: .public) draining=\(old.token, privacy: .public)")
         scheduleUpgrade(from: token, connectedTo: endpoint, immediately: false)
