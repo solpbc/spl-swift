@@ -172,7 +172,11 @@ public struct PairClient: Sendable {
             canonical: canonical
         )
         let generated = try materialGenerator(deviceLabel)
-        let jsonBody = try Self.encodePairRequestBody(csrPEM: generated.csrPEM, deviceLabel: deviceLabel)
+        let jsonBody = try Self.encodePairRequestBody(
+            csrPEM: generated.csrPEM,
+            deviceLabel: deviceLabel,
+            platform: clientInfo.platform
+        )
         var sawCAFingerprintMismatch = false
         var lastError: PairError?
 
@@ -481,7 +485,11 @@ public struct PairClient: Sendable {
         }
 
         do {
-            let requestBody = try Self.encodePairRequestBody(csrPEM: csrPEM, deviceLabel: deviceLabel)
+            let requestBody = try Self.encodePairRequestBody(
+                csrPEM: csrPEM,
+                deviceLabel: deviceLabel,
+                platform: clientInfo.platform
+            )
             let stream = try await mux.openStream()
             try await stream.write(Self.buildHTTPRequest(
                 method: "POST",
@@ -506,10 +514,14 @@ public struct PairClient: Sendable {
         }
     }
 
-    static func encodePairRequestBody(csrPEM: String, deviceLabel: String) throws -> Data {
+    static func encodePairRequestBody(
+        csrPEM: String,
+        deviceLabel: String,
+        platform: SPLPlatform? = nil
+    ) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
-        return try encoder.encode(LANPairRequest(csr: csrPEM, deviceLabel: deviceLabel))
+        return try encoder.encode(LANPairRequest(csr: csrPEM, deviceLabel: deviceLabel, platform: platform?.rawValue))
     }
 
     static func pairWindowInnerPath(sBytes: [UInt8]) -> String {
@@ -806,10 +818,13 @@ struct PairHTTPResponse: Equatable, Sendable {
 struct LANPairRequest: Encodable {
     let csr: String
     let deviceLabel: String
+    /// Optional identity hint (proto/pairing.md §5); omitted from the body when nil.
+    let platform: String?
 
     enum CodingKeys: String, CodingKey {
         case csr
         case deviceLabel = "device_label"
+        case platform
     }
 }
 

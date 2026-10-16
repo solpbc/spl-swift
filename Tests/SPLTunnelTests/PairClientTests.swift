@@ -174,6 +174,38 @@ struct PairClientDirectTests {
         #expect(parsed.body == expectedBody)
         let json = try #require(JSONSerialization.jsonObject(with: parsed.body) as? [String: String])
         #expect(json["csr"] == "csr-1")
+        #expect(json["platform"] == nil)
+    }
+
+    // proto/pairing.md §5: the optional `platform` hint rides the pair body
+    // when the consuming app supplies one, and is absent when it does not.
+    @Test func directPairSendsTheConsumersPlatformHint() async throws {
+        defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
+        let fixture = try TestCA.make()
+        let material = PairingMaterialSpy()
+        let pairURL = try Self.directPairURL(candidates: [
+            PairCandidate(address: "192.168.0.10", port: 7657),
+        ])
+        let transport = FakeLANPairTransport(prepareOutcomes: [
+            .attempt(.response(status: 200, body: try Self.pairResponseData(bundle: fixture))),
+        ])
+        let client = PairClient(
+            session: Self.relayFailureSession(status: 503),
+            lanTransport: transport,
+            clientInfo: SPLClientInfo(userAgent: "spl-swift-tests/1", platform: .ios),
+            materialGenerator: material.generate
+        )
+
+        _ = try await client.pair(
+            pairURL: pairURL,
+            deviceLabel: "test phone",
+            relayEndpoint: Self.relayEndpoint
+        )
+
+        let request = try #require(await transport.requests.first)
+        let parsed = try Self.parseRequest(request.requestBytes)
+        let json = try #require(JSONSerialization.jsonObject(with: parsed.body) as? [String: String])
+        #expect(json == ["csr": "csr-1", "device_label": "test phone", "platform": "ios"])
     }
 
     @Test func genericPreRequestFailurePreservesUnderlyingError() async throws {
