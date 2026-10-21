@@ -864,16 +864,55 @@ private func makePumpTasks(transport: any ByteTransport, peer: NWConnection) -> 
     return [inbound, outbound]
 }
 
-private func waitForCompletion(of task: Task<Void, Never>, upTo limit: Duration) async {
-    await withTaskGroup(of: Void.self) { group in
-        group.addTask {
-            await task.value
+/// Returns when `task` finishes or `limit` passes, whichever is first. Awaiting a task's value
+/// cannot be cancelled, so the two race to open a one-shot gate instead.
+func waitForCompletion(of task: Task<Void, Never>, upTo limit: Duration) async {
+    let gate = OneShotGate()
+    let watcher = Task {
+        await task.value
+        gate.open()
+    }
+    let timer = Task {
+        try? await Task.sleep(for: limit)
+        gate.open()
+    }
+    await gate.wait()
+    watcher.cancel()
+    timer.cancel()
+}
+
+private final class OneShotGate: @unchecked Sendable {
+    // why: the watcher and timer tasks race to open the gate; NSLock gives one resume.
+    private let lock = NSLock()
+    private var isOpen = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resumeNow = lock.withLock {
+                if isOpen {
+                    return true
+                }
+                waiter = continuation
+                return false
+            }
+            if resumeNow {
+                continuation.resume()
+            }
         }
-        group.addTask {
-            try? await Task.sleep(for: limit)
+    }
+
+    func open() {
+        let continuation = lock.withLock {
+            guard !isOpen else {
+                return nil as CheckedContinuation<Void, Never>?
+            }
+            isOpen = true
+            let continuation = waiter
+            waiter = nil
+            return continuation
         }
-        await group.next()
-        group.cancelAll()
+        continuation?.resume()
     }
 }
 

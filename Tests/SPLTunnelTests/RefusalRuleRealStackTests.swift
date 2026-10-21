@@ -130,6 +130,47 @@ struct RefusalRuleRealStackTests {
         print("refusal-real-stack negative-twin mode=\(twin.rawValue) endings=\(endings)")
     }
 
+    // An attacker on the path cannot forge the journal's alert after the handshake, but it can
+    // corrupt a record. The client detects that itself, so it is not the journal's verdict.
+    // Falsified by a classifier that counts a locally detected record failure (a bad record MAC
+    // or a decrypt failure) as a received alert: anyone on the path could unpair the owner.
+    @Test func aRecordTamperedWithOnThePathIsUnreachableAndNeverCounts() async throws {
+        var endings: [String: Int] = [:]
+        for run in 0..<realStackRuns {
+            let fixture = try TestCA.make()
+            let server = TLSEchoServer(bundle: fixture, mode: .mux)
+            try await server.start()
+            let proxy = RecordTamperProxy(upstreamPort: await server.port)
+            try await proxy.start()
+            let store = TestRefusalStore()
+            let session = TunnelSession(pairing: fixture.pairing, clientInfo: realStackClientInfo, refusalStore: store)
+            let states = await stateProbe(for: session)
+            let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: await proxy.port, scope: "loopback")
+
+            var ending: SessionError?
+            do {
+                _ = try await session.connect(endpoints: [endpoint])
+                if await waitForFailure(in: states, timeout: .seconds(5), matching: { _ in true }) {
+                    ending = await states.firstFailure(matching: { _ in true })
+                }
+            } catch let error as SessionError {
+                ending = error
+            }
+            if let ending {
+                endings[Self.describe(ending), default: 0] += 1
+                #expect(RaceCoordinator<Int>.isVerdict(ending) == false, "run \(run): \(ending)")
+            } else {
+                Issue.record("run \(run) neither failed nor connected")
+            }
+            #expect((store.record(credential: fixture.pairing.refusalCredential) ?? HandshakeRefusalRecord()) == HandshakeRefusalRecord(), "run \(run)")
+            await session.disconnect()
+            await states.stop()
+            await proxy.stop()
+            await server.stop()
+        }
+        print("refusal-real-stack tampered-record endings=\(endings)")
+    }
+
     // Falsified by reporting an unpinned CA as a generic TLS failure, or by naming no claim.
     @Test func aServerPresentingAnUnpinnedCAIsAnUnknownJournalClaimingThatCAsID() async throws {
         let fixture = try TestCA.make()
@@ -248,12 +289,40 @@ struct RefusalRuleRealStackTests {
         case writeFailsBeforeTheRefusalArrives
         /// The relay leg closes abnormally just after delivering the journal's refusal.
         case webSocketFailsJustAfterTheRefusal
+        /// The relay leg stops taking writes and then delivers nothing more until it is closed.
+        case writeFailsAndTheRelayGoesQuiet
+
+        static let verdictCases: [RelayEnding] = [.writeFailsBeforeTheRefusalArrives, .webSocketFailsJustAfterTheRefusal]
+    }
+
+    // Falsified by a grace that only ends when the relay delivers something: a relay leg that
+    // stops taking writes and goes quiet would hold the bridge, and the session, open.
+    @Test func aFailedRelayWriteWaitsAtMostTheGraceBeforeClosingTheRelayLeg() async throws {
+        let fixture = try TestCA.make()
+        let journal = TLSEchoServer(bundle: fixture, rejectClientCertificate: true)
+        try await journal.start()
+        let transport = try await ScriptedRelayTransport.open(port: await journal.port, ending: .writeFailsAndTheRelayGoesQuiet)
+        let tls = try await InnerTLS.connectViaTransport(transport: transport, pairing: fixture.pairing)
+        try? await tls.send(Data([0x01]))
+
+        #expect(await waitUntil("the relay leg closes", timeout: .seconds(3)) {
+            await transport.closedAt != nil
+        })
+        if let failed = await transport.sendFailedAt, let closed = await transport.closedAt {
+            let waited = failed.duration(to: closed)
+            #expect(waited >= .milliseconds(900), "waited \(waited)")
+            #expect(waited < .milliseconds(1500), "waited \(waited)")
+        } else {
+            Issue.record("the relay write never failed")
+        }
+        await tls.close()
+        await journal.stop()
     }
 
     // Outcome 2. Falsified by a relay bridge that tears down the loopback as soon as the relay
     // leg fails, dropping the journal's alert that the relay still had to deliver: the attempt
     // would read as unreachable instead of a counted refusal.
-    @Test(arguments: RelayEnding.allCases)
+    @Test(arguments: RelayEnding.verdictCases)
     func theRelayLegKeepsTheJournalsVerdict(_ ending: RelayEnding) async throws {
         let fixture = try TestCA.make()
         let journal = TLSEchoServer(bundle: fixture, rejectClientCertificate: true)
@@ -341,6 +410,8 @@ private actor ScriptedRelayTransport: ByteTransport {
     private var released = false
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
     private var deliveredAfterHandshake = false
+    private(set) var sendFailedAt: ContinuousClock.Instant?
+    private(set) var closedAt: ContinuousClock.Instant?
 
     private init(connection: NWConnection, ending: RefusalRuleRealStackTests.RelayEnding) {
         self.connection = connection
@@ -378,10 +449,15 @@ private actor ScriptedRelayTransport: ByteTransport {
             encryptedSends += 1
         }
         // The client's second encrypted send is its first write after the handshake.
-        if ending == .writeFailsBeforeTheRefusalArrives, encryptedSends >= 2 {
-            Task {
-                try? await Task.sleep(for: .milliseconds(100))
-                self.release()
+        if ending != .webSocketFailsJustAfterTheRefusal, encryptedSends >= 2 {
+            if sendFailedAt == nil {
+                sendFailedAt = .now
+            }
+            if ending == .writeFailsBeforeTheRefusalArrives {
+                Task {
+                    try? await Task.sleep(for: .milliseconds(100))
+                    self.release()
+                }
             }
             throw DialError.sendFailed("relay stopped taking writes")
         }
@@ -414,7 +490,7 @@ private actor ScriptedRelayTransport: ByteTransport {
             return data
         }
         // Bytes after the client's encrypted flight carry the journal's verdict.
-        if ending == .writeFailsBeforeTheRefusalArrives, !released {
+        if ending != .webSocketFailsJustAfterTheRefusal, !released {
             await withCheckedContinuation { continuation in
                 releaseWaiters.append(continuation)
             }
@@ -432,6 +508,7 @@ private actor ScriptedRelayTransport: ByteTransport {
             return
         }
         closed = true
+        closedAt = .now
         connection.cancel()
         release()
     }

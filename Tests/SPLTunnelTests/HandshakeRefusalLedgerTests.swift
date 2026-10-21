@@ -234,6 +234,42 @@ struct HandshakeRefusalLedgerTests {
         #expect(await ledger.view().refusals == 2)
     }
 
+    // Falsified by a Keychain encoding that rounds dates (ISO 8601 drops fractional seconds):
+    // the stored time would never match the in-process anchor again.
+    @Test func theKeychainEncodingKeepsDatesExactly() throws {
+        let record = HandshakeRefusalRecord(
+            refusals: 2,
+            lastCountedAt: Date(timeIntervalSince1970: 1_800_000_000.123_456_7),
+            stop: .refusalsExhausted
+        )
+        let decoded = try SPLKeychainRefusalStore.decode(SPLKeychainRefusalStore.encode(record))
+        #expect(decoded == record)
+        #expect(decoded.lastCountedAt?.timeIntervalSinceReferenceDate == record.lastCountedAt?.timeIntervalSinceReferenceDate)
+        #expect(throws: HandshakeRefusalStoreError.decodingFailed) {
+            _ = try SPLKeychainRefusalStore.decode(Data("not a record".utf8))
+        }
+    }
+
+    // Through the production encoding, with a wall clock off whole seconds as it always is.
+    // Falsified by a stored time that loses precision: spacing would fall back to the wall
+    // clock, and the clock set forward here would let a refusal 10 s later count.
+    @Test func spacingWithinAProcessSurvivesTheKeychainEncoding() async {
+        let clock = ManualRefusalClock(wall: Date(timeIntervalSince1970: 1_800_000_000.375))
+        let store = KeychainEncodedRefusalStore()
+        let ledger = HandshakeRefusalLedger(credential: credential, store: store, clock: clock.clock)
+        await ledger.record(.refused)
+
+        clock.advance(.seconds(10))
+        clock.setWall(clock.now.addingTimeInterval(86_400 * 2))
+        await ledger.record(.refused)
+        #expect(await ledger.view().refusals == 1)
+        #expect(store.record(credential: credential)?.refusals == 1)
+
+        clock.advance(.seconds(290))
+        await ledger.record(.refused)
+        #expect(store.record(credential: credential)?.refusals == 2)
+    }
+
     // Falsified by swallowing a failed write: the event would be lost, and the next good write
     // would not carry it.
     @Test func aFailedWriteIsReportedAndKeptForTheNextWrite() async {

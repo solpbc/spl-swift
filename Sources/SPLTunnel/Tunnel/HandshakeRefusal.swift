@@ -119,10 +119,10 @@ enum HandshakeFailure: Sendable, Equatable {
         if status == errSSLFatalAlert {
             return true
         }
-        // why: Security/SecureTransport.h assigns the peer-alert statuses one contiguous
-        // range; errSSLIllegalParam sits inside it but names a local failure.
+        // why: Security/SecureTransport.h assigns the received alerts one contiguous range in
+        // alert order, errSSLIllegalParam (illegal_parameter, 47) included. A record failure
+        // this client detects itself (errSSLBadRecordMac, errSSLDecryptionFail) sits outside it.
         return (errSSLPeerNoRenegotiation...errSSLPeerUnexpectedMsg).contains(status)
-            && status != errSSLIllegalParam
     }
 }
 
@@ -153,6 +153,8 @@ public struct HandshakeRefusalRecord: Codable, Sendable, Equatable {
 /// The record is keyed on the client credential (its certificate fingerprint) and kept
 /// apart from the pairing record, so a new pairing starts fresh. Every update to a record
 /// is a read, then a write of the result.
+/// A store keeps the record's dates exactly: within a process the ledger recognises the
+/// refusal it last counted by its stored time, to measure spacing on the monotonic clock.
 public protocol HandshakeRefusalStore: Sendable {
     /// The record for a credential: `nil` when none exists. Throws when the record
     /// could not be read, which is never treated as "none".
@@ -193,13 +195,7 @@ public struct SPLKeychainRefusalStore: HandshakeRefusalStore {
             guard let data = result as? Data else {
                 throw HandshakeRefusalStoreError.loadFailed(status: errSecInternalError)
             }
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            do {
-                return try decoder.decode(HandshakeRefusalRecord.self, from: data)
-            } catch {
-                throw HandshakeRefusalStoreError.decodingFailed
-            }
+            return try Self.decode(data)
         case errSecItemNotFound:
             return nil
         default:
@@ -208,14 +204,7 @@ public struct SPLKeychainRefusalStore: HandshakeRefusalStore {
     }
 
     public func saveRefusalRecord(_ record: HandshakeRefusalRecord, credential: String) throws {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let data: Data
-        do {
-            data = try encoder.encode(record)
-        } catch {
-            throw HandshakeRefusalStoreError.encodingFailed
-        }
+        let data = try Self.encode(record)
         let policy = recordPolicy(credential: credential)
         let status = SecItemAdd(policy.addAttributes(data: data) as CFDictionary, nil)
         switch status {
@@ -231,6 +220,28 @@ public struct SPLKeychainRefusalStore: HandshakeRefusalStore {
             }
         default:
             throw HandshakeRefusalStoreError.saveFailed(status: status)
+        }
+    }
+
+    // why: dates are stored as the exact Date value; a format that rounds them (ISO 8601 drops
+    // fractional seconds) would never match the ledger's in-process anchor again.
+    static func encode(_ record: HandshakeRefusalRecord) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .deferredToDate
+        do {
+            return try encoder.encode(record)
+        } catch {
+            throw HandshakeRefusalStoreError.encodingFailed
+        }
+    }
+
+    static func decode(_ data: Data) throws -> HandshakeRefusalRecord {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .deferredToDate
+        do {
+            return try decoder.decode(HandshakeRefusalRecord.self, from: data)
+        } catch {
+            throw HandshakeRefusalStoreError.decodingFailed
         }
     }
 

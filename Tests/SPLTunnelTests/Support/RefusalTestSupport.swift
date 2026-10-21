@@ -61,6 +61,27 @@ final class TestRefusalStore: HandshakeRefusalStore, @unchecked Sendable {
     }
 }
 
+/// An in-memory store that keeps each record as the bytes the Keychain store would write.
+final class KeychainEncodedRefusalStore: HandshakeRefusalStore, @unchecked Sendable {
+    // why: store calls are synchronous from ledger actors and test tasks; NSLock guards state.
+    private let lock = NSLock()
+    private var items: [String: Data] = [:]
+
+    func loadRefusalRecord(credential: String) throws -> HandshakeRefusalRecord? {
+        let data = lock.withLock { items[credential] }
+        return try data.map(SPLKeychainRefusalStore.decode)
+    }
+
+    func saveRefusalRecord(_ record: HandshakeRefusalRecord, credential: String) throws {
+        let data = try SPLKeychainRefusalStore.encode(record)
+        lock.withLock { items[credential] = data }
+    }
+
+    func record(credential: String) -> HandshakeRefusalRecord? {
+        try? loadRefusalRecord(credential: credential)
+    }
+}
+
 /// A wall clock and a monotonic clock that move only when a test moves them.
 final class ManualRefusalClock: @unchecked Sendable {
     // why: ledger actors read the clock while test tasks advance it; NSLock guards both values.

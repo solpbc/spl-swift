@@ -35,7 +35,8 @@ struct ErrorMappingTests {
     @Test func receivedAlertsAreTheJournalsVerdictAndNothingElseIs() {
         // proto/session.md § 7: 49 stops, 46 retries, every other received alert is counted.
         // Falsified by narrowing the counted branch to recognised codes (no_renegotiation and the
-        // generic received-alert status would then read as unreachable), by dropping the
+        // generic received-alert status would then read as unreachable, as illegal_parameter
+        // did), by dropping the
         // record-layer alerts, or by counting a close, a reset or a local record failure.
         #expect(HandshakeFailure.verdict(from: NWError.tls(PeerAlert.accessDenied)) == .accessDenied)
         #expect(HandshakeFailure.verdict(from: TLSPeerAlert(status: PeerAlert.accessDenied)) == .accessDenied)
@@ -49,6 +50,7 @@ struct ErrorMappingTests {
             PeerAlert.genericFatal,
             Int32(-9840), // no_renegotiation, a code no journal sends
             Int32(-9831), // unknown_ca
+            Int32(-9830), // illegal_parameter, between 46 and 48 in alert order
         ] {
             #expect(HandshakeFailure.verdict(from: NWError.tls(status)) == .refused, "status \(status)")
             #expect(HandshakeFailure.verdict(from: TLSPeerAlert(status: status)) == .refused, "status \(status)")
@@ -60,7 +62,6 @@ struct ErrorMappingTests {
             NWError.tls(PeerAlert.localDecryptionFailure),
             NWError.tls(PeerAlert.localBadRecordMac),
             NWError.tls(-9800), // errSSLProtocol, detected locally
-            NWError.tls(-9830), // errSSLIllegalParam, inside the peer range but local
             NWError.tls(-9841), // errSSLPeerAuthCompleted, not an alert
             NWError.posix(.ECONNRESET),
             NWError.posix(.ECONNREFUSED),

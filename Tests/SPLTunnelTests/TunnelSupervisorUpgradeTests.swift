@@ -50,6 +50,27 @@ private func waitFor(
 
 @Suite("Supervisor returns to a better path", .serialized)
 struct TunnelSupervisorUpgradeTests {
+    @Test("A better-path candidate that learns the credential stopped pauses the supervisor", arguments: [SessionError.revoked, .refusalsExhausted])
+    func aStoppedCredentialSeenByAnUpgradeCandidatePausesTheSupervisor(_ stop: SessionError) async throws {
+        // Falsified by treating the candidate's stop like any failed upgrade: the supervisor
+        // would keep its carrier and schedule another upgrade dial for a stopped credential.
+        let relay = relayEndpoint()
+        let factory = FakeGenerationFactory(scripts: [.success(relay), .failure(stop)])
+        let upgradeGate = TestSignal()
+        let supervisor = fakeSupervisor(factory: factory, upgradeSleeper: gatedUpgradeSleeper(upgradeGate), policy: returningPolicy)
+
+        #expect(try await supervisor.connect(endpoints: [lanEndpoint, relay]) == relay.connectedVia)
+        await upgradeGate.signal()
+        try await waitFor { await supervisor.attemptState == .terminal(stop.attemptFailureClass) }
+        #expect(await factory.count() == 2)
+        #expect(await supervisor.connectionMode == nil)
+        await expectSessionError(stop) {
+            try await supervisor.connect(endpoints: [lanEndpoint, relay])
+        }
+        #expect(await factory.count() == 2)
+        await supervisor.disconnect()
+    }
+
     @Test("On relay with a LAN path planned, the LAN carrier takes over and the relay drains after its transfer")
     func upgradesToTheBetterPathAndDrainsTheOldCarrier() async throws {
         let relay = relayEndpoint()

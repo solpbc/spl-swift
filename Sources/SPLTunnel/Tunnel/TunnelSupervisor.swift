@@ -948,6 +948,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             via = try await candidate.connect(endpoints: better, preferredEndpoint: nil)
         } catch {
             await candidate.disconnect()
+            // A stopped credential stops this supervisor too, whichever connection learned it.
+            if let sessionError = error as? SessionError, Self.isStop(sessionError) {
+                await pause(sessionError)
+                return
+            }
             supervisorLog.notice("supervisor upgrade found no better path; keeping generation=\(token, privacy: .public)")
             if isCurrentHealthyGeneration(token) {
                 scheduleUpgrade(from: token, connectedTo: endpoint, immediately: false)
