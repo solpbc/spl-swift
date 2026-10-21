@@ -50,9 +50,13 @@ struct JournalIdentityConformanceTests {
     }
 
     @Test func parsePairLinkVectorsMatchAuthorityCorpus() throws {
+        // Every refusal is compared field by field with what the library itself reports,
+        // from parsing and from its own admission check. Falsified by a library error case
+        // that covers two corpus kinds, or that drops a field the corpus pins.
         let vectors = corpus.vectors.filter { $0.operation == "parse_pair_link" }
         #expect(vectors.count == 73)
 
+        var executed = 0
         for vector in vectors {
             guard let input = vector.input,
                   case .encoded(let encoding, let value) = input,
@@ -61,14 +65,21 @@ struct JournalIdentityConformanceTests {
                 continue
             }
 
-            let observed = Self.observePairLink(encoding: encoding, value: value)
+            let observed: PairLinkObservation
+            do {
+                observed = try Self.observePairLink(encoding: encoding, value: value)
+            } catch {
+                Issue.record("vector \(vector.id) input could not be built: \(error)")
+                continue
+            }
+            executed += 1
             switch expected.result {
             case "error":
-                guard case .error(let kind) = observed else {
-                    Issue.record("vector \(vector.id) expected a refusal")
+                guard case .error(let reported) = observed else {
+                    Issue.record("vector \(vector.id) expected a refusal, got \(observed)")
                     continue
                 }
-                #expect(kind == expected.error?.kind, "vector \(vector.id)")
+                #expect(reported.error == expected.error, "vector \(vector.id)")
             case "direct":
                 guard case .direct(let pairURL, let candidates) = observed else {
                     Issue.record("vector \(vector.id) expected direct, got \(observed)")
@@ -91,6 +102,32 @@ struct JournalIdentityConformanceTests {
                 Issue.record("vector \(vector.id) has an unknown result \(expected.result)")
             }
         }
+        #expect(executed == 73)
+    }
+
+    @Test func everyCorpusRefusalKindHasExactlyOneLibraryCase() throws {
+        // Falsified by one library case reporting two corpus kinds (a split that was undone),
+        // or two library cases reporting the same corpus kind.
+        let pairLinkVectors = corpus.vectors.filter { $0.operation == "parse_pair_link" }
+        let kinds = Set(pairLinkVectors.compactMap { $0.expected?.error?.kind })
+        #expect(kinds.count == 6)
+        var casesByKind: [String: Set<String>] = [:]
+        for vector in pairLinkVectors {
+            guard case .encoded(let encoding, let value) = vector.input else {
+                continue
+            }
+            guard case .error(let reported) = try Self.observePairLink(encoding: encoding, value: value),
+                  let libraryCase = reported.libraryCase else {
+                continue
+            }
+            casesByKind[reported.kind, default: []].insert(libraryCase)
+        }
+        #expect(Set(casesByKind.keys) == kinds)
+        for (kind, cases) in casesByKind {
+            #expect(cases.count == 1, "corpus kind \(kind) maps to \(cases.sorted())")
+        }
+        let allCases = casesByKind.values.flatMap { $0 }
+        #expect(allCases.count == Set(allCases).count)
     }
 
     @Test func decodeCrockfordVectorMatchesAuthorityCorpus() throws {
@@ -114,45 +151,27 @@ struct JournalIdentityConformanceTests {
         #expect(key.secPairKeyHeaderValue == expectedHex, "vector \(vector.id)")
     }
 
-    private static func observePairLink(encoding: String, value: String) -> PairLinkObservation {
-        let url: URL
-        let payload: [UInt8]
-        switch encoding {
-        case "link":
-            guard let parsedURL = URL(string: value),
-                  let components = URLComponents(url: parsedURL, resolvingAgainstBaseURL: false),
-                  let fragment = components.percentEncodedFragment,
-                  let decoded = try? Crockford32.decode(fragment) else {
-                return .error("truncated")
-            }
-            url = parsedURL
-            payload = decoded
-        case "blob_hex":
-            guard let decoded = try? bytes(value),
-                  let link = URL(string: "https://go.solstone.app/p#\(Crockford32TestEncoding.encode(decoded))") else {
-                return .error("truncated")
-            }
-            url = link
-            payload = decoded
-        default:
-            return .error("truncated")
-        }
-
+    /// Runs the library on one vector input: the URL parser for a link, the blob parser for
+    /// a blob, then the library's own admission check for a direct link. The refusal is the
+    /// library's error, mapped field by field; nothing here inspects the payload.
+    private static func observePairLink(encoding: String, value: String) throws -> PairLinkObservation {
+        let pairURL: PairURL
         do {
-            let pairURL = try PairURL.parse(url)
+            switch encoding {
+            case "link":
+                pairURL = try PairURL.parse(try #require(URL(string: value)))
+            case "blob_hex":
+                pairURL = try PairURL(payload: try bytes(value))
+            default:
+                throw JournalIdentityCorpusError.unknownEncoding(encoding)
+            }
             if pairURL.kind == .direct {
-                guard pairURL.candidates.allSatisfy({
-                    TunnelAddressClassifier.isValidDirectDialAddressLiteral($0.address)
-                }) else {
-                    return .error("disallowed_direct_ipv4")
-                }
+                try pairURL.admitDirectCandidates()
                 return .direct(pairURL, PairClient.coalesceCandidates(pairURL.candidates))
             }
             return .relay(pairURL)
         } catch let error as PairURLError {
-            return .error(error.kind(for: payload))
-        } catch {
-            return .error("invalid_pair_link")
+            return .error(ReportedRefusal(error))
         }
     }
 
@@ -378,8 +397,14 @@ private extension JournalIdentityCorpus {
         }
     }
 
-    struct RawVectorError: Decodable {
+    struct RawVectorError: Decodable, Equatable {
         let kind: String
+        let address: String?
+        let count: Int?
+        let addressType: Int?
+        let tag: Int?
+        let expected: Int?
+        let got: Int?
     }
 
     struct RawCandidate: Decodable {
@@ -391,36 +416,70 @@ private extension JournalIdentityCorpus {
 private enum PairLinkObservation: CustomStringConvertible {
     case direct(PairURL, [PairCandidate])
     case relay(PairURL)
-    case error(String)
+    case error(ReportedRefusal)
 
     var description: String {
         switch self {
         case .direct(_, _): "direct"
         case .relay(_): "relay"
-        case .error(let kind): "error \(kind)"
+        case .error(let refusal): "error \(refusal)"
         }
     }
 }
 
-private extension PairURLError {
-    func kind(for payload: [UInt8]) -> String {
-        switch self {
-        case .missingFragment:
-            return "truncated"
-        case .invalidLength(_):
-            if payload.first == 0x05, payload.count >= 3,
-               !(1...4).contains(Int(payload[2])) {
-                return "invalid_candidate_count"
-            }
-            return "truncated"
-        case .unsupportedAddrType(_):
-            return "unsupported_address_type"
-        case .unsupportedCAFingerprintTag(_):
-            return "unknown_ca_fp_tag"
+/// A library refusal in the corpus's terms. Each corpus kind comes from exactly one
+/// `PairURLError` case; a case the corpus does not cover keeps its own name, so it can
+/// never pass as a corpus kind.
+private struct ReportedRefusal: CustomStringConvertible {
+    let error: JournalIdentityCorpus.RawVectorError
+    let libraryCase: String?
+
+    var kind: String { error.kind }
+    var description: String { "\(error)" }
+
+    init(_ error: PairURLError) {
+        func refusal(
+            _ kind: String,
+            address: String? = nil,
+            count: Int? = nil,
+            addressType: Int? = nil,
+            tag: Int? = nil,
+            expected: Int? = nil,
+            got: Int? = nil
+        ) -> JournalIdentityCorpus.RawVectorError {
+            JournalIdentityCorpus.RawVectorError(
+                kind: kind,
+                address: address,
+                count: count,
+                addressType: addressType,
+                tag: tag,
+                expected: expected,
+                got: got
+            )
+        }
+        switch error {
+        case .truncated(let expected, let got):
+            self.error = refusal("truncated", expected: expected, got: got)
+            libraryCase = "truncated"
+        case .invalidCandidateCount(let count):
+            self.error = refusal("invalid_candidate_count", count: Int(count))
+            libraryCase = "invalidCandidateCount"
+        case .unsupportedAddrType(let addressType):
+            self.error = refusal("unsupported_address_type", addressType: Int(addressType))
+            libraryCase = "unsupportedAddrType"
+        case .unsupportedCAFingerprintTag(let tag):
+            self.error = refusal("unknown_ca_fp_tag", tag: Int(tag))
+            libraryCase = "unsupportedCAFingerprintTag"
         case .invalidRelayOrigin:
-            return "bad_relay_origin"
-        default:
-            return "invalid_pair_link"
+            self.error = refusal("bad_relay_origin")
+            libraryCase = "invalidRelayOrigin"
+        case .disallowedDirectAddress(let address):
+            self.error = refusal("disallowed_direct_ipv4", address: address)
+            libraryCase = "disallowedDirectAddress"
+        case .wrongScheme, .wrongHost, .wrongPath, .missingFragment, .invalidBase32,
+             .invalidVersion, .lengthMismatch, .malformedOuterURL:
+            self.error = refusal("uncovered:\(error)")
+            libraryCase = nil
         }
     }
 }
@@ -468,6 +527,7 @@ private enum JournalIdentityCorpusError: Error {
     case invalidJIDVector(String)
     case unrecognizedJIDResult(String)
     case invalidHex(String)
+    case unknownEncoding(String)
 }
 
 private func sha256(_ data: Data) -> String {

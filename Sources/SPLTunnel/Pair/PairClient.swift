@@ -162,7 +162,9 @@ public struct PairClient: Sendable {
         // error case (cross-repo consumer in solstone-swift's
         // PairFailureReason) but now only fires for a genuinely invalid
         // literal (unspecified network, multicast/reserved, malformed).
-        guard pairURL.candidates.allSatisfy({ TunnelAddressClassifier.isValidDirectDialAddressLiteral($0.address) }) else {
+        do {
+            try pairURL.admitDirectCandidates()
+        } catch {
             pairLog.notice("direct pair candidates rejected reason=\("invalid_candidate", privacy: .public) count=\(pairURL.candidates.count, privacy: .public)")
             throw PairError.directAddressNotLocal
         }

@@ -94,7 +94,7 @@ struct PairURLTests {
         var bytes = Self.canonicalBytes
         bytes.removeLast()
 
-        expectThrows(.invalidLength(39)) {
+        expectThrows(.truncated(expected: 40, got: 39)) {
             _ = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(bytes)))
         }
     }
@@ -103,7 +103,7 @@ struct PairURLTests {
         var bytes = Self.canonicalBytes
         bytes.append(0x00)
 
-        expectThrows(.invalidLength(41)) {
+        expectThrows(.lengthMismatch(expected: 40, got: 41)) {
             _ = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(bytes)))
         }
     }
@@ -139,7 +139,7 @@ struct PairURLTests {
         var bytes = Self.relayBytes()
         bytes[26] = 0x04
 
-        expectThrows(.invalidLength(27)) {
+        expectThrows(.truncated(expected: 31, got: 27)) {
             _ = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(bytes)))
         }
     }
@@ -172,7 +172,7 @@ struct PairURLTests {
         var bytes = Self.multiAddressBytes
         bytes[2] = 0
 
-        expectThrows(.invalidLength(bytes.count)) {
+        expectThrows(.invalidCandidateCount(0)) {
             _ = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(bytes)))
         }
     }
@@ -181,7 +181,7 @@ struct PairURLTests {
         var bytes = Self.multiAddressBytes
         bytes.removeLast()
 
-        expectThrows(.invalidLength(bytes.count)) {
+        expectThrows(.truncated(expected: 45, got: 44)) {
             _ = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(bytes)))
         }
     }
@@ -190,7 +190,7 @@ struct PairURLTests {
         var bytes = Self.multiAddressBytes
         bytes.append(0x00)
 
-        expectThrows(.invalidLength(bytes.count)) {
+        expectThrows(.lengthMismatch(expected: 45, got: 46)) {
             _ = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(bytes)))
         }
     }
@@ -202,6 +202,19 @@ struct PairURLTests {
         expectThrows(.unsupportedAddrType(0x02)) {
             _ = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(bytes)))
         }
+    }
+
+    @Test func admissionNamesTheFirstDisallowedCandidateInLinkOrder() throws {
+        // Falsified by an admission check that reports only a boolean, or the last refused address.
+        var bytes = Self.multiAddressBytes
+        bytes[5...8] = [224, 0, 0, 1]
+        bytes[9...12] = [0, 1, 2, 3]
+        let pairURL = try PairURL.parse(Self.url(fragment: Crockford32TestEncoding.encode(bytes)))
+
+        expectThrows(.disallowedDirectAddress("224.0.0.1")) {
+            try pairURL.admitDirectCandidates()
+        }
+        try PairURL.parse(Self.url(fragment: Self.multiAddressBlob)).admitDirectCandidates()
     }
 
     @Test func rejectsFutureVersion() {

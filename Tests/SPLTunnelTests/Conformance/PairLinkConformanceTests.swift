@@ -41,12 +41,12 @@ struct PairLinkConformanceTests {
     @Test func multiCandidateOutOfRangeCountsAreMalformed() throws {
         // proto/pairing.md:96,102,104 require out-of-range 0x05 counts to be refused before key generation or dialing.
         let zero = Self.multiCandidateBytes(count: 0)
-        #expect(throws: PairURLError.invalidLength(zero.count)) {
+        #expect(throws: PairURLError.invalidCandidateCount(0)) {
             _ = try PairURL.parse(Self.link(bytes: zero))
         }
 
         let five = Self.multiCandidateBytes(count: 5)
-        #expect(throws: PairURLError.invalidLength(five.count)) {
+        #expect(throws: PairURLError.invalidCandidateCount(5)) {
             _ = try PairURL.parse(Self.link(bytes: five))
         }
     }

@@ -68,12 +68,16 @@ public struct PairURL: Sendable, Equatable, Hashable {
         } catch let error as Crockford32Error {
             throw PairURLError.invalidBase32(error)
         }
+        try self.init(payload: bytes)
+    }
 
-        guard !bytes.isEmpty else {
-            throw PairURLError.invalidLength(bytes.count)
+    /// Parses the decoded pair-link blob.
+    init(payload bytes: [UInt8]) throws {
+        guard let version = bytes.first else {
+            throw PairURLError.truncated(expected: 1, got: 0)
         }
 
-        switch bytes[0] {
+        switch version {
         case Self.directVersion:
             try self.init(directBytes: bytes)
         case Self.multiVersion:
@@ -81,20 +85,39 @@ public struct PairURL: Sendable, Equatable, Hashable {
         case Self.relayVersion:
             try self.init(relayBytes: bytes)
         default:
-            throw PairURLError.invalidVersion(bytes[0])
+            throw PairURLError.invalidVersion(version)
+        }
+    }
+
+    /// Refuses a direct link that names an address no client may dial, naming
+    /// the first such candidate in link order. Relay links have no candidates.
+    func admitDirectCandidates() throws {
+        if let refused = candidates.first(where: {
+            !TunnelAddressClassifier.isValidDirectDialAddressLiteral($0.address)
+        }) {
+            throw PairURLError.disallowedDirectAddress(refused.address)
+        }
+    }
+
+    private static func require(_ bytes: [UInt8], count expected: Int) throws {
+        guard bytes.count >= expected else {
+            throw PairURLError.truncated(expected: expected, got: bytes.count)
+        }
+    }
+
+    private static func requireExact(_ bytes: [UInt8], count expected: Int) throws {
+        try require(bytes, count: expected)
+        guard bytes.count == expected else {
+            throw PairURLError.lengthMismatch(expected: expected, got: bytes.count)
         }
     }
 
     private init(directBytes bytes: [UInt8]) throws {
-        guard bytes.count >= 2 else {
-            throw PairURLError.invalidLength(bytes.count)
-        }
+        try Self.require(bytes, count: 40)
         guard bytes[1] == 0x01 else {
             throw PairURLError.unsupportedAddrType(bytes[1])
         }
-        guard bytes.count == 40 else {
-            throw PairURLError.invalidLength(bytes.count)
-        }
+        try Self.requireExact(bytes, count: 40)
 
         let addressBytes = Array(bytes[2..<6])
         let port = UInt16(bytes[6]) << 8 | UInt16(bytes[7])
@@ -110,19 +133,16 @@ public struct PairURL: Sendable, Equatable, Hashable {
     }
 
     private init(multiBytes bytes: [UInt8]) throws {
-        guard bytes.count >= 3 else {
-            throw PairURLError.invalidLength(bytes.count)
-        }
+        try Self.require(bytes, count: 3)
         guard bytes[1] == 0x01 else {
             throw PairURLError.unsupportedAddrType(bytes[1])
         }
+        guard 1...4 ~= bytes[2] else {
+            throw PairURLError.invalidCandidateCount(bytes[2])
+        }
         let count = Int(bytes[2])
-        guard 1...4 ~= count else {
-            throw PairURLError.invalidLength(bytes.count)
-        }
-        guard bytes.count == 5 + 4 * count + 32 else {
-            throw PairURLError.invalidLength(bytes.count)
-        }
+        try Self.require(bytes, count: 5)
+        try Self.requireExact(bytes, count: 5 + 4 * count + 32)
 
         let port = UInt16(bytes[3]) << 8 | UInt16(bytes[4])
         var parsedCandidates: [PairCandidate] = []
@@ -146,9 +166,7 @@ public struct PairURL: Sendable, Equatable, Hashable {
     }
 
     private init(relayBytes bytes: [UInt8]) throws {
-        guard bytes.count >= 27 else {
-            throw PairURLError.invalidLength(bytes.count)
-        }
+        try Self.require(bytes, count: 27)
         guard bytes[9] == 0x01 else {
             throw PairURLError.unsupportedCAFingerprintTag(bytes[9])
         }
@@ -156,14 +174,10 @@ public struct PairURL: Sendable, Equatable, Hashable {
         let parsedRelayOrigin: RelayOrigin
         let selectorLength = Int(bytes[26])
         if selectorLength == 0 {
-            guard bytes.count == 27 else {
-                throw PairURLError.invalidLength(bytes.count)
-            }
+            try Self.requireExact(bytes, count: 27)
             parsedRelayOrigin = .wellKnown
         } else {
-            guard bytes.count == 27 + selectorLength else {
-                throw PairURLError.invalidLength(bytes.count)
-            }
+            try Self.requireExact(bytes, count: 27 + selectorLength)
             let originBytes = bytes[27..<(27 + selectorLength)]
             guard let origin = String(bytes: originBytes, encoding: .utf8),
                   let url = URL(string: origin),
@@ -193,6 +207,14 @@ public enum PairURLError: Error, Equatable, Sendable {
     case unsupportedAddrType(UInt8)
     case unsupportedCAFingerprintTag(UInt8)
     case invalidRelayOrigin
-    case invalidLength(Int)
+    /// The blob ends before a field its form needs: `expected` bytes were
+    /// needed and `got` were present.
+    case truncated(expected: Int, got: Int)
+    /// The blob is longer than its form allows.
+    case lengthMismatch(expected: Int, got: Int)
+    /// A multi-candidate direct link names a candidate count outside 1-4.
+    case invalidCandidateCount(UInt8)
+    /// A direct link names an address no client may dial.
+    case disallowedDirectAddress(String)
     case malformedOuterURL
 }
