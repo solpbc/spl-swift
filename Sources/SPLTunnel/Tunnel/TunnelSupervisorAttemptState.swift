@@ -65,6 +65,14 @@ extension SessionError {
             .notEntitled
         case .revoked:
             .revoked
+        case .refused:
+            .refused
+        case .certificateUnknown:
+            .certificateUnknown
+        case .unknownJournal:
+            .unknownJournal
+        case .refusalsExhausted:
+            .refusalsExhausted
         case .transportFailed, .inboundClosed, .directKeepaliveMissed, .relayKeepaliveMissed:
             .transport
         case .notConnected:

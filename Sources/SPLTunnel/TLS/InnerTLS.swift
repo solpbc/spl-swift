@@ -22,13 +22,15 @@ public enum InnerTLSError: Error, Equatable, Sendable {
     case invalidPrivateKey
     case peerNotPinned
     case caFingerprintMismatch
+    /// The peer presented a certificate that does not chain to the paired journal's CA.
+    /// `claimedJournalID` is what the peer claims, never a proven identity; see
+    /// ``UnknownJournalSighting/claimedJournalID``.
+    case unknownJournal(claimedJournalID: String?)
     case handshakeFailed(String)
     case sendFailed(String)
     case receiveFailed(String)
     case closed
 }
-
-private struct PeerAccessDeniedError: Error, Sendable {}
 
 public actor InnerTLS {
     public nonisolated var inbound: AsyncThrowingStream<Data, Error> {
@@ -315,10 +317,7 @@ public actor InnerTLS {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 connection.send(content: plaintext, completion: .contentProcessed { error in
                     if let error {
-                        let mapped: any Error = isPeerAccessDenied(error)
-                            ? PeerAccessDeniedError()
-                            : InnerTLSError.sendFailed(error.localizedDescription)
-                        continuation.resume(throwing: mapped)
+                        continuation.resume(throwing: establishedTLSError(error, otherwise: InnerTLSError.sendFailed))
                     } else {
                         continuation.resume()
                     }
@@ -358,10 +357,7 @@ public actor InnerTLS {
                 }
                 inboundContinuation.finish()
             } catch {
-                let mapped: any Error = isPeerAccessDenied(error)
-                    ? PeerAccessDeniedError()
-                    : InnerTLSError.receiveFailed(error.localizedDescription)
-                inboundContinuation.finish(throwing: mapped)
+                inboundContinuation.finish(throwing: establishedTLSError(error, otherwise: InnerTLSError.receiveFailed))
             }
         }
     }
@@ -381,19 +377,39 @@ public actor InnerTLS {
         sec_protocol_options_set_max_tls_protocol_version(secOptions, .TLSv13)
         sec_protocol_options_set_local_identity(secOptions, identity)
         // why: SPLTunnel pins its private CA; the verify block replaces default hostname validation.
-        sec_protocol_options_set_verify_block(secOptions, { _, trust, complete in
+        sec_protocol_options_set_verify_block(secOptions, { metadata, trust, complete in
             let secTrust = sec_trust_copy_ref(trust).takeRetainedValue()
+            let presented = presentedCertificates(metadata: metadata, trust: secTrust)
             SecTrustSetPolicies(secTrust, SecPolicyCreateBasicX509())
             SecTrustSetAnchorCertificates(secTrust, caCertificates as CFArray)
             SecTrustSetAnchorCertificatesOnly(secTrust, true)
             var error: CFError?
             let trusted = SecTrustEvaluateWithError(secTrust, &error)
             if !trusted {
-                verifyFailure.set(.peerNotPinned)
+                verifyFailure.set(untrustedPeerFailure(presented: presented, pinned: caCertificates))
             }
             complete(trusted)
         }, tlsQueue)
         return options
+    }
+
+    /// Why a peer whose chain did not verify against the pinned CA was refused.
+    ///
+    /// A leaf the pinned CA signed is the paired journal's own certificate failing another
+    /// check, such as its dates against a wrong clock: an ordinary handshake failure. Any
+    /// other peer is not the paired journal, and what it presented decides what it claims.
+    static func untrustedPeerFailure(presented: [SecCertificate], pinned: [SecCertificate]) -> InnerTLSError {
+        let pinnedDER = Set(pinned.map { SecCertificateCopyData($0) as Data })
+        if let leaf = presented.first,
+           !pinnedDER.contains(SecCertificateCopyData(leaf) as Data),
+           pinned.contains(where: { CertChain.isSigned(leaf, by: $0) }) {
+            return .handshakeFailed("paired journal certificate rejected")
+        }
+        if presented.contains(where: { pinnedDER.contains(SecCertificateCopyData($0) as Data) }) {
+            // The paired journal's CA, presented without a certificate it signed.
+            return .unknownJournal(claimedJournalID: nil)
+        }
+        return .unknownJournal(claimedJournalID: CertChain.claimedJournalID(presented: presented))
     }
 
     static func lanParametersForTesting(host: String, unpinnedInterface: Bool) -> NWParameters {
@@ -707,9 +723,8 @@ func startAndReturnReadyWaiter(_ connection: NWConnection) -> InnerTLSConnection
 }
 
 func innerTLSError(for error: any Error) -> any Error {
-    if isPeerAccessDenied(error) {
-        return PeerAccessDeniedError()
-    }
+    // why: an alert during the handshake comes from a peer this client has not yet confirmed,
+    // so it is never the journal's verdict (proto/session.md § 7); it is an ordinary failure.
     if let sessionError = error as? SessionError {
         return sessionError
     }
@@ -729,18 +744,41 @@ func innerTLSError(for error: any Error) -> any Error {
     return InnerTLSError.handshakeFailed(error.localizedDescription)
 }
 
-func isPeerAccessDenied(_ error: any Error) -> Bool {
-    // InnerTLS carries the production mapping; raw NWError remains accepted so post-ready tests can inject it.
-    if error is PeerAccessDeniedError {
-        return true
+/// Maps a failed read or write on an established inner TLS connection, keeping a
+/// received alert's status so the journal's verdict can be classified.
+func establishedTLSError(_ error: any Error, otherwise: (String) -> InnerTLSError) -> any Error {
+    if let networkError = error as? NWError,
+       case .tls(let status) = networkError,
+       HandshakeFailure.isReceivedAlert(status) {
+        return TLSPeerAlert(status: status)
     }
-    guard let networkError = error as? NWError else {
-        return false
+    return otherwise(error.localizedDescription)
+}
+
+/// The certificates the peer presented, leaf first.
+private func presentedCertificates(metadata: sec_protocol_metadata_t, trust: SecTrust) -> [SecCertificate] {
+    let collector = PresentedCertificateCollector()
+    let accessed = sec_protocol_metadata_access_peer_certificate_chain(metadata) { certificate in
+        collector.append(sec_certificate_copy_ref(certificate).takeRetainedValue())
     }
-    if case let .tls(status) = networkError {
-        return status == errSSLPeerAccessDenied
+    if accessed, !collector.certificates.isEmpty {
+        return collector.certificates
     }
-    return false
+    return (SecTrustCopyCertificateChain(trust) as? [SecCertificate]) ?? []
+}
+
+private final class PresentedCertificateCollector: @unchecked Sendable {
+    // why: Security calls the chain accessor synchronously on the verify queue; the lock keeps it safe if not.
+    private let lock = NSLock()
+    private var collected: [SecCertificate] = []
+
+    var certificates: [SecCertificate] {
+        lock.withLock { collected }
+    }
+
+    func append(_ certificate: SecCertificate) {
+        lock.withLock { collected.append(certificate) }
+    }
 }
 
 private func startAndWaitReady(_ listener: NWListener) async throws {
@@ -767,38 +805,76 @@ private func startAndWaitReady(_ listener: NWListener) async throws {
     }
 }
 
+/// How long the relay bridge keeps delivering what the relay returns after the relay leg
+/// stopped taking this client's writes.
+let relayBridgeVerdictGrace: Duration = .seconds(1)
+
+// why: a journal that refuses this device sends its alert and closes, and the relay leg can
+// end, or stop taking writes, in that same moment. Every byte the relay returns reaches the
+// TLS client before teardown, and the loopback then ends with a FIN after those bytes, never
+// a reset, so the attempt is classified by the journal's alert instead of as unreachable.
 private func makePumpTasks(transport: any ByteTransport, peer: NWConnection) -> [Task<Void, Never>] {
     let inbound = Task {
-        do {
-            while !Task.isCancelled {
-                guard let data = try await transport.receive() else {
-                    peer.send(content: nil, isComplete: true, completion: .contentProcessed { _ in })
-                    return
-                }
-                try await sendRaw(data, to: peer)
+        while !Task.isCancelled {
+            let data: Data?
+            do {
+                data = try await transport.receive()
+            } catch {
+                break
             }
-        } catch {
-            peer.cancel()
-            await transport.close()
+            guard let data else {
+                break
+            }
+            do {
+                try await sendRaw(data, to: peer)
+            } catch {
+                peer.cancel()
+                await transport.close()
+                return
+            }
         }
+        peer.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
+        await transport.close()
     }
 
     let outbound = Task {
-        do {
-            while !Task.isCancelled {
-                guard let data = try await receiveRaw(from: peer) else {
-                    await transport.close()
-                    return
-                }
-                try await transport.send(data)
+        while !Task.isCancelled {
+            let data: Data?
+            do {
+                data = try await receiveRaw(from: peer)
+            } catch {
+                peer.cancel()
+                await transport.close()
+                return
             }
-        } catch {
-            peer.cancel()
-            await transport.close()
+            guard let data else {
+                await transport.close()
+                return
+            }
+            do {
+                try await transport.send(data)
+            } catch {
+                await waitForCompletion(of: inbound, upTo: relayBridgeVerdictGrace)
+                await transport.close()
+                return
+            }
         }
     }
 
     return [inbound, outbound]
+}
+
+private func waitForCompletion(of task: Task<Void, Never>, upTo limit: Duration) async {
+    await withTaskGroup(of: Void.self) { group in
+        group.addTask {
+            await task.value
+        }
+        group.addTask {
+            try? await Task.sleep(for: limit)
+        }
+        await group.next()
+        group.cancelAll()
+    }
 }
 
 private func sendRaw(_ data: Data, to connection: NWConnection) async throws {

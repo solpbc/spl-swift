@@ -43,6 +43,14 @@ enum TunnelStateLogDescription {
             return "tlsFailed"
         case .revoked:
             return "revoked"
+        case .refused:
+            return "refused"
+        case .certificateUnknown:
+            return "certificateUnknown"
+        case .unknownJournal:
+            return "unknownJournal"
+        case .refusalsExhausted:
+            return "refusalsExhausted"
         case .authRefreshRequired:
             return "authRefreshRequired"
         case .notEntitled:

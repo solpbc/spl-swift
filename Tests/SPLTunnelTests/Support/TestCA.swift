@@ -4,6 +4,7 @@
 import Crypto
 import Foundation
 import Security
+import Testing
 @testable import SPLTunnel
 
 enum TestCA {
@@ -76,6 +77,40 @@ enum TestCA {
             clientPrivateKeyPEM: clientKeyPEM,
             pairing: pairing
         )
+    }
+
+    /// A server leaf signed by `issuer`'s CA, presented with `presentedCAPEM` (the issuer's own
+    /// CA unless given) as the rest of its chain.
+    static func serverIdentity(
+        signedBy issuer: Bundle,
+        presentedCAPEM: String? = nil,
+        notBefore: Date = Date(timeIntervalSinceNow: -3600),
+        notAfter: Date = Date(timeIntervalSinceNow: 86400)
+    ) throws -> TLSServerIdentity {
+        let caKey = try CryptoCSR.pkcs8PEMToPrivateKey(issuer.caPrivateKeyPEM)
+        let serverKey = P256.Signing.PrivateKey()
+        let leafDER = try CertBuilder.certificate(
+            subject: "localhost",
+            issuer: "solstone-test-ca",
+            subjectPublicKey: serverKey.publicKey,
+            issuerPrivateKey: caKey,
+            isCA: false,
+            extendedKeyUsage: [CertBuilder.oidServerAuth],
+            subjectAlternativeNames: true,
+            notBefore: notBefore,
+            notAfter: notAfter
+        )
+        let leafPEM = CryptoCSR.pemEncode(leafDER, label: "CERTIFICATE")
+        return TLSServerIdentity(
+            chainPEM: "\(leafPEM)\n\(presentedCAPEM ?? issuer.caCertificatePEM)",
+            privateKeyPEM: CryptoCSR.pemEncode(CryptoCSR.exportPKCS8(serverKey), label: "PRIVATE KEY")
+        )
+    }
+
+    /// The journal ID of a fixture's CA, as a peer presenting it would claim.
+    static func journalID(of bundle: Bundle) throws -> String {
+        let ca = try #require(try CertChain.certificates(fromPEM: bundle.caCertificatePEM).first)
+        return try CertChain.jidFromSPKI(CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: ca))
     }
 
     static func secIdentity(certificatePEM: String, privateKeyPEM: String) throws -> sec_identity_t {

@@ -243,8 +243,10 @@ struct TunnelSupervisorTests {
         await reconnects.stop()
     }
 
-    @Test func terminalPeerAccessDeniedPauseRearmsOnConnectSameSupervisor() async throws {
-        // Security/SecBase.h: peer access denied pauses once and an explicit connect re-arms the supervisor.
+    @Test func terminalPeerAccessDeniedPauseDoesNotRearmOnConnectSameSupervisor() async throws {
+        // proto/session.md § 7: access denied pauses once, and the stop latches: an explicit
+        // connect no longer re-arms the supervisor. Falsified by the earlier re-arm, which dialled
+        // a stopped credential again.
         let relay = relayEndpoint()
         let factory = FakeGenerationFactory(scripts: [
             .failure(.revoked),
@@ -270,8 +272,11 @@ struct TunnelSupervisorTests {
             await factory.count() > 1
         } == false)
 
-        _ = try await supervisor.connect(endpoints: [relay])
-        #expect(await factory.count() == 2)
+        await expectSessionError(.revoked) {
+            try await supervisor.connect(endpoints: [relay])
+        }
+        #expect(await factory.count() == 1)
+        #expect(await states.count(.failed(.revoked)) == 1)
         await supervisor.disconnect()
         await states.stop()
         await reconnects.stop()
@@ -403,7 +408,9 @@ struct TunnelSupervisorTests {
     }
 
     @Test(arguments: supervisorRaceEndpoints)
-    func peerAccessDeniedThenLaterGenericCallbackPausesOnceAndRearms(_ endpoint: TransportEndpoint) async throws {
+    func peerAccessDeniedThenLaterGenericCallbackPausesOnceAndStaysStopped(_ endpoint: TransportEndpoint) async throws {
+        // Falsified by a second terminal pause for one denial, or by a connect that re-arms a
+        // stopped credential.
         let tls = FakeTunnelTLS()
         let replacementTLS = FakeTunnelTLS()
         let tlsSequence = TunnelTLSSequence([tls, replacementTLS])
@@ -434,8 +441,10 @@ struct TunnelSupervisorTests {
             return terminalCount > 1 || invocationCount > 1
         } == false)
 
-        _ = try await supervisor.connect(endpoints: [endpoint])
-        #expect(await connector.invocationCount == 2)
+        await expectSessionError(.revoked) {
+            try await supervisor.connect(endpoints: [endpoint])
+        }
+        #expect(await connector.invocationCount == 1)
         await supervisor.disconnect()
         await states.stop()
         await reconnects.stop()
@@ -573,8 +582,8 @@ struct TunnelSupervisorTests {
                 schedule: .table([.milliseconds(1)]),
                 random: { _ in 1.0 }
             ),
-            makeSession: { pairing, _, policy in
-                let session = TunnelSession(pairing: pairing, policy: policy, tlsConnector: connector.connector)
+            makeSession: { pairing, _, policy, context in
+                let session = TunnelSession(pairing: pairing, policy: policy, tlsConnector: connector.connector, refusalLedger: context.refusals)
                 if await generations.isSuccessor() {
                     return session
                 }
@@ -648,8 +657,8 @@ struct TunnelSupervisorTests {
             pairing: fakePairing(),
             clientInfo: supervisorClientInfo,
             policy: SessionPolicy(race: controlledRacePolicy()),
-            makeSession: { pairing, _, policy in
-                let session = TunnelSession(pairing: pairing, policy: policy, tlsConnector: connector.connector)
+            makeSession: { pairing, _, policy, context in
+                let session = TunnelSession(pairing: pairing, policy: policy, tlsConnector: connector.connector, refusalLedger: context.refusals)
                 if await generations.isSuccessor() { return session }
                 return GatedOpenGeneration(base: session, gate: openReturnGate)
             },
@@ -959,8 +968,11 @@ struct TunnelSupervisorTests {
         await reconnects.stop()
     }
 
-    @Test func preReadyPeerAccessDeniedPausesDirectAndRelayForFailedAndWaiting() async throws {
-        // Security/SecBase.h: access denied before ready pauses without fallback or autonomous redrive.
+    @Test func preReadyPeerAccessDeniedNeverPausesAndTheNextAttemptConnects() async throws {
+        // proto/session.md § 7: an access denied before ready comes from a peer the client has
+        // not confirmed, so it is an ordinary handshake failure: retried, never a stop, never
+        // counted. Security/SecBase.h: errSSLPeerAccessDenied is -9832. Falsified by the earlier
+        // pause on a pre-ready access denied, which let a forged alert unpair the device.
         let direct = directEndpoint("10.0.0.5")
         let relay = relayEndpoint()
         let terminalStatus = ReconnectStatus(
@@ -976,25 +988,23 @@ struct TunnelSupervisorTests {
         ] {
             for endpoint in [direct, relay] {
                 let error = innerTLSError(for: try #require(preReadyNetworkError(from: state)))
+                let calls = PreReadyDenialCalls()
                 let connector = ConnectorProbe { _, _, _ in
-                    throw error
+                    if await calls.next() == 1 {
+                        throw error
+                    }
+                    return FakeTunnelTLS()
                 }
                 let supervisor = supervisorWithConnector(connector, racePolicy: allCandidatesRacePolicy())
                 let states = await stateProbe(for: supervisor)
                 let reconnects = await reconnectProbe(for: supervisor)
 
-                await expectSessionError(.revoked) {
-                    try await supervisor.connect(endpoints: [endpoint])
-                }
-                #expect(await waitForFailure(.revoked, in: states))
-                #expect(await waitUntil("terminal reconnect status") {
-                    await reconnects.count(terminalStatus) >= 1
-                })
-                #expect(await reconnects.count(terminalStatus) == 1)
-                #expect(await connector.invocationCount == 1)
-                #expect(await conditionObserved(timeout: .milliseconds(100)) {
-                    await connector.invocationCount > 1
-                } == false)
+                #expect(try await supervisor.connect(endpoints: [endpoint]) == endpoint.connectedVia)
+                #expect(await waitForState(.connected(via: endpoint.connectedVia), in: states))
+                #expect(await connector.invocationCount == 2)
+                #expect(await states.containsFailure { $0 == .revoked } == false)
+                #expect(await reconnects.count(terminalStatus) == 0)
+                #expect(await supervisor.attemptState == .connected)
                 await supervisor.disconnect()
                 await states.stop()
                 await reconnects.stop()
@@ -1416,7 +1426,7 @@ private func supervisorWithConnector(
         clientInfo: supervisorClientInfo,
         policy: SessionPolicy(race: racePolicy),
         reconnectBackoff: reconnectBackoff,
-        makeSession: { pairing, _, policy in
+        makeSession: { pairing, _, policy, context in
             if await generations.isSuccessor(), let successorInstallGate {
                 return TunnelSession(
                     pairing: pairing,
@@ -1424,13 +1434,15 @@ private func supervisorWithConnector(
                     tlsConnector: connector.connector,
                     installWindowTestGate: {
                         await successorInstallGate.waitForRelease()
-                    }
+                    },
+                    refusalLedger: context.refusals
                 )
             }
             return TunnelSession(
                 pairing: pairing,
                 policy: policy,
-                tlsConnector: connector.connector
+                tlsConnector: connector.connector,
+                refusalLedger: context.refusals
             )
         },
         retirementCommitTestGate: retirementCommitTestGate,
@@ -1718,5 +1730,14 @@ private func expectSameEndpoints(_ actual: [TransportEndpoint], _ expected: [Tra
     #expect(actual.count == expected.count)
     for endpoint in expected {
         #expect(actual.contains(endpoint))
+    }
+}
+
+private actor PreReadyDenialCalls {
+    private var count = 0
+
+    func next() -> Int {
+        count += 1
+        return count
     }
 }

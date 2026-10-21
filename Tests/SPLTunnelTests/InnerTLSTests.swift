@@ -17,14 +17,18 @@ private let innerTLSClientInfo = SPLClientInfo(userAgent: "spl-swift-tests/1")
     .enabled(if: IdentityAssemblyCapability.isAvailable, "\(IdentityAssemblyCapability.reason)")
 )
 struct InnerTLSTests {
-    @Test func stateErrorMappingClassifiesPeerAccessDeniedForFailedAndWaiting() {
-        // Security/SecBase.h: errSSLPeerAccessDenied is -9832 on Apple platforms.
+    @Test func stateErrorMappingNeverTrustsAPeerAlertBeforeReady() {
+        // proto/session.md § 7: an alert before the client confirmed the journal and sent its
+        // Finished is not a verdict. Security/SecBase.h: errSSLPeerAccessDenied is -9832.
+        // Falsified by the earlier mapping of a pre-ready access denied to revoked.
         for state in [NWConnection.State.failed(.tls(-9832)), .waiting(.tls(-9832))] {
             guard let error = preReadyNetworkError(from: state) else {
                 Issue.record("Expected a pre-ready Network.framework error")
                 continue
             }
-            #expect(RaceCoordinator<Int>.sessionError(from: innerTLSError(for: error)) == .revoked)
+            let mapped = RaceCoordinator<Int>.sessionError(from: innerTLSError(for: error))
+            #expect(mapped != .revoked)
+            #expect(mapped.attemptFailureClass == .tls)
         }
 
         for error in [NWError.tls(-9838), NWError.tls(-9800)] {
@@ -78,20 +82,25 @@ struct InnerTLSTests {
         #expect(echoed == payload)
     }
 
-    @Test func lanWrongCAInPinFailsHandshake() async throws {
+    @Test func lanWrongCAInPinIsAnUnknownJournal() async throws {
+        // proto/session.md § 7, "a peer that is not the paired home". Falsified by reporting a
+        // peer outside the pinned CA as a generic pin failure.
         let fixture = try TestCA.make()
         let wrongServerFixture = try TestCA.make()
         let server = TLSEchoServer(bundle: wrongServerFixture, clientCAPEM: fixture.caCertificatePEM)
         try await server.start()
         let port = await server.port
 
-        await expectInnerTLSError(.peerNotPinned) {
+        await expectInnerTLSError(.unknownJournal(claimedJournalID: try TestCA.journalID(of: wrongServerFixture))) {
             _ = try await InnerTLS.connectLAN(host: "127.0.0.1", port: port, pairing: fixture.pairing)
         }
         await server.stop()
     }
 
-    @Test func lanServerRejectingClientCertFailsHandshake() async throws {
+    @Test func lanServerRejectingClientCertRefusesAfterReady() async throws {
+        // A TLS 1.3 server judges the client certificate after the client's Finished, so the
+        // refusal arrives after ready as a received alert. Falsified by losing the alert's status
+        // on the inbound error, which would make the refusal unclassifiable.
         let fixture = try TestCA.make()
         let server = TLSEchoServer(bundle: fixture, rejectClientCertificate: true)
         try await server.start()
@@ -260,10 +269,8 @@ struct InnerTLSTests {
                 group.cancelAll()
             }
             Issue.record("Expected client certificate rejection")
-        } catch InnerTLSError.handshakeFailed(_) {
-        } catch InnerTLSError.receiveFailed(_) {
         } catch {
-            Issue.record("Expected handshakeFailed or receiveFailed, got \(error)")
+            #expect(HandshakeFailure.verdict(from: error) == .refused, "got \(error)")
         }
     }
 }

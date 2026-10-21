@@ -180,6 +180,68 @@ public enum CertChain {
 
 }
 
+extension CertChain {
+    private static let ecdsaWithSHA256: [UInt8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]
+    private static let ecdsaWithSHA384: [UInt8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03]
+    private static let ecdsaWithSHA512: [UInt8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04]
+
+    /// Whether `issuer`'s P-256 key verifies the signature on `certificate`. Says nothing
+    /// about dates, usage or names.
+    static func isSigned(_ certificate: SecCertificate, by issuer: SecCertificate) -> Bool {
+        let der = Array(SecCertificateCopyData(certificate) as Data)
+        guard let certificateElement = DER.element(at: der[...]),
+              certificateElement.tag == 0x30,
+              let parts = DER.elements(in: certificateElement.contents),
+              parts.count == 3,
+              parts[0].tag == 0x30,
+              parts[1].tag == 0x30,
+              parts[2].tag == 0x03,
+              let algorithm = DER.elements(in: parts[1].contents)?.first,
+              algorithm.tag == 0x06,
+              let unusedBits = parts[2].contents.first,
+              unusedBits == 0,
+              let signature = try? P256.Signing.ECDSASignature(derRepresentation: parts[2].contents.dropFirst()),
+              let key = p256PublicKey(of: issuer) else {
+            return false
+        }
+        let tbs = Data(parts[0].encoded)
+        switch Array(algorithm.contents) {
+        case ecdsaWithSHA256:
+            return key.isValidSignature(signature, for: SHA256.hash(data: tbs))
+        case ecdsaWithSHA384:
+            return key.isValidSignature(signature, for: SHA384.hash(data: tbs))
+        case ecdsaWithSHA512:
+            return key.isValidSignature(signature, for: SHA512.hash(data: tbs))
+        default:
+            return false
+        }
+    }
+
+    static func isSelfSigned(_ certificate: SecCertificate) -> Bool {
+        isSigned(certificate, by: certificate)
+    }
+
+    /// The journal ID of the self-signed P-256 certificate a peer presented, as a
+    /// journal's CA is, preferring the chain's root. A claim, not an identity.
+    static func claimedJournalID(presented chain: [SecCertificate]) -> String? {
+        chain.reversed()
+            .first(where: isSelfSigned)
+            .flatMap { try? canonicalP256SubjectPublicKeyInfoDER(certificate: $0) }
+            .flatMap { try? jidFromSPKI($0) }
+    }
+
+    private static func p256PublicKey(of certificate: SecCertificate) -> P256.Signing.PublicKey? {
+        guard let key = SecCertificateCopyKey(certificate) else {
+            return nil
+        }
+        var error: Unmanaged<CFError>?
+        guard let keyData = SecKeyCopyExternalRepresentation(key, &error) as Data? else {
+            return nil
+        }
+        return try? P256.Signing.PublicKey(x963Representation: keyData)
+    }
+}
+
 public enum CertChainError: Error, Equatable, Sendable {
     case invalidPEM
     case emptyChain

@@ -28,7 +28,7 @@ struct TunnelSessionTests {
         let pairing = pairing(from: fixture, localEndpoints: [
             LocalEndpoint(host: "127.0.0.1", port: port, scope: "local"),
         ])
-        let session = TunnelSession(pairing: pairing, clientInfo: tunnelClientInfo)
+        let session = TunnelSession(pairing: pairing, clientInfo: tunnelClientInfo, refusalStore: TestRefusalStore())
 
         let via = try await session.connect(endpoints: [
             .lan(host: "127.0.0.1", port: port, scope: "local"),
@@ -71,7 +71,7 @@ struct TunnelSessionTests {
         let pairing = pairing(from: fixture, localEndpoints: [
             LocalEndpoint(host: "127.0.0.1", port: port, scope: "local"),
         ])
-        let session = TunnelSession(pairing: pairing, clientInfo: tunnelClientInfo)
+        let session = TunnelSession(pairing: pairing, clientInfo: tunnelClientInfo, refusalStore: TestRefusalStore())
 
         _ = try await session.connect(endpoints: [
             .lan(host: "127.0.0.1", port: port, scope: "local"),
@@ -110,7 +110,8 @@ struct TunnelSessionTests {
         let session = TunnelSession(
             pairing: pairing,
             clientInfo: tunnelClientInfo,
-            policy: fastKeepalivePolicy(runsOnRelayPath: false)
+            policy: fastKeepalivePolicy(runsOnRelayPath: false),
+            refusalStore: TestRefusalStore()
         )
         let states = await stateProbe(for: session)
 
@@ -546,115 +547,97 @@ struct TunnelSessionTests {
     }
 
     @Test(arguments: PostReadyTerminalCase.allCases)
-    func peerAccessDeniedPostReadyIngressesFailOnce(_ testCase: PostReadyTerminalCase) async throws {
-        // Security/SecBase.h: errSSLPeerAccessDenied reaches terminal session handling from every mux write ingress.
+    func peerAccessDeniedPostReadyIngressesStopOnlyInsideTheVerdictWindow(_ testCase: PostReadyTerminalCase) async throws {
+        // proto/session.md § 7: an access denied after ready and before the journal's first
+        // application byte stops the credential once, from every write ingress. An ingress that
+        // first receives a byte from the journal closes the window, so its access denied is an
+        // ordinary session error. Falsified by the earlier rule that read every post-ready
+        // access denied as a stop, or by losing the stop at any in-window ingress.
         let tls = FakeTunnelTLS()
         let connector = ConnectorProbe { _, _, _ in tls }
         let gate = KeepaliveTickGate()
-        let session: TunnelSession
-        let policy = fastKeepalivePolicy(runsOnRelayPath: true)
-        if testCase.ingress == .keepalive {
-            session = TunnelSession(
-                pairing: fakePairing(),
-                policy: policy,
-                tlsConnector: connector.connector,
-                makeMultiplexer: { tls in
-                    Multiplexer(
-                        sink: { data in try await tls.send(data) },
-                        sleeper: { duration in try await gate.sleep(duration) }
-                    )
-                }
-            )
-        } else {
-            session = TunnelSession(pairing: fakePairing(), policy: policy, tlsConnector: connector.connector)
-        }
+        let store = TestRefusalStore()
+        let ledger = refusalLedger(for: fakePairing(), store: store)
+        let session = postReadySession(testCase, connector: connector, gate: gate, ledger: ledger)
         let states = await stateProbe(for: session)
 
         _ = try await session.connect(endpoints: [testCase.endpoint])
         await tls.setSendError(NWError.tls(-9832))
+        let insideWindow = testCase.ingress.isInsideVerdictWindow
         try await trigger(
             testCase.ingress,
             tlsStatus: -9832,
-            expectation: .sessionError(.revoked),
+            expectation: insideWindow ? .sessionError(.revoked) : .rawTLS(-9832),
             session: session,
             tls: tls,
             keepaliveGate: gate
         )
 
-        #expect(await waitForFailure(.revoked, in: states))
-        #expect(await states.count(.failed(.revoked)) == 1)
-        #expect(await states.containsFailure { $0 != .revoked } == false)
-        #expect(await tls.closeCount == 1)
+        if insideWindow {
+            #expect(await waitForFailure(.revoked, in: states))
+            #expect(await states.count(.failed(.revoked)) == 1)
+            #expect(await states.containsFailure { $0 != .revoked } == false)
+            #expect(await tls.closeCount == 1)
+            #expect(await ledger.stop() == .accessDenied)
+        } else {
+            #expect(await conditionObserved(timeout: .milliseconds(100)) {
+                await states.containsFailure { $0 == .revoked }
+            } == false)
+            #expect(await ledger.stop() == nil)
+            #expect(await ledger.view() == HandshakeRefusalRecord())
+        }
         await session.disconnect()
         await states.stop()
         await gate.cancelAll()
     }
 
     @Test(arguments: PostReadyTerminalCase.allCases)
-    func peerInternalErrorPostReadyIngressesRetainCurrentBehavior(_ testCase: PostReadyTerminalCase) async throws {
-        // Security/SecBase.h: errSSLPeerInternalError is nonterminal at every post-ready ingress.
+    func peerInternalErrorPostReadyIngressesCountOnlyInsideTheVerdictWindow(_ testCase: PostReadyTerminalCase) async throws {
+        // proto/session.md § 7: internal_error (80) is the catch-all refusal, counted when it
+        // arrives after ready and before the journal's first byte, from any ingress. After the
+        // journal's first byte it keeps the ordinary behaviour. Falsified by narrowing the
+        // counted branch to recognised codes, or by counting an alert after the window closed.
         let tls = FakeTunnelTLS()
         let connector = ConnectorProbe { _, _, _ in tls }
         let gate = KeepaliveTickGate()
-        let policy = fastKeepalivePolicy(runsOnRelayPath: true)
-        let session: TunnelSession
-        if testCase.ingress == .keepalive {
-            session = TunnelSession(
-                pairing: fakePairing(),
-                policy: policy,
-                tlsConnector: connector.connector,
-                makeMultiplexer: { tls in
-                    Multiplexer(
-                        sink: { data in try await tls.send(data) },
-                        sleeper: { duration in try await gate.sleep(duration) }
-                    )
-                }
-            )
-        } else {
-            session = TunnelSession(pairing: fakePairing(), policy: policy, tlsConnector: connector.connector)
-        }
+        let ledger = refusalLedger(for: fakePairing(), store: TestRefusalStore())
+        let session = postReadySession(testCase, connector: connector, gate: gate, ledger: ledger)
         let states = await stateProbe(for: session)
 
         _ = try await session.connect(endpoints: [testCase.endpoint])
         await tls.setSendError(NWError.tls(-9838))
+        let insideWindow = testCase.ingress.isInsideVerdictWindow
         try await trigger(
             testCase.ingress,
             tlsStatus: -9838,
-            expectation: .rawTLS(-9838),
+            expectation: insideWindow ? .sessionError(.refused) : .rawTLS(-9838),
             session: session,
             tls: tls,
             keepaliveGate: gate
         )
 
-        switch testCase.ingress {
-        case .receive, .pong, .unknownStreamReset, .isolateReset:
-            // The inbound pump still classifies ordinary mux and receive failures as inbound closure.
-            #expect(await waitForFailure(in: states) { error in
-                if case .inboundClosed = error {
-                    return true
-                }
-                return false
-            })
-        case .open, .write, .close, .window:
-            // trigger observes the original raw Network.framework error at the propagating boundary.
-            break
-        case .reset:
-            // reset suppresses its send error; a second stream write proves the session remains usable.
-            await tls.setSendError(nil)
-            let stream = try await session.openStream()
-            try await stream.write(Data([0x01]))
-        case .keepalive:
-            let expected: SessionError
-            switch testCase.endpoint {
-            case .lan:
-                expected = .directKeepaliveMissed
-            case .relay:
-                expected = .relayKeepaliveMissed
+        if insideWindow {
+            #expect(await waitForFailure(.refused, in: states))
+            #expect(await states.count(.failed(.refused)) == 1)
+            #expect(await ledger.view().refusals == 1)
+        } else {
+            switch testCase.ingress {
+            case .pong, .unknownStreamReset, .isolateReset:
+                // The inbound pump still classifies ordinary mux and receive failures as inbound closure.
+                #expect(await waitForFailure(in: states) { error in
+                    if case .inboundClosed = error {
+                        return true
+                    }
+                    return false
+                })
+            default:
+                // trigger observes the original raw Network.framework error at the propagating boundary.
+                break
             }
-            #expect(await waitForFailure(expected, in: states))
+            #expect(await ledger.view() == HandshakeRefusalRecord())
         }
-
         #expect(await states.count(.failed(.revoked)) == 0)
+        #expect(await ledger.stop() == nil)
         await session.disconnect()
         await states.stop()
         await gate.cancelAll()
@@ -714,6 +697,43 @@ enum PostReadyTerminalIngress: CaseIterable, Sendable {
     case isolateReset
     case window
     case keepalive
+
+    /// Whether the failure arrives before any byte from the journal. The pong, reset-on-unknown,
+    /// isolation-reset and window ingresses all start with a frame the journal sent.
+    var isInsideVerdictWindow: Bool {
+        switch self {
+        case .receive, .open, .write, .close, .reset, .keepalive:
+            true
+        case .pong, .unknownStreamReset, .isolateReset, .window:
+            false
+        }
+    }
+}
+
+private func postReadySession(
+    _ testCase: PostReadyTerminalCase,
+    connector: ConnectorProbe,
+    gate: KeepaliveTickGate,
+    ledger: HandshakeRefusalLedger
+) -> TunnelSession {
+    if testCase.ingress == .keepalive {
+        let policy = fastKeepalivePolicy(runsOnRelayPath: true)
+        return TunnelSession(
+            pairing: fakePairing(),
+            policy: policy,
+            tlsConnector: connector.connector,
+            makeMultiplexer: { tls in
+                Multiplexer(
+                    sink: { data in try await tls.send(data) },
+                    sleeper: { duration in try await gate.sleep(duration) }
+                )
+            },
+            refusalLedger: ledger
+        )
+    }
+    // why: no keepalive write may race the ingress under test; the keepalive case has its own gate.
+    let quiet = SessionPolicy(keepalive: KeepalivePolicy(interval: .seconds(30), runsOnRelayPath: true))
+    return TunnelSession(pairing: fakePairing(), policy: quiet, tlsConnector: connector.connector, refusalLedger: ledger)
 }
 
 struct PostReadyTerminalCase: Sendable {

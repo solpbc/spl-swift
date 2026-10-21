@@ -259,6 +259,7 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
             var graceStarted = false
             var sawNotEntitled = false
             var sawAuthRefreshRequired = false
+            var sawUnknownJournal = false
 
             func closeIfNeeded(order: Int, value: Value, winnerOrder: Int?) async {
                 guard order != winnerOrder, closedOrders.insert(order).inserted else {
@@ -313,9 +314,10 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                     case .failure(let order, let error):
                         await waitingTracker.clearWaiting(order: order)
                         failures += 1
-                        if error == .revoked {
+                        // The first verdict on any leg decides the attempt; no other leg is ranked.
+                        if Self.isVerdict(error) {
                             await cancelAndDrain(winnerOrder: nil)
-                            throw SessionError.revoked
+                            throw error
                         }
                         if error == .notEntitled {
                             sawNotEntitled = true
@@ -323,10 +325,14 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                         if error == .authRefreshRequired {
                             sawAuthRefreshRequired = true
                         }
+                        if error == .unknownJournal {
+                            sawUnknownJournal = true
+                        }
                         if failures == sorted.count, successes.isEmpty {
                             let aggregate = Self.aggregateFailure(
                                 sawNotEntitled: sawNotEntitled,
-                                sawAuthRefreshRequired: sawAuthRefreshRequired
+                                sawAuthRefreshRequired: sawAuthRefreshRequired,
+                                sawUnknownJournal: sawUnknownJournal
                             )
                             group.cancelAll()
                             throw aggregate
@@ -344,7 +350,8 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                         }
                         let aggregate = Self.aggregateFailure(
                             sawNotEntitled: sawNotEntitled,
-                            sawAuthRefreshRequired: sawAuthRefreshRequired
+                            sawAuthRefreshRequired: sawAuthRefreshRequired,
+                            sawUnknownJournal: sawUnknownJournal
                         )
                         await cancelAndDrain(winnerOrder: nil)
                         throw aggregate
@@ -353,7 +360,8 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
                         guard let winner = successes.min(by: { $0.order < $1.order }) else {
                             let aggregate = Self.aggregateFailure(
                                 sawNotEntitled: sawNotEntitled,
-                                sawAuthRefreshRequired: sawAuthRefreshRequired
+                                sawAuthRefreshRequired: sawAuthRefreshRequired,
+                                sawUnknownJournal: sawUnknownJournal
                             )
                             await cancelAndDrain(winnerOrder: nil)
                             throw aggregate
@@ -372,7 +380,8 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
             guard let winner = successes.min(by: { $0.order < $1.order }) else {
                 throw Self.aggregateFailure(
                     sawNotEntitled: sawNotEntitled,
-                    sawAuthRefreshRequired: sawAuthRefreshRequired
+                    sawAuthRefreshRequired: sawAuthRefreshRequired,
+                    sawUnknownJournal: sawUnknownJournal
                 )
             }
             if Task.isCancelled {
@@ -418,18 +427,23 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
            dialError == .relayNotEntitled {
             return .notEntitled
         }
-        if isPeerAccessDenied(error) {
-            return .revoked
-        }
         if let tlsError = error as? InnerTLSError {
+            if case .unknownJournal = tlsError {
+                return .unknownJournal
+            }
             return .tlsFailed(String(describing: tlsError))
         }
         return .unreachable
     }
 
+    /// The outcome of an attempt in which every leg ended without a verdict. A relay that
+    /// rejected the device keeps its own outcome, so its token and entitlement handling is
+    /// unchanged; otherwise a peer that is not the paired journal outranks a leg that did not
+    /// answer.
     static func aggregateFailure(
         sawNotEntitled: Bool,
-        sawAuthRefreshRequired: Bool
+        sawAuthRefreshRequired: Bool,
+        sawUnknownJournal: Bool = false
     ) -> SessionError {
         if sawNotEntitled {
             return .notEntitled
@@ -437,7 +451,20 @@ struct RaceCoordinator<Value: Sendable>: Sendable {
         if sawAuthRefreshRequired {
             return .authRefreshRequired
         }
+        if sawUnknownJournal {
+            return .unknownJournal
+        }
         return .unreachable
+    }
+
+    /// Whether a leg's error is the journal's verdict on this device.
+    static func isVerdict(_ error: SessionError) -> Bool {
+        switch error {
+        case .revoked, .refused, .certificateUnknown, .refusalsExhausted:
+            return true
+        default:
+            return false
+        }
     }
 }
 

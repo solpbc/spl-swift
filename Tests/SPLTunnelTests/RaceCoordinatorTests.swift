@@ -456,8 +456,50 @@ struct RaceCoordinatorTests {
     }
 
     @Test(arguments: [false, true])
-    func peerAccessDeniedShortCircuitDrainsCollectedSuccesses(terminalIsRelay: Bool) async {
-        // Security/SecBase.h: access denied terminates the race and closes an already-ready competitor.
+    func aDialTimeAccessDeniedIsNotAVerdictAndTheReadyCompetitorWins(terminalIsRelay: Bool) async throws {
+        // proto/session.md § 7: an access denied during the handshake comes from a peer not yet
+        // confirmed, so it is not the journal's verdict and never ends the race. Falsified by
+        // the earlier short-circuit to revoked, which let a forged alert unpair the device.
+        let direct = TransportEndpoint.lan(host: "10.0.0.5", port: 443, scope: "local")
+        let relay = TransportEndpoint.relay(
+            endpoint: URL(string: "wss://relay.example/session")!,
+            instanceID: "instance",
+            deviceToken: "token"
+        )
+        let denied = terminalIsRelay ? relay : direct
+        let successful = terminalIsRelay ? direct : relay
+        let successReady = TestSignal()
+        let releaseDenied = TestSignal()
+        let closeLog = CloseLog()
+        let coordinator = RaceCoordinator<DiscardValue>(
+            stagger: .milliseconds(0),
+            loserGrace: .milliseconds(50),
+            budget: .seconds(1),
+            close: { value in await closeLog.record(value.id) }
+        ) { endpoint, _ in
+            if endpoint == denied {
+                await releaseDenied.wait()
+                throw NWError.tls(-9832)
+            }
+            await successReady.signal()
+            return DiscardValue(id: endpoint == direct ? 1 : 2)
+        }
+
+        let task = Task {
+            try await coordinator.connect(endpoints: [direct, relay])
+        }
+        await successReady.wait()
+        await releaseDenied.signal()
+        let result = try await task.value
+        #expect(result.endpoint == successful)
+        #expect(await closeLog.count(successful == direct ? 1 : 2) == 0)
+    }
+
+    @Test(arguments: [false, true])
+    func aVerdictShortCircuitDrainsCollectedSuccesses(terminalIsRelay: Bool) async {
+        // The first verdict on any leg decides the attempt: no other leg is ranked, and a
+        // competitor that is already ready is closed. Falsified by ranking the ready leg's
+        // success over the verdict.
         let direct = TransportEndpoint.lan(host: "10.0.0.5", port: 443, scope: "local")
         let relay = TransportEndpoint.relay(
             endpoint: URL(string: "wss://relay.example/session")!,
@@ -477,7 +519,7 @@ struct RaceCoordinatorTests {
         ) { endpoint, _ in
             if endpoint == terminal {
                 await releaseTerminal.wait()
-                throw NWError.tls(-9832)
+                throw SessionError.refused
             }
             await successReady.signal()
             return DiscardValue(id: endpoint == direct ? 1 : 2)
@@ -488,7 +530,7 @@ struct RaceCoordinatorTests {
         }
         await successReady.wait()
         await releaseTerminal.signal()
-        await expectSessionError(.revoked) {
+        await expectSessionError(.refused) {
             _ = try await task.value
         }
         #expect(await closeLog.count(successful == direct ? 1 : 2) == 1)

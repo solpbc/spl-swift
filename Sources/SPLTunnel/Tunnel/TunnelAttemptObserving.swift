@@ -15,6 +15,14 @@ public enum TunnelAttemptFailureClass: Sendable, Equatable {
     case authRefreshRequired
     case notEntitled
     case revoked
+    /// The journal refused this device; counted toward the refusal limit.
+    case refused
+    /// The journal could not read its device list (certificate unknown, 46).
+    case certificateUnknown
+    /// A peer that is not the paired journal answered.
+    case unknownJournal
+    /// Refusals reached the refusal limit; the credential has stopped.
+    case refusalsExhausted
     case transport
     case other
 }

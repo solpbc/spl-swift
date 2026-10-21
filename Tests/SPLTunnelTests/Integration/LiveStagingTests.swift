@@ -25,7 +25,7 @@ struct LiveStagingTests {
             endpoints = TransportEndpoint.candidates(for: pairing)
         }
 
-        let tunnel = TunnelSession(pairing: pairing, clientInfo: liveClientInfo)
+        let tunnel = TunnelSession(pairing: pairing, clientInfo: liveClientInfo, refusalStore: TestRefusalStore())
         let via = try await tunnel.connect(endpoints: endpoints)
 
         do {

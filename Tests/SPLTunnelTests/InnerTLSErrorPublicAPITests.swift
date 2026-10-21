@@ -14,6 +14,7 @@ struct InnerTLSErrorPublicAPITests {
             .invalidPrivateKey,
             .peerNotPinned,
             .caFingerprintMismatch,
+            .unknownJournal(claimedJournalID: "claimed"),
             .handshakeFailed("test"),
             .sendFailed("test"),
             .receiveFailed("test"),
@@ -27,6 +28,7 @@ struct InnerTLSErrorPublicAPITests {
             "invalidPrivateKey",
             "peerNotPinned",
             "caFingerprintMismatch",
+            "unknownJournal",
             "handshakeFailed",
             "sendFailed",
             "receiveFailed",
@@ -48,6 +50,8 @@ struct InnerTLSErrorPublicAPITests {
             "peerNotPinned"
         case .caFingerprintMismatch:
             "caFingerprintMismatch"
+        case .unknownJournal:
+            "unknownJournal"
         case .handshakeFailed:
             "handshakeFailed"
         case .sendFailed:

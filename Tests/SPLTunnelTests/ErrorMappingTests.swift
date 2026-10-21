@@ -32,17 +32,64 @@ struct ErrorMappingTests {
         #expect(message == "peerNotPinned")
     }
 
-    @Test func peerAccessDeniedClassifierRecognizesOnlyAccessDenied() {
-        // Security/SecBase.h: errSSLPeerAccessDenied is the sole terminal TLS status.
-        #expect(isPeerAccessDenied(NWError.tls(-9832)))
-        #expect(isPeerAccessDenied(NWError.tls(-9838)) == false)
-        #expect(isPeerAccessDenied(NWError.tls(-9800)) == false)
-        #expect(isPeerAccessDenied(NWError.posix(.ECONNREFUSED)) == false)
+    @Test func receivedAlertsAreTheJournalsVerdictAndNothingElseIs() {
+        // proto/session.md § 7: 49 stops, 46 retries, every other received alert is counted.
+        // Falsified by narrowing the counted branch to recognised codes (no_renegotiation and the
+        // generic received-alert status would then read as unreachable), by dropping the
+        // record-layer alerts, or by counting a close, a reset or a local record failure.
+        #expect(HandshakeFailure.verdict(from: NWError.tls(PeerAlert.accessDenied)) == .accessDenied)
+        #expect(HandshakeFailure.verdict(from: TLSPeerAlert(status: PeerAlert.accessDenied)) == .accessDenied)
+        #expect(HandshakeFailure.verdict(from: NWError.tls(PeerAlert.certificateUnknown)) == .certificateUnknown)
+        for status in [
+            PeerAlert.internalError,
+            PeerAlert.badCertificate,
+            PeerAlert.unexpectedMessage,
+            PeerAlert.badRecordMac,
+            PeerAlert.recordOverflow,
+            PeerAlert.genericFatal,
+            Int32(-9840), // no_renegotiation, a code no journal sends
+            Int32(-9831), // unknown_ca
+        ] {
+            #expect(HandshakeFailure.verdict(from: NWError.tls(status)) == .refused, "status \(status)")
+            #expect(HandshakeFailure.verdict(from: TLSPeerAlert(status: status)) == .refused, "status \(status)")
+        }
+        let notVerdicts: [any Error] = [
+            NWError.tls(PeerAlert.closedGraceful),
+            NWError.tls(PeerAlert.closedAbort),
+            NWError.tls(PeerAlert.closedNoNotify),
+            NWError.tls(PeerAlert.localDecryptionFailure),
+            NWError.tls(PeerAlert.localBadRecordMac),
+            NWError.tls(-9800), // errSSLProtocol, detected locally
+            NWError.tls(-9830), // errSSLIllegalParam, inside the peer range but local
+            NWError.tls(-9841), // errSSLPeerAuthCompleted, not an alert
+            NWError.posix(.ECONNRESET),
+            NWError.posix(.ECONNREFUSED),
+            InnerTLSError.receiveFailed("closed"),
+            SessionError.revoked,
+        ]
+        for error in notVerdicts {
+            #expect(HandshakeFailure.verdict(from: error) == nil, "\(error)")
+        }
     }
 
-    @Test func peerAccessDeniedMapsToRevoked() {
-        // Security/SecBase.h: access denied is a terminal session revocation signal.
-        #expect(RaceCoordinator<Int>.sessionError(from: NWError.tls(-9832)) == .revoked)
+    @Test func anAlertDuringTheHandshakeIsNeverTheJournalsVerdict() {
+        // proto/session.md § 7: an alert before the client confirmed the journal and sent its
+        // Finished is not authenticated. Falsified by trusting a pre-window access denied, which
+        // would let anyone on the path unpair the device with one forged alert.
+        for status in [PeerAlert.accessDenied, PeerAlert.certificateUnknown, PeerAlert.internalError] {
+            let dialError = innerTLSError(for: NWError.tls(status))
+            let mapped = RaceCoordinator<Int>.sessionError(from: dialError)
+            #expect(mapped.attemptFailureClass == .tls, "status \(status)")
+            #expect(RaceCoordinator<Int>.isVerdict(mapped) == false, "status \(status)")
+            let raw = RaceCoordinator<Int>.sessionError(from: NWError.tls(status))
+            #expect(raw == .unreachable, "status \(status)")
+        }
+    }
+
+    @Test func unknownJournalMapsToItsOwnOutcome() {
+        // Falsified by folding a peer that is not the paired journal into a generic TLS failure.
+        #expect(RaceCoordinator<Int>.sessionError(from: InnerTLSError.unknownJournal(claimedJournalID: "j")) == .unknownJournal)
+        #expect(RaceCoordinator<Int>.sessionError(from: InnerTLSError.unknownJournal(claimedJournalID: nil)) == .unknownJournal)
     }
 
     @Test func directConnectFailuresBeforeTLSDoNotReadAsTLS() {
@@ -72,7 +119,7 @@ struct ErrorMappingTests {
     }
 
     @Test func aggregateFailurePrecedence() {
-        // Revocation short-circuits before aggregation; aggregate preserves remaining precedence.
+        // A verdict short-circuits before aggregation; aggregate preserves remaining precedence.
         #expect(RaceCoordinator<Int>.aggregateFailure(
             sawNotEntitled: true,
             sawAuthRefreshRequired: true
@@ -85,5 +132,16 @@ struct ErrorMappingTests {
             sawNotEntitled: false,
             sawAuthRefreshRequired: false
         ) == .unreachable)
+        // An unknown journal outranks a leg that did not answer, and yields to the relay's own rejection.
+        #expect(RaceCoordinator<Int>.aggregateFailure(
+            sawNotEntitled: false,
+            sawAuthRefreshRequired: false,
+            sawUnknownJournal: true
+        ) == .unknownJournal)
+        #expect(RaceCoordinator<Int>.aggregateFailure(
+            sawNotEntitled: false,
+            sawAuthRefreshRequired: true,
+            sawUnknownJournal: true
+        ) == .authRefreshRequired)
     }
 }

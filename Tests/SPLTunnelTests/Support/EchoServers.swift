@@ -401,6 +401,17 @@ enum TLSEchoMode {
     case raw
     case mux
     case muxDropControl
+    /// Completes the handshake, never sends an application byte, and closes with close_notify.
+    case closeAfterHandshake
+    /// Completes the handshake and never sends an application byte.
+    case silentAfterHandshake
+}
+
+/// A server identity other than the fixture's own: the chain it presents, leaf first, and
+/// the leaf's key.
+struct TLSServerIdentity: Sendable {
+    let chainPEM: String
+    let privateKeyPEM: String
 }
 
 actor TLSEchoServer {
@@ -409,23 +420,32 @@ actor TLSEchoServer {
     private let requiresClientCertificate: Bool
     private let rejectClientCertificate: Bool
     private let mode: TLSEchoMode
+    private let identity: TLSServerIdentity?
     private let capture = CertificateCapture()
     private var listener: NWListener?
     private var connections: [NWConnection] = []
     private var boundPort: NWEndpoint.Port?
+    private let handshakes = AsyncStream<Void>.makeStream()
 
     init(
         bundle: TestCA.Bundle,
         clientCAPEM: String? = nil,
         requiresClientCertificate: Bool = true,
         rejectClientCertificate: Bool = false,
-        mode: TLSEchoMode = .raw
+        mode: TLSEchoMode = .raw,
+        identity: TLSServerIdentity? = nil
     ) {
         self.bundle = bundle
         self.clientCAPEM = clientCAPEM ?? bundle.caCertificatePEM
         self.requiresClientCertificate = requiresClientCertificate
         self.rejectClientCertificate = rejectClientCertificate
         self.mode = mode
+        self.identity = identity
+    }
+
+    /// One element per connection whose server side completed the handshake.
+    nonisolated var completedHandshakes: AsyncStream<Void> {
+        handshakes.stream
     }
 
     var port: Int {
@@ -468,6 +488,17 @@ actor TLSEchoServer {
 
     private func accept(_ connection: NWConnection) {
         connections.append(connection)
+        let handshakes = handshakes.continuation
+        let mode = mode
+        connection.stateUpdateHandler = { state in
+            guard case .ready = state else {
+                return
+            }
+            handshakes.yield()
+            if case .closeAfterHandshake = mode {
+                connection.cancel()
+            }
+        }
         connection.start(queue: serverQueue)
         if rejectClientCertificate {
             connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { _, _, _, _ in
@@ -482,6 +513,22 @@ actor TLSEchoServer {
             muxEcho(connection, decoder: MuxEchoDecoder(respondsToControlFrames: true))
         case .muxDropControl:
             muxEcho(connection, decoder: MuxEchoDecoder(respondsToControlFrames: false))
+        case .closeAfterHandshake, .silentAfterHandshake:
+            discard(connection)
+        }
+    }
+
+    private func discard(_ connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, isComplete, error in
+            guard error == nil, !isComplete, data != nil else {
+                return
+            }
+            guard let server = self else {
+                return
+            }
+            Task {
+                await server.discard(connection)
+            }
         }
     }
 
@@ -531,8 +578,8 @@ actor TLSEchoServer {
     private func makeServerTLSOptions() throws -> NWProtocolTLS.Options {
         let anchors = try CertChain.certificates(fromPEM: clientCAPEM)
         let identity = try TestCA.secIdentity(
-            certificatePEM: "\(bundle.serverCertificatePEM)\n\(bundle.caCertificatePEM)",
-            privateKeyPEM: bundle.serverPrivateKeyPEM
+            certificatePEM: self.identity?.chainPEM ?? "\(bundle.serverCertificatePEM)\n\(bundle.caCertificatePEM)",
+            privateKeyPEM: self.identity?.privateKeyPEM ?? bundle.serverPrivateKeyPEM
         )
         let options = NWProtocolTLS.Options()
         let secOptions = options.securityProtocolOptions

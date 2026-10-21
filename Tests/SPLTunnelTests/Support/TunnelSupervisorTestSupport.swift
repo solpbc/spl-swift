@@ -524,7 +524,7 @@ func fakeSupervisor(
         reconnectBackoff: reconnectBackoff,
         sleeper: sleeper,
         upgradeSleeper: upgradeSleeper,
-        makeSession: { _, _, _ in
+        makeSession: { _, _, _, _ in
             await factory.makeSession()
         },
         retirementCommitTestGate: retirementCommitTestGate

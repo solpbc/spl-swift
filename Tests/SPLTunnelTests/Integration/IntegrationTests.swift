@@ -147,7 +147,8 @@ struct IntegrationTests {
         let session = TunnelSession(
             pairing: paired.pairing,
             clientInfo: integrationClientInfo,
-            policy: fastKeepalivePolicy(runsOnRelayPath: false)
+            policy: fastKeepalivePolicy(runsOnRelayPath: false),
+            refusalStore: TestRefusalStore()
         )
         let states = await stateProbe(for: session)
         let proxy = LoopbackProxy(opener: session)

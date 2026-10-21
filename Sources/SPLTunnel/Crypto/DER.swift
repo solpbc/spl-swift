@@ -87,4 +87,62 @@ enum DER {
         }
         return stack
     }
+
+    /// One TLV read from DER bytes: its tag, the whole element, and its contents.
+    struct Element {
+        let tag: UInt8
+        let encoded: ArraySlice<UInt8>
+        let contents: ArraySlice<UInt8>
+    }
+
+    /// Reads the next definite-length TLV at the start of `bytes`, or `nil` when the
+    /// bytes are not one.
+    static func element(at bytes: ArraySlice<UInt8>) -> Element? {
+        var index = bytes.startIndex
+        guard index < bytes.endIndex else {
+            return nil
+        }
+        let tag = bytes[index]
+        index += 1
+        guard index < bytes.endIndex else {
+            return nil
+        }
+        let first = bytes[index]
+        index += 1
+        var length = 0
+        if first < 0x80 {
+            length = Int(first)
+        } else {
+            let count = Int(first & 0x7f)
+            guard (1...4).contains(count), bytes.endIndex - index >= count else {
+                return nil
+            }
+            for _ in 0..<count {
+                length = length << 8 | Int(bytes[index])
+                index += 1
+            }
+        }
+        guard length >= 0, bytes.endIndex - index >= length else {
+            return nil
+        }
+        return Element(
+            tag: tag,
+            encoded: bytes[bytes.startIndex..<(index + length)],
+            contents: bytes[index..<(index + length)]
+        )
+    }
+
+    /// The consecutive TLVs that make up `bytes`, or `nil` when any is malformed.
+    static func elements(in bytes: ArraySlice<UInt8>) -> [Element]? {
+        var result: [Element] = []
+        var rest = bytes
+        while !rest.isEmpty {
+            guard let element = element(at: rest) else {
+                return nil
+            }
+            result.append(element)
+            rest = rest[element.encoded.endIndex...]
+        }
+        return result
+    }
 }

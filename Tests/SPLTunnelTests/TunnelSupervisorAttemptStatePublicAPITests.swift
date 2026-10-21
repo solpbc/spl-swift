@@ -42,9 +42,16 @@ struct TunnelSupervisorAttemptStatePublicAPITests {
             relayEnrollment: .enrolled(deviceToken: "token", expiresAt: nil),
             pairedAt: Date(timeIntervalSince1970: 0)
         )
+        let keychain = SPLKeychainStore(policy: KeychainPolicy(
+            service: "app.example.public-api-test",
+            accessGroup: nil,
+            useDataProtectionKeychain: false,
+            accessibility: .afterFirstUnlockThisDeviceOnly
+        ))
         let supervisor = TunnelSupervisor(
             pairing: pairing,
-            clientInfo: SPLClientInfo(userAgent: "public-api-test/1")
+            clientInfo: SPLClientInfo(userAgent: "public-api-test/1"),
+            refusalStore: keychain.refusalStore
         )
 
         let erasedSupervisor: any TunnelSessioning = supervisor

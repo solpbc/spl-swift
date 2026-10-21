@@ -14,7 +14,8 @@ struct TunnelAttemptObservingPublicAPITests {
     @Test func publicTypesAndConcreteSessionConformance() {
         let routes: [TunnelAttemptRoute] = [.directPinned, .directUnpinned, .relay]
         let failures: [TunnelAttemptFailureClass] = [
-            .unreachable, .tls, .authRefreshRequired, .notEntitled, .revoked, .transport, .other,
+            .unreachable, .tls, .authRefreshRequired, .notEntitled, .revoked, .refused,
+            .certificateUnknown, .unknownJournal, .refusalsExhausted, .transport, .other,
         ]
         let phases: [TunnelAttemptPhase] = [
             .started,
@@ -29,7 +30,7 @@ struct TunnelAttemptObservingPublicAPITests {
         }
 
         #expect(routes == [.directPinned, .directUnpinned, .relay])
-        #expect(failures.count == 7)
+        #expect(failures.count == 11)
         #expect(events[0] == TunnelAttemptEvent(route: .directPinned, ordinal: 0, phase: .started))
 
         let pairing = StoredPairing(
@@ -44,13 +45,23 @@ struct TunnelAttemptObservingPublicAPITests {
             pairedAt: Date(timeIntervalSince1970: 0)
         )
         let clientInfo = SPLClientInfo(userAgent: "spl-swift-tests/1")
-        let session = TunnelSession(pairing: pairing, clientInfo: clientInfo)
+        let refusalStore = PublicAPIRefusalStore()
+        let session = TunnelSession(pairing: pairing, clientInfo: clientInfo, refusalStore: refusalStore)
         let erasedSession: any TunnelSessioning = session
-        let supervisor = TunnelSupervisor(pairing: pairing, clientInfo: clientInfo)
+        let supervisor = TunnelSupervisor(pairing: pairing, clientInfo: clientInfo, refusalStore: refusalStore)
         let erasedSupervisor: any TunnelSessioning = supervisor
 
         #expect((erasedSession as? any TunnelAttemptObserving) != nil)
         #expect((erasedSupervisor as? any TunnelAttemptObserving) == nil)
         _ = session.attemptUpdates
     }
+}
+
+/// A refusal store an app could write against the public API alone.
+private struct PublicAPIRefusalStore: HandshakeRefusalStore {
+    func loadRefusalRecord(credential _: String) throws -> HandshakeRefusalRecord? {
+        nil
+    }
+
+    func saveRefusalRecord(_: HandshakeRefusalRecord, credential _: String) throws {}
 }

@@ -33,10 +33,18 @@ protocol TunnelGeneration: TunnelSessioning {
 
 extension TunnelSession: TunnelGeneration {}
 
+/// What every connection of one supervisor shares: the credential's refusal state, and
+/// where its unknown-journal sightings go.
+struct TunnelGenerationContext: Sendable {
+    let refusals: HandshakeRefusalLedger
+    let unknownJournalObserver: @Sendable (UnknownJournalSighting) -> Void
+}
+
 typealias TunnelGenerationFactory = @Sendable (
     StoredPairing,
     SPLClientInfo,
-    SessionPolicy
+    SessionPolicy,
+    TunnelGenerationContext
 ) async -> any TunnelGeneration
 
 public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
@@ -50,6 +58,13 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
 
     public nonisolated var reconnectUpdates: AsyncStream<ReconnectStatus> {
         reconnectStream
+    }
+
+    /// Peers that answered where the paired journal was expected but are not it, from every
+    /// connection attempt, in the order they were seen. A sighting is delivered even when
+    /// another path then connects. The newest 32 are kept until read.
+    public nonisolated var unknownJournalSightings: AsyncStream<UnknownJournalSighting> {
+        sightingsStream
     }
 
     public private(set) var connectionMode: ConnectionMode?
@@ -137,6 +152,9 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private let connectionModeContinuation: AsyncStream<ConnectionMode?>.Continuation
     private let reconnectStream: AsyncStream<ReconnectStatus>
     private let reconnectContinuation: AsyncStream<ReconnectStatus>.Continuation
+    private let sightingsStream: AsyncStream<UnknownJournalSighting>
+    private let sightingsContinuation: AsyncStream<UnknownJournalSighting>.Continuation
+    private let refusals: HandshakeRefusalLedger
 
     private var lifecycle: Lifecycle = .idle
     private var generation: Generation?
@@ -168,18 +186,23 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private var attemptStateSubscribers: [UInt64: AsyncStream<TunnelSupervisorAttemptState>.Continuation] = [:]
     private var nextAttemptStateSubscriberID: UInt64 = 0
 
+    /// Creates a supervisor that keeps one pairing connected across reconnects.
+    ///
+    /// `refusalStore` keeps the credential's refusal count and stop across processes; pass
+    /// the ``SPLKeychainStore/refusalStore`` of the store that holds the pairing. Once the
+    /// credential stops, no connect, reconnect or upgrade request dials it again, in this
+    /// process or any later one; only a new pairing does.
     public init(
         pairing: StoredPairing,
         clientInfo: SPLClientInfo,
-        policy: SessionPolicy = SessionPolicy()
+        policy: SessionPolicy = SessionPolicy(),
+        refusalStore: any HandshakeRefusalStore
     ) {
         self.init(
             pairing: pairing,
             clientInfo: clientInfo,
             policy: policy,
-            makeSession: { pairing, clientInfo, policy in
-                TunnelSession(pairing: pairing, clientInfo: clientInfo, policy: policy)
-            }
+            refusalLedger: HandshakeRefusalLedger(credential: pairing.refusalCredential, store: refusalStore)
         )
     }
 
@@ -191,9 +214,16 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         sleeper: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
         upgradeSleeper: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
         now: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
-        makeSession: @escaping TunnelGenerationFactory = { pairing, clientInfo, policy in
-            TunnelSession(pairing: pairing, clientInfo: clientInfo, policy: policy)
+        makeSession: @escaping TunnelGenerationFactory = { pairing, clientInfo, policy, context in
+            TunnelSession(
+                pairing: pairing,
+                policy: policy,
+                tlsConnector: TunnelSession.defaultTLSConnector(policy: policy, clientInfo: clientInfo),
+                refusalLedger: context.refusals,
+                unknownJournalObserver: context.unknownJournalObserver
+            )
         },
+        refusalLedger: HandshakeRefusalLedger? = nil,
         // Internal test seams; defaults have no production effect.
         retirementCommitTestGate: (@Sendable (UInt64, RetirementCommitCaller) async -> Void)? = nil,
         stateEmissionTestObserver: @escaping @Sendable (TunnelState) -> Void = { _ in },
@@ -202,6 +232,10 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         self.pairing = pairing
         self.clientInfo = clientInfo
         self.policy = policy
+        self.refusals = refusalLedger ?? HandshakeRefusalLedger(
+            credential: pairing.refusalCredential,
+            store: EphemeralRefusalStore()
+        )
         self.backoff = reconnectBackoff
         self.sleeper = sleeper
         self.upgradeSleeper = upgradeSleeper
@@ -222,6 +256,10 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         let reconnect = AsyncStream<ReconnectStatus>.makeStream(bufferingPolicy: .bufferingNewest(1))
         self.reconnectStream = reconnect.stream
         self.reconnectContinuation = reconnect.continuation
+
+        let sightings = AsyncStream<UnknownJournalSighting>.makeStream(bufferingPolicy: .bufferingNewest(32))
+        self.sightingsStream = sightings.stream
+        self.sightingsContinuation = sightings.continuation
 
         state.continuation.yield(.disconnected)
         mode.continuation.yield(nil)
@@ -253,6 +291,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     public func connect(endpoints: [TransportEndpoint]) async throws -> ConnectedVia {
         guard !endpoints.isEmpty else {
             throw SessionError.unreachable
+        }
+        // A stopped credential is never dialled again; only a new pairing ends a stop.
+        if let stop = await refusals.stop() {
+            await presentStop(stop.sessionError)
+            throw stop.sessionError
         }
 
         plannedEndpoints = endpoints
@@ -336,7 +379,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         do {
             stream = try await current.session.openStream()
         } catch {
-            if let sessionError = error as? SessionError, sessionError == .revoked {
+            if let sessionError = error as? SessionError, Self.isStop(sessionError) {
                 throw sessionError
             }
             if generation?.token == current.token, connectingToken != current.token {
@@ -493,7 +536,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
 
         nextGenerationToken += 1
         let token = nextGenerationToken
-        let session = await makeSession(pairing, clientInfo, policy)
+        let session = await makeSession(pairing, clientInfo, policy, generationContext)
         guard lifecycle == .running, nextGenerationToken == token else {
             throw SessionError.notConnected
         }
@@ -710,10 +753,11 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         }
 
         guard retiringGeneration?.generation.token == token,
-              case .failed(.revoked) = childState else {
+              case .failed(let error) = childState,
+              Self.isStop(error) else {
             return
         }
-        await pause(.revoked)
+        await pause(error)
     }
 
     private func handleActiveChildState(_ childState: TunnelState, token: UInt64) async {
@@ -814,6 +858,12 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         guard lifecycle == .running else {
             return
         }
+        if let stop = Self.stop(for: error) {
+            await refusals.latch(stop)
+            guard lifecycle == .running else {
+                return
+            }
+        }
         lifecycle = .paused
         cancelUpgrade()
         await disconnectDraining()
@@ -888,7 +938,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         upgradeDialing = true
         defer { upgradeDialing = false }
         supervisorLog.notice("supervisor upgrade attempt generation=\(token, privacy: .public) from=\(endpoint.logDescription, privacy: .public) candidates=\(better.count, privacy: .public)")
-        let candidate = await makeSession(pairing, clientInfo, policy)
+        let candidate = await makeSession(pairing, clientInfo, policy, generationContext)
         guard isCurrentHealthyGeneration(token) else {
             await candidate.disconnect()
             return
@@ -1061,11 +1111,72 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
 
     private static func isTerminalPause(_ error: SessionError) -> Bool {
         switch error {
-        case .authRefreshRequired, .notEntitled, .revoked:
+        case .authRefreshRequired, .notEntitled, .revoked, .refusalsExhausted:
             return true
         case .unreachable, .tlsFailed, .notConnected, .directKeepaliveMissed,
-             .relayKeepaliveMissed, .transportFailed, .inboundClosed:
+             .relayKeepaliveMissed, .transportFailed, .inboundClosed,
+             .refused, .certificateUnknown, .unknownJournal:
             return false
         }
+    }
+
+    /// Whether an error means the credential has stopped: present the unpaired state.
+    static func isStop(_ error: SessionError) -> Bool {
+        stop(for: error) != nil
+    }
+
+    private static func stop(for error: SessionError) -> HandshakeStop? {
+        switch error {
+        case .revoked:
+            .accessDenied
+        case .refusalsExhausted:
+            .refusalsExhausted
+        default:
+            nil
+        }
+    }
+
+    private var generationContext: TunnelGenerationContext {
+        let sightings = sightingsContinuation
+        return TunnelGenerationContext(
+            refusals: refusals,
+            unknownJournalObserver: { sightings.yield($0) }
+        )
+    }
+
+    /// Presents a stopped credential: pauses a running supervisor, and puts an idle or
+    /// paused one into the same terminal state without dialling.
+    private func presentStop(_ error: SessionError) async {
+        if lifecycle == .running {
+            await pause(error)
+            return
+        }
+        let terminal = TunnelSupervisorAttemptState.terminal(error.attemptFailureClass)
+        guard attemptState != terminal else {
+            return
+        }
+        lifecycle = .paused
+        cancelUpgrade()
+        pendingRedrive = nil
+        redriveSourceToken = nil
+        redriveTask?.cancel()
+        redriveTask = nil
+        cancelEstablishment()
+        connectingToken = nil
+        backoff.reset()
+        pendingRetryStep = nil
+        planner.noteTerminalPause()
+        currentVia = nil
+        currentEndpoint = nil
+        publishAttemptState(terminal)
+        await clearGeneration(disconnect: true)
+        setConnectionMode(nil)
+        setReconnectStatus(ReconnectStatus(
+            reason: error,
+            attempt: 1,
+            retryAfter: nil,
+            terminalPause: true
+        ))
+        publish(.failed(error))
     }
 }

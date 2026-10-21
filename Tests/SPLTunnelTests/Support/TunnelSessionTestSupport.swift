@@ -255,6 +255,10 @@ actor StateProbe {
         }.first
     }
 
+    func snapshot() -> [TunnelState] {
+        states
+    }
+
     func containsFailure(_ matches: @Sendable (SessionError) -> Bool) -> Bool {
         states.contains { state in
             if case .failed(let error) = state {

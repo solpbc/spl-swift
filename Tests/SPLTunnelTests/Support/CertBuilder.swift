@@ -24,11 +24,13 @@ enum CertBuilder {
         issuerPrivateKey: P256.Signing.PrivateKey,
         isCA: Bool,
         extendedKeyUsage: [[UInt64]],
-        subjectAlternativeNames: Bool = false
+        subjectAlternativeNames: Bool = false,
+        notBefore: Date = Date(timeIntervalSinceNow: -3600),
+        notAfter: Date = Date(timeIntervalSinceNow: 86400)
     ) throws -> [UInt8] {
         let validity = DER.sequence([
-            utcTime(Date(timeIntervalSinceNow: -3600)),
-            utcTime(Date(timeIntervalSinceNow: 86400)),
+            utcTime(notBefore),
+            utcTime(notAfter),
         ])
         var extensions = [
             certificateExtension(oid: oidBasicConstraints, critical: true, value: basicConstraints(isCA: isCA)),
