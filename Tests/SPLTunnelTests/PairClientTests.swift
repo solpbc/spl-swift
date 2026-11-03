@@ -1096,6 +1096,34 @@ struct PairClientRelayTests {
         #expect(HTTPStubProtocol.state.requests(forHost: "127.0.0.1").isEmpty)
     }
 
+    @Test func aPeerPresentingACopyOfThePinnedKeyIsRefused() async throws {
+        let owner = try TestCA.make()
+        let copy = try TestCA.copyingPublicKey(of: owner)
+        let pairURL = try Self.relayPairURL(bundle: owner)
+        let responseBody = try PairClientDirectTests.pairResponseData(
+            bundle: copy,
+            instanceID: Self.caJID(bundle: owner),
+            caChain: [copy.caCertificatePEM]
+        )
+        let client = PairClient(
+            session: makeHTTPStubSession(host: "127.0.0.1") { _ in
+                Issue.record("enrollment must not be attempted")
+                return .http(status: 200, data: Data(#"{"device_token":"token"}"#.utf8))
+            },
+            clientInfo: pairClientInfo
+        )
+
+        try await Self.withRelayPairingServer(bundle: copy, responseBody: responseBody) { relayEndpoint in
+            await expectPairError(.lanCAFingerprintMismatch) {
+                _ = try await client.pair(
+                    pairURL: pairURL,
+                    deviceLabel: "test phone",
+                    relayEndpoint: RelayEndpoint.unchecked(relayEndpoint)
+                )
+            }
+        }
+    }
+
     @Test func liveAnchorJIDMismatchThrowsBeforeEnrollment() async throws {
         // proto/pair-window.md:98-104 requires instance_id == jid(pinned CA); this fixture would pass if only the jid check were removed.
         defer { HTTPStubProtocol.state.reset(host: "127.0.0.1") }

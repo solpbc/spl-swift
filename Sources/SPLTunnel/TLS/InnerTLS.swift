@@ -13,6 +13,8 @@ private let tlsQueue = DispatchQueue(label: "SPLTunnel.tls")
 public struct PairingTLSConnection: Sendable {
     public let tls: InnerTLS
     public let caSPKIDER: [UInt8]
+    /// The certificate the pin accepted.
+    public let caCertificateDER: Data
 }
 
 public enum InnerTLSError: Error, Equatable, Sendable {
@@ -293,7 +295,8 @@ public actor InnerTLS {
             let elapsed = startedAt.duration(to: .now).milliseconds
             logger.notice("pairing handshake transport=\(transport.transportKind, privacy: .public) duration_ms=\(elapsed, privacy: .public)")
 
-            guard let caSPKIDER = trustCapture.caSPKIDER else {
+            guard let caSPKIDER = trustCapture.caSPKIDER,
+                  let caCertificateDER = trustCapture.caCertificateDER else {
                 pumps.forEach { $0.cancel() }
                 acceptedPeer.cancel()
                 connection.cancel()
@@ -310,7 +313,7 @@ public actor InnerTLS {
                 pumpTasks: pumps
             )
             await tls.startReceiveLoop()
-            return PairingTLSConnection(tls: tls, caSPKIDER: caSPKIDER)
+            return PairingTLSConnection(tls: tls, caSPKIDER: caSPKIDER, caCertificateDER: caCertificateDER)
         } catch let error as InnerTLSError {
             pumps.forEach { $0.cancel() }
             peer?.cancel()
@@ -508,7 +511,15 @@ public actor InnerTLS {
     }
 
     private static func pairingTrustAnchorCertificate(chain: [SecCertificate], caPin: PairingCAPin) -> SecCertificate? {
-        guard let anchor = chain.first(where: { CertChain.pinMatches(certificate: $0, pin: caPin) }) else {
+        guard let anchorIndex = chain.firstIndex(where: { CertChain.pinMatches(certificate: $0, pin: caPin) }) else {
+            return nil
+        }
+        let anchor = chain[anchorIndex]
+
+        // Trust evaluation takes an anchor as given, and a pin matches on a hash. So prove what the
+        // pinned certificate is: it signed itself, and it signed its way down to the leaf.
+        guard CertChain.isSelfSigned(anchor),
+              (0..<anchorIndex).allSatisfy({ CertChain.isSigned(chain[$0], by: chain[$0 + 1]) }) else {
             return nil
         }
 

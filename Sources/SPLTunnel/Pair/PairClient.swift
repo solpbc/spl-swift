@@ -463,11 +463,11 @@ public struct PairClient: Sendable {
         clientInfo: SPLClientInfo
     ) async throws -> LANPairResponse {
         let tls: InnerTLS
-        let caSPKIDER: [UInt8]
+        let caCertificateDER: Data
         do {
             let pairingTLS = try await InnerTLS.connectPairingViaTransport(transport: transport, caPin: caPin)
             tls = pairingTLS.tls
-            caSPKIDER = pairingTLS.caSPKIDER
+            caCertificateDER = pairingTLS.caCertificateDER
         } catch InnerTLSError.peerNotPinned {
             throw PairError.lanCAFingerprintMismatch
         } catch InnerTLSError.caFingerprintMismatch {
@@ -508,7 +508,7 @@ public struct PairClient: Sendable {
             }
             let response = try Self.parseHTTPResponse(responseData)
             let lanResponse = try Self.decodePairResponse(status: response.status, body: response.body)
-            try Self.verifyRelayPairResponse(lanResponse, caSPKIDER: caSPKIDER)
+            try Self.verifyRelayPairResponse(lanResponse, pinnedCACertificateDER: caCertificateDER)
             await cleanupPairingTunnel(tls: tls, mux: mux, pump: pump)
             return lanResponse
         } catch {
@@ -531,49 +531,32 @@ public struct PairClient: Sendable {
         "/app/network/pair?token=\(CertChain.hex(sBytes))"
     }
 
-    static func verifyRelayPairResponse(_ response: LANPairResponse, caSPKIDER: [UInt8]) throws {
-        let responseCAP256SPKI = try responseCAP256SPKI(response.caChain)
-        guard responseCAP256SPKI == caSPKIDER else {
-            throw PairError.relayInstanceMismatch
-        }
-        let expected: String
-        do {
-            expected = try CertChain.jidFromSPKI(caSPKIDER)
-        } catch {
-            // The byte-matched pinned CA is unusable, so the response must fail closed.
-            throw PairError.relayInstanceMismatch
-        }
-        guard response.instanceID == expected else {
+    static func verifyRelayPairResponse(_ response: LANPairResponse, pinnedCACertificateDER: Data) throws {
+        guard pairResponseIsBound(response, pinnedCACertificateDER: pinnedCACertificateDER) else {
+            pairLog.notice("relay pair refused reason=\("instance_not_pinned_ca", privacy: .public)")
             throw PairError.relayInstanceMismatch
         }
     }
 
-    /// A direct link pins whichever CA it names, so the id the peer answers with counts only if
-    /// it is the id of the certificate the pin accepted, and that same certificate heads the chain
-    /// the pairing stores. Runs before anything from the response is kept.
     static func verifyDirectPairResponse(_ response: LANPairResponse, pinnedCACertificateDER: Data) throws {
-        guard let chainCA = (try? CertChain.certificates(fromPEM: joinPEMChain(response.caChain)))?.first,
-              SecCertificateCopyData(chainCA) as Data == pinnedCACertificateDER,
-              let caSPKIDER = try? CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: chainCA),
-              let expected = try? CertChain.jidFromSPKI(caSPKIDER),
-              response.instanceID == expected else {
+        guard pairResponseIsBound(response, pinnedCACertificateDER: pinnedCACertificateDER) else {
             pairLog.notice("direct pair refused reason=\("instance_not_pinned_ca", privacy: .public)")
             throw PairError.directInstanceMismatch
         }
     }
 
-    private static func responseCAP256SPKI(_ caChain: [String]) throws -> [UInt8] {
-        do {
-            let certificates = try CertChain.certificates(fromPEM: joinPEMChain(caChain))
-            guard let caCertificate = certificates.first else {
-                throw PairError.relayInstanceMismatch
-            }
-            return try CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: caCertificate)
-        } catch let error as PairError {
-            throw error
-        } catch {
-            throw PairError.relayInstanceMismatch
+    /// Whether the answer is tied to the certificate the pin accepted: that certificate heads the
+    /// chain being stored, it signed itself, and the id answered is its journal id. Checked before
+    /// anything from the response is kept, on every pairing path.
+    private static func pairResponseIsBound(_ response: LANPairResponse, pinnedCACertificateDER: Data) -> Bool {
+        guard let chainCA = (try? CertChain.certificates(fromPEM: joinPEMChain(response.caChain)))?.first,
+              SecCertificateCopyData(chainCA) as Data == pinnedCACertificateDER,
+              CertChain.isSelfSigned(chainCA),
+              let caSPKIDER = try? CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: chainCA),
+              let expected = try? CertChain.jidFromSPKI(caSPKIDER) else {
+            return false
         }
+        return response.instanceID == expected
     }
 
     static func makeRelayRequest(relayEndpoint: RelayEndpoint, response: LANPairResponse) throws -> URLRequest {

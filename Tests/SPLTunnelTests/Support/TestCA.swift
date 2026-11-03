@@ -107,6 +107,42 @@ enum TestCA {
         )
     }
 
+    /// A peer holding its own key and a certificate carrying `owner`'s public key, which is public,
+    /// signed with that other key. The certificate's SPKI gives the owner's journal ID and its
+    /// signature doesn't verify under the key it carries.
+    static func copyingPublicKey(of owner: Bundle) throws -> Bundle {
+        let ownerKey = try CryptoCSR.pkcs8PEMToPrivateKey(owner.caPrivateKeyPEM).publicKey
+        let peerKey = P256.Signing.PrivateKey()
+        let copyDER = try certificate(
+            subject: "solstone-test-ca",
+            issuer: "solstone-test-ca",
+            subjectPublicKey: ownerKey,
+            issuerPrivateKey: peerKey,
+            isCA: true,
+            extendedKeyUsage: []
+        )
+        let serverKey = P256.Signing.PrivateKey()
+        let serverDER = try certificate(
+            subject: "localhost",
+            issuer: "solstone-test-ca",
+            subjectPublicKey: serverKey.publicKey,
+            issuerPrivateKey: peerKey,
+            isCA: false,
+            extendedKeyUsage: [CertBuilder.oidServerAuth],
+            subjectAlternativeNames: true
+        )
+        let copyPEM = CryptoCSR.pemEncode(copyDER, label: "CERTIFICATE")
+        return Bundle(
+            caCertificatePEM: copyPEM,
+            caPrivateKeyPEM: CryptoCSR.pemEncode(CryptoCSR.exportPKCS8(peerKey), label: "PRIVATE KEY"),
+            serverCertificatePEM: CryptoCSR.pemEncode(serverDER, label: "CERTIFICATE"),
+            serverPrivateKeyPEM: CryptoCSR.pemEncode(CryptoCSR.exportPKCS8(serverKey), label: "PRIVATE KEY"),
+            clientCertificatePEM: owner.clientCertificatePEM,
+            clientPrivateKeyPEM: owner.clientPrivateKeyPEM,
+            pairing: owner.pairing
+        )
+    }
+
     /// The journal ID of a fixture's CA, as a peer presenting it would claim.
     static func journalID(of bundle: Bundle) throws -> String {
         let ca = try #require(try CertChain.certificates(fromPEM: bundle.caCertificatePEM).first)
