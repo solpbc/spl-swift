@@ -12,6 +12,8 @@ protocol LANPairTransport: Sendable {
 }
 
 protocol LANPairAttempt: Sendable {
+    /// The DER of the certificate the link's CA pin accepted on this attempt.
+    var pinnedCACertificateDER: Data { get }
     func send(requestBytes: Data) async throws -> (status: Int, body: Data)
     func close() async
 }
@@ -29,7 +31,11 @@ struct CertlessPairExchange: LANPairTransport {
         port: Int,
         caFingerprintBytes: [UInt8]
     ) async throws -> any LANPairAttempt {
-        let tls = try await InnerTLS.connectLANCertless(host: host, port: port, caFingerprintBytes: caFingerprintBytes)
+        let (tls, pinnedCACertificateDER) = try await InnerTLS.connectLANPairing(
+            host: host,
+            port: port,
+            caFingerprintBytes: caFingerprintBytes
+        )
         let mux = Multiplexer(sink: { data in
             try await tls.send(data)
         }, role: .dialer)
@@ -46,7 +52,13 @@ struct CertlessPairExchange: LANPairTransport {
 
         do {
             let stream = try await mux.openStream()
-            return CertlessPairAttempt(tls: tls, mux: mux, pump: pump, stream: stream)
+            return CertlessPairAttempt(
+                pinnedCACertificateDER: pinnedCACertificateDER,
+                tls: tls,
+                mux: mux,
+                pump: pump,
+                stream: stream
+            )
         } catch {
             await CertlessPairAttempt.cleanup(tls: tls, mux: mux, pump: pump, reason: .transportFailure)
             throw error
@@ -161,13 +173,15 @@ struct CertlessPairExchange: LANPairTransport {
 }
 
 private actor CertlessPairAttempt: LANPairAttempt {
+    nonisolated let pinnedCACertificateDER: Data
     private let tls: InnerTLS
     private let mux: Multiplexer
     private let pump: Task<Void, Never>
     private let stream: MuxStream
     private var closed = false
 
-    init(tls: InnerTLS, mux: Multiplexer, pump: Task<Void, Never>, stream: MuxStream) {
+    init(pinnedCACertificateDER: Data, tls: InnerTLS, mux: Multiplexer, pump: Task<Void, Never>, stream: MuxStream) {
+        self.pinnedCACertificateDER = pinnedCACertificateDER
         self.tls = tls
         self.mux = mux
         self.pump = pump

@@ -1,0 +1,430 @@
+{
+  "from_journal_id": [
+    {
+      "journal_id": "45706955-fcdd-591c-4421-b694ee813188",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#94a3b8",
+            "name": "slate"
+          },
+          "name": "cake",
+          "rot": 45,
+          "svg": "<path d=\"M20 21v-8a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8\" /> <path d=\"M4 16s.5-1 2-1 2.5 2 4 2 2.5-2 4-2 2.5 2 4 2 2-1 2-1\" /> <path d=\"M2 21h20\" /> <path d=\"M7 8v3\" /> <path d=\"M12 8v3\" /> <path d=\"M17 8v3\" /> <path d=\"M7 4h.01\" /> <path d=\"M12 4h.01\" /> <path d=\"M17 4h.01\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#f59e0b",
+            "name": "amber"
+          },
+          "name": "snowflake",
+          "rot": 0,
+          "svg": "<path d=\"m10 20-1.25-2.5L6 18\" /> <path d=\"M10 4 8.75 6.5 6 6\" /> <path d=\"m14 20 1.25-2.5L18 18\" /> <path d=\"m14 4 1.25 2.5L18 6\" /> <path d=\"m17 21-3-6h-4\" /> <path d=\"m17 3-3 6 1.5 3\" /> <path d=\"M2 12h6.5L10 9\" /> <path d=\"m20 10-1.5 2 1.5 2\" /> <path d=\"M22 12h-6.5L14 15\" /> <path d=\"m4 10 1.5 2L4 14\" /> <path d=\"m7 21 3-6-1.5-3\" /> <path d=\"m7 3 3 6h4\" />"
+        },
+        "words": [
+          "yen",
+          "margarita"
+        ]
+      }
+    },
+    {
+      "journal_id": "1f3614fc-36f0-bdba-a2b8-ad302f1c3c10",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#22c55e",
+            "name": "green"
+          },
+          "name": "gift",
+          "rot": 0,
+          "svg": "<path d=\"M12 7v14\" /> <path d=\"M20 11v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8\" /> <path d=\"M7.5 7a1 1 0 0 1 0-5A4.8 8 0 0 1 12 7a4.8 8 0 0 1 4.5-5 1 1 0 0 1 0 5\" /> <rect x=\"3\" y=\"7\" width=\"18\" height=\"4\" rx=\"1\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#f97316",
+            "name": "orange"
+          },
+          "name": "snowflake",
+          "rot": 0,
+          "svg": "<path d=\"m10 20-1.25-2.5L6 18\" /> <path d=\"M10 4 8.75 6.5 6 6\" /> <path d=\"m14 20 1.25-2.5L18 18\" /> <path d=\"m14 4 1.25 2.5L18 6\" /> <path d=\"m17 21-3-6h-4\" /> <path d=\"m17 3-3 6 1.5 3\" /> <path d=\"M2 12h6.5L10 9\" /> <path d=\"m20 10-1.5 2 1.5 2\" /> <path d=\"M22 12h-6.5L14 15\" /> <path d=\"m4 10 1.5 2L4 14\" /> <path d=\"m7 21 3-6-1.5-3\" /> <path d=\"m7 3 3 6h4\" />"
+        },
+        "words": [
+          "luxury",
+          "diminish"
+        ]
+      }
+    },
+    {
+      "journal_id": "446ff1bc-7bbf-f8a8-baee-fbf6e01cdaba",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#3b82f6",
+            "name": "blue"
+          },
+          "name": "lock",
+          "rot": 45,
+          "svg": "<rect width=\"18\" height=\"11\" x=\"3\" y=\"11\" rx=\"2\" ry=\"2\" /> <path d=\"M7 11V7a5 5 0 0 1 10 0v4\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#22c55e",
+            "name": "green"
+          },
+          "name": "magnet",
+          "rot": 45,
+          "svg": "<path d=\"m12 15 4 4\" /> <path d=\"M2.352 10.648a1.205 1.205 0 0 0 0 1.704l2.296 2.296a1.205 1.205 0 0 0 1.704 0l6.029-6.029a1 1 0 1 1 3 3l-6.029 6.029a1.205 1.205 0 0 0 0 1.704l2.296 2.296a1.205 1.205 0 0 0 1.704 0l6.365-6.367A1 1 0 0 0 8.716 4.282z\" /> <path d=\"m5 8 4 4\" />"
+        },
+        "words": [
+          "timing",
+          "swear"
+        ]
+      }
+    },
+    {
+      "journal_id": "d6037fea-31d0-1c74-ca98-ac1c2a407a2b",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#a855f7",
+            "name": "purple"
+          },
+          "name": "shrimp",
+          "rot": 0,
+          "svg": "<path d=\"M11 12h.01\" /> <path d=\"M13 22c.5-.5 1.12-1 2.5-1-1.38 0-2-.5-2.5-1\" /> <path d=\"M14 2a3.28 3.28 0 0 1-3.227 1.798l-6.17-.561A2.387 2.387 0 1 0 4.387 8H15.5a1 1 0 0 1 0 13 1 1 0 0 0 0-5H12a7 7 0 0 1-7-7V8\" /> <path d=\"M14 8a8.5 8.5 0 0 1 0 8\" /> <path d=\"M16 16c2 0 4.5-4 4-6\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#94a3b8",
+            "name": "slate"
+          },
+          "name": "sun",
+          "rot": 45,
+          "svg": "<circle cx=\"12\" cy=\"12\" r=\"4\" /> <path d=\"M12 2v2\" /> <path d=\"M12 20v2\" /> <path d=\"m4.93 4.93 1.41 1.41\" /> <path d=\"m17.66 17.66 1.41 1.41\" /> <path d=\"M2 12h2\" /> <path d=\"M20 12h2\" /> <path d=\"m6.34 17.66-1.41 1.41\" /> <path d=\"m19.07 4.93-1.41 1.41\" />"
+        },
+        "words": [
+          "handling",
+          "glitch"
+        ]
+      }
+    },
+    {
+      "journal_id": "5bcbce8a-4527-6d80-b389-cb8693d9b472",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#a855f7",
+            "name": "purple"
+          },
+          "name": "leaf",
+          "rot": 0,
+          "svg": "<path d=\"M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z\" /> <path d=\"M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#14b8a6",
+            "name": "teal"
+          },
+          "name": "sun",
+          "rot": 0,
+          "svg": "<circle cx=\"12\" cy=\"12\" r=\"4\" /> <path d=\"M12 2v2\" /> <path d=\"M12 20v2\" /> <path d=\"m4.93 4.93 1.41 1.41\" /> <path d=\"m17.66 17.66 1.41 1.41\" /> <path d=\"M2 12h2\" /> <path d=\"M20 12h2\" /> <path d=\"m6.34 17.66-1.41 1.41\" /> <path d=\"m19.07 4.93-1.41 1.41\" />"
+        },
+        "words": [
+          "leggings",
+          "lucrative"
+        ]
+      }
+    },
+    {
+      "journal_id": "c20390fa-291f-6596-69bc-d58d06689638",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#14b8a6",
+            "name": "teal"
+          },
+          "name": "coffee",
+          "rot": 45,
+          "svg": "<path d=\"M10 2v2\" /> <path d=\"M14 2v2\" /> <path d=\"M16 8a1 1 0 0 1 1 1v8a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1h14a4 4 0 1 1 0 8h-1\" /> <path d=\"M6 2v2\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#d946ef",
+            "name": "magenta"
+          },
+          "name": "pill",
+          "rot": 45,
+          "svg": "<path d=\"m10.5 20.5 10-10a4.95 4.95 0 1 0-7-7l-10 10a4.95 4.95 0 1 0 7 7Z\" /> <path d=\"m8.5 8.5 7 7\" />"
+        },
+        "words": [
+          "rental",
+          "directory"
+        ]
+      }
+    },
+    {
+      "journal_id": "95d7e061-48af-76dc-d6a9-d50355ea3f53",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#06b6d4",
+            "name": "cyan"
+          },
+          "name": "sun",
+          "rot": 0,
+          "svg": "<circle cx=\"12\" cy=\"12\" r=\"4\" /> <path d=\"M12 2v2\" /> <path d=\"M12 20v2\" /> <path d=\"m4.93 4.93 1.41 1.41\" /> <path d=\"m17.66 17.66 1.41 1.41\" /> <path d=\"M2 12h2\" /> <path d=\"M20 12h2\" /> <path d=\"m6.34 17.66-1.41 1.41\" /> <path d=\"m19.07 4.93-1.41 1.41\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#38bdf8",
+            "name": "sky"
+          },
+          "name": "croissant",
+          "rot": 0,
+          "svg": "<path d=\"M10.2 18H4.774a1.5 1.5 0 0 1-1.352-.97 11 11 0 0 1 .132-6.487\" /> <path d=\"M18 10.2V4.774a1.5 1.5 0 0 0-.97-1.352 11 11 0 0 0-6.486.132\" /> <path d=\"M18 5a4 3 0 0 1 4 3 2 2 0 0 1-2 2 10 10 0 0 0-5.139 1.42\" /> <path d=\"M5 18a3 4 0 0 0 3 4 2 2 0 0 0 2-2 10 10 0 0 1 1.42-5.14\" /> <path d=\"M8.709 2.554a10 10 0 0 0-6.155 6.155 1.5 1.5 0 0 0 .676 1.626l9.807 5.42a2 2 0 0 0 2.718-2.718l-5.42-9.807a1.5 1.5 0 0 0-1.626-.676\" />"
+        },
+        "words": [
+          "laborious",
+          "showcase"
+        ]
+      }
+    },
+    {
+      "journal_id": "79c79904-a567-d708-fc1a-eef740bd28e1",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#06b6d4",
+            "name": "cyan"
+          },
+          "name": "snail",
+          "rot": 45,
+          "svg": "<path d=\"M2 13a6 6 0 1 0 12 0 4 4 0 1 0-8 0 2 2 0 0 0 4 0\" /> <circle cx=\"10\" cy=\"13\" r=\"8\" /> <path d=\"M2 21h12c4.4 0 8-3.6 8-8V7a2 2 0 1 0-4 0v6\" /> <path d=\"M18 3 19.1 5.2\" /> <path d=\"M22 3 20.9 5.2\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#f59e0b",
+            "name": "amber"
+          },
+          "name": "fish",
+          "rot": 45,
+          "svg": "<path d=\"M6.5 12c.94-3.46 4.94-6 8.5-6 3.56 0 6.06 2.54 7 6-.94 3.47-3.44 6-7 6s-7.56-2.53-8.5-6Z\" /> <path d=\"M18 12v.5\" /> <path d=\"M16 17.93a9.77 9.77 0 0 1 0-11.86\" /> <path d=\"M7 10.67C7 8 5.58 5.97 2.73 5.5c-1 1.5-1 5 .23 6.5-1.24 1.5-1.24 5-.23 6.5C5.58 18.03 7 16 7 13.33\" /> <path d=\"M10.46 7.26C10.2 5.88 9.17 4.24 8 3h5.8a2 2 0 0 1 1.98 1.67l.23 1.4\" /> <path d=\"m16.01 17.93-.23 1.4A2 2 0 0 1 13.8 21H9.5a5.96 5.96 0 0 0 1.49-3.98\" />"
+        },
+        "words": [
+          "upon",
+          "sanded"
+        ]
+      }
+    },
+    {
+      "journal_id": "e37accfb-33c9-813d-d808-1a4e42824b6e",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#06b6d4",
+            "name": "cyan"
+          },
+          "name": "cat",
+          "rot": 0,
+          "svg": "<path d=\"M12 5c.67 0 1.35.09 2 .26 1.78-2 5.03-2.84 6.42-2.26 1.4.58-.42 7-.42 7 .57 1.07 1 2.24 1 3.44C21 17.9 16.97 21 12 21s-9-3-9-7.56c0-1.25.5-2.4 1-3.44 0 0-1.89-6.42-.5-7 1.39-.58 4.72.23 6.5 2.23A9.04 9.04 0 0 1 12 5Z\" /> <path d=\"M8 14v.5\" /> <path d=\"M16 14v.5\" /> <path d=\"M11.25 16.25h1.5L12 17l-.75-.75Z\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#f97316",
+            "name": "orange"
+          },
+          "name": "hammer",
+          "rot": 0,
+          "svg": "<path d=\"m15 12-9.373 9.373a1 1 0 0 1-3.001-3L12 9\" /> <path d=\"m18 15 4-4\" /> <path d=\"m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172v-.344a2 2 0 0 0-.586-1.414l-1.657-1.657A6 6 0 0 0 12.516 3H9l1.243 1.243A6 6 0 0 1 12 8.485V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5\" />"
+        },
+        "words": [
+          "backing",
+          "sappy"
+        ]
+      }
+    },
+    {
+      "journal_id": "972d37cb-e1de-0623-0ae0-4f4f6bd8ecef",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#22c55e",
+            "name": "green"
+          },
+          "name": "feather",
+          "rot": 0,
+          "svg": "<path d=\"M12.67 19a2 2 0 0 0 1.416-.588l6.154-6.172a6 6 0 0 0-8.49-8.49L5.586 9.914A2 2 0 0 0 5 11.328V18a1 1 0 0 0 1 1z\" /> <path d=\"M16 8 2 22\" /> <path d=\"M17.5 15H9\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#3b82f6",
+            "name": "blue"
+          },
+          "name": "trees",
+          "rot": 45,
+          "svg": "<path d=\"M10 10v.2A3 3 0 0 1 8.9 16H5a3 3 0 0 1-1-5.8V10a3 3 0 0 1 6 0Z\" /> <path d=\"M7 16v6\" /> <path d=\"M13 19v3\" /> <path d=\"M12 19h8.3a1 1 0 0 0 .7-1.7L18 14h.3a1 1 0 0 0 .7-1.7L16 9h.2a1 1 0 0 0 .8-1.7L13 3l-1.4 1.5\" />"
+        },
+        "words": [
+          "vowel",
+          "twice"
+        ]
+      }
+    },
+    {
+      "journal_id": "45706955-FCDD-591C-4421-B694EE813188",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#94a3b8",
+            "name": "slate"
+          },
+          "name": "cake",
+          "rot": 45,
+          "svg": "<path d=\"M20 21v-8a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8\" /> <path d=\"M4 16s.5-1 2-1 2.5 2 4 2 2.5-2 4-2 2.5 2 4 2 2-1 2-1\" /> <path d=\"M2 21h20\" /> <path d=\"M7 8v3\" /> <path d=\"M12 8v3\" /> <path d=\"M17 8v3\" /> <path d=\"M7 4h.01\" /> <path d=\"M12 4h.01\" /> <path d=\"M17 4h.01\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#f59e0b",
+            "name": "amber"
+          },
+          "name": "snowflake",
+          "rot": 0,
+          "svg": "<path d=\"m10 20-1.25-2.5L6 18\" /> <path d=\"M10 4 8.75 6.5 6 6\" /> <path d=\"m14 20 1.25-2.5L18 18\" /> <path d=\"m14 4 1.25 2.5L18 6\" /> <path d=\"m17 21-3-6h-4\" /> <path d=\"m17 3-3 6 1.5 3\" /> <path d=\"M2 12h6.5L10 9\" /> <path d=\"m20 10-1.5 2 1.5 2\" /> <path d=\"M22 12h-6.5L14 15\" /> <path d=\"m4 10 1.5 2L4 14\" /> <path d=\"m7 21 3-6-1.5-3\" /> <path d=\"m7 3 3 6h4\" />"
+        },
+        "words": [
+          "yen",
+          "margarita"
+        ]
+      }
+    }
+  ],
+  "from_spki": [
+    {
+      "journal_id": "f30ed159-ef46-8e9c-913f-e49f0fe7d201",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#3b82f6",
+            "name": "blue"
+          },
+          "name": "piano",
+          "rot": 45,
+          "svg": "<path d=\"M18.5 8c-1.4 0-2.6-.8-3.2-2A6.87 6.87 0 0 0 2 9v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-8.5C22 9.6 20.4 8 18.5 8\" /> <path d=\"M2 14h20\" /> <path d=\"M6 14v4\" /> <path d=\"M10 14v4\" /> <path d=\"M14 14v4\" /> <path d=\"M18 14v4\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#a855f7",
+            "name": "purple"
+          },
+          "name": "key",
+          "rot": 0,
+          "svg": "<path d=\"m15.5 7.5 2.3 2.3a1 1 0 0 0 1.4 0l2.1-2.1a1 1 0 0 0 0-1.4L19 4\" /> <path d=\"m21 2-9.6 9.6\" /> <circle cx=\"7.5\" cy=\"15.5\" r=\"5.5\" />"
+        },
+        "words": [
+          "liquefy",
+          "smock"
+        ]
+      },
+      "spki_hex": "3059301306072a8648ce3d020106082a8648ce3d03010703420004471c3e758c4904285bba7e53118ed0f524adeb0757d25bd2f8e7b0d76dfa714cdd520f7aca8a8b917acc37f51de8f0c9bbe3ad858382e702dc25a12d09f7a858"
+    },
+    {
+      "journal_id": "62bde3af-1ef4-8292-84db-1e5ac2c07e8b",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#ec4899",
+            "name": "pink"
+          },
+          "name": "turtle",
+          "rot": 0,
+          "svg": "<path d=\"m12 10 2 4v3a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1v-3a8 8 0 1 0-16 0v3a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1v-3l2-4h4Z\" /> <path d=\"M4.82 7.9 8 10\" /> <path d=\"M15.18 7.9 12 10\" /> <path d=\"M16.93 10H20a2 2 0 0 1 0 4H2\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#06b6d4",
+            "name": "cyan"
+          },
+          "name": "pizza",
+          "rot": 0,
+          "svg": "<path d=\"m12 14-1 1\" /> <path d=\"m13.75 18.25-1.25 1.42\" /> <path d=\"M17.775 5.654a15.68 15.68 0 0 0-12.121 12.12\" /> <path d=\"M18.8 9.3a1 1 0 0 0 2.1 7.7\" /> <path d=\"M21.964 20.732a1 1 0 0 1-1.232 1.232l-18-5a1 1 0 0 1-.695-1.232A19.68 19.68 0 0 1 15.732 2.037a1 1 0 0 1 1.232.695z\" />"
+        },
+        "words": [
+          "distrust",
+          "chokehold"
+        ]
+      },
+      "spki_hex": "3059301306072a8648ce3d020106082a8648ce3d030107034200047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1"
+    },
+    {
+      "journal_id": "75e46c0d-1c50-892b-98ff-4d174c135add",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#d946ef",
+            "name": "magenta"
+          },
+          "name": "dice-5",
+          "rot": 0,
+          "svg": "<rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" ry=\"2\" /> <path d=\"M16 8h.01\" /> <path d=\"M8 8h.01\" /> <path d=\"M8 16h.01\" /> <path d=\"M16 16h.01\" /> <path d=\"M12 12h.01\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#38bdf8",
+            "name": "sky"
+          },
+          "name": "snail",
+          "rot": 45,
+          "svg": "<path d=\"M2 13a6 6 0 1 0 12 0 4 4 0 1 0-8 0 2 2 0 0 0 4 0\" /> <circle cx=\"10\" cy=\"13\" r=\"8\" /> <path d=\"M2 21h12c4.4 0 8-3.6 8-8V7a2 2 0 1 0-4 0v6\" /> <path d=\"M18 3 19.1 5.2\" /> <path d=\"M22 3 20.9 5.2\" />"
+        },
+        "words": [
+          "delay",
+          "safari"
+        ]
+      },
+      "spki_hex": "3059301306072a8648ce3d020106082a8648ce3d030107034200048e533b6fa0bf7b4625bb30667c01fb607ef9f8b8a80fef5b300628703187b2a373eb1dbde03318366d069f83a6f5900053c73633cb041b21c55e1a86c1f400b4"
+    },
+    {
+      "journal_id": "bb8f23b4-fd5e-8ca9-98c7-c1dfa927a840",
+      "mark": {
+        "icon1": {
+          "color": {
+            "hex": "#f97316",
+            "name": "orange"
+          },
+          "name": "truck",
+          "rot": 45,
+          "svg": "<path d=\"M14 18V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v11a1 1 0 0 0 1 1h2\" /> <path d=\"M15 18H9\" /> <path d=\"M19 18h2a1 1 0 0 0 1-1v-3.65a1 1 0 0 0-.22-.624l-3.48-4.35A1 1 0 0 0 17.52 8H14\" /> <circle cx=\"17\" cy=\"18\" r=\"2\" /> <circle cx=\"7\" cy=\"18\" r=\"2\" />"
+        },
+        "icon2": {
+          "color": {
+            "hex": "#14b8a6",
+            "name": "teal"
+          },
+          "name": "snail",
+          "rot": 45,
+          "svg": "<path d=\"M2 13a6 6 0 1 0 12 0 4 4 0 1 0-8 0 2 2 0 0 0 4 0\" /> <circle cx=\"10\" cy=\"13\" r=\"8\" /> <path d=\"M2 21h12c4.4 0 8-3.6 8-8V7a2 2 0 1 0-4 0v6\" /> <path d=\"M18 3 19.1 5.2\" /> <path d=\"M22 3 20.9 5.2\" />"
+        },
+        "words": [
+          "duvet",
+          "capital"
+        ]
+      },
+      "spki_hex": "3059301306072a8648ce3d020106082a8648ce3d03010703420004ea68d7b6fedf0b71878938d51d71f8729e0acb8c2c6df8b3d79e8a4b90949ee02a2744c972c9fce787014a964a8ea0c84d714feaa4de823fe85a224a4dd048fa"
+    }
+  ],
+  "generator": "scripts/mark-vectors, computed by spl_core::mark::mark_from_jid",
+  "refused_journal_ids": [
+    "",
+    "not-a-journal-id",
+    "f30ed159ef468e9c913fe49f0fe7d2010000",
+    "f30ed159-ef46-8e9c-913f-e49f0fe7d20g",
+    "f30ed159-ef46-8e9c-913f-e49f0fe7d20",
+    "f30ed159-ef46-8e9c-913f-e49f-fe7d201"
+  ],
+  "spl_rust_revision": "6ecae85c0606896d9ea29d50f3718ae15ed96821",
+  "tables": {
+    "colors_sha256": "2cf5114de1b5b6e75849289ebe43100a7e566994024220acbdda75a7db4f19e9",
+    "glyphs_sha256": "301364199873161e57b28dedccb11307b4c3664c3975942fe0c299a365f5ecdb",
+    "words_sha256": "6d557f0693958fb5e650b68b5bee585eb82cf4da32965505c789e924743bc522"
+  }
+}

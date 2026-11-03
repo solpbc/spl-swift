@@ -11,7 +11,8 @@ let package = Package(
         .iOS(.v26),
     ],
     products: [
-        .library(name: "SPLTunnel", targets: ["SPLTunnel"])
+        .library(name: "SPLTunnel", targets: ["SPLTunnel"]),
+        .library(name: "SPLMark", targets: ["SPLMark"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0")
@@ -26,9 +27,38 @@ let package = Package(
                 .swiftLanguageMode(.v6)
             ]
         ),
+        .target(
+            name: "CArgon2",
+            exclude: ["LICENSE", "README.md"],
+            cSettings: [
+                .define("ARGON2_NO_THREADS")
+            ]
+        ),
+        .target(
+            name: "SPLMark",
+            dependencies: ["CArgon2"],
+            exclude: ["NOTICE.md"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
+        .testTarget(
+            name: "SPLMarkTests",
+            dependencies: [
+                "SPLMark",
+                "SPLTunnel",
+                .product(name: "Crypto", package: "swift-crypto"),
+            ],
+            resources: [
+                .copy("Vectors/mark-vectors.json")
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
         .testTarget(
             name: "SPLTunnelTests",
-            dependencies: ["SPLTunnel"],
+            dependencies: ["SPLTunnel", "SPLMark"],
             resources: [
                 .copy("Conformance/Corpus")
             ],

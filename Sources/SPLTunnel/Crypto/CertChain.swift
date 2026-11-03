@@ -158,6 +158,15 @@ public enum CertChain {
         return uuid.uuidString.lowercased()
     }
 
+    /// The journal ID of the CA heading a stored pairing's chain, the certificate its pin accepted.
+    /// This is the id the journal's mark comes from: a stored instance ID is only what the peer said.
+    public static func journalID(ofCAChainPEM caChainPEM: String) throws -> String {
+        guard let caCertificate = try certificates(fromPEM: caChainPEM).first else {
+            throw CertChainError.nonCanonicalP256SPKI
+        }
+        return try jidFromSPKI(canonicalP256SubjectPublicKeyInfoDER(certificate: caCertificate))
+    }
+
     public static func jidFromSPKI(_ spkiDER: [UInt8]) throws -> String {
         guard let template = jidSPKITemplates.first(where: {
             spkiDER.count == $0.totalLength && spkiDER.starts(with: $0.prefix)

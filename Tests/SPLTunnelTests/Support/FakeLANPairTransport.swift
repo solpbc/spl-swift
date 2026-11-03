@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 import Foundation
+import Security
 @testable import SPLTunnel
 
 enum FakeLANPairError: Error, Equatable, Sendable {
@@ -99,6 +100,8 @@ actor FakeLANPairTransport: LANPairTransport {
 }
 
 private actor FakeLANPairAttempt: LANPairAttempt {
+    /// An honest fake: the certificate its pin accepted is the one its response names.
+    nonisolated let pinnedCACertificateDER: Data
     private let prepare: FakeLANPrepare
     private let outcome: FakeLANOutcome
     private let recorder: FakeLANRecorder
@@ -108,6 +111,7 @@ private actor FakeLANPairAttempt: LANPairAttempt {
         self.prepare = prepare
         self.outcome = outcome
         self.recorder = recorder
+        self.pinnedCACertificateDER = Self.certificateNamed(by: outcome)
     }
 
     func send(requestBytes: Data) async throws -> (status: Int, body: Data) {
@@ -131,6 +135,16 @@ private actor FakeLANPairAttempt: LANPairAttempt {
         }
         closed = true
         await recorder.recordClose()
+    }
+
+    private static func certificateNamed(by outcome: FakeLANOutcome) -> Data {
+        guard case .response(_, let body) = outcome,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let pem = (json["ca_chain"] as? [String])?.first,
+              let certificate = (try? CertChain.certificates(fromPEM: pem))?.first else {
+            return Data()
+        }
+        return SecCertificateCopyData(certificate) as Data
     }
 }
 

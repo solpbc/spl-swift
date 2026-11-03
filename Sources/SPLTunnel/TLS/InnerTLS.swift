@@ -118,12 +118,33 @@ public actor InnerTLS {
         caFingerprintBytes: [UInt8],
         unpinnedInterface: Bool = false
     ) async throws -> InnerTLS {
+        try await connectLANPairing(
+            host: host,
+            port: port,
+            caFingerprintBytes: caFingerprintBytes,
+            unpinnedInterface: unpinnedInterface
+        ).tls
+    }
+
+    /// The certless direct pairing channel, with the certificate its CA pin accepted, so the
+    /// ceremony can bind what the peer answers to that certificate.
+    static func connectLANPairing(
+        host: String,
+        port: Int,
+        caFingerprintBytes: [UInt8],
+        unpinnedInterface: Bool = false
+    ) async throws -> (tls: InnerTLS, caCertificateDER: Data) {
         guard let nwPort = NWEndpoint.Port(rawValue: UInt16(clamping: port)), 1...65535 ~= port else {
             throw InnerTLSError.invalidPort(port)
         }
 
         let verifyFailure = TLSVerifyFailure()
-        let options = makeCertlessTLSOptions(caFingerprintBytes: caFingerprintBytes, verifyFailure: verifyFailure)
+        let trustCapture = PairingTrustCapture()
+        let options = makeCertlessTLSOptions(
+            caFingerprintBytes: caFingerprintBytes,
+            verifyFailure: verifyFailure,
+            trustCapture: trustCapture
+        )
         let parameters = makeLANParameters(tls: options, host: host, unpinnedInterface: unpinnedInterface)
         let dialHost = await NAT64Synthesis.dialHost(host, port: nwPort.rawValue)
         let connection = NWConnection(host: dialHost, port: nwPort, using: parameters)
@@ -147,9 +168,14 @@ public actor InnerTLS {
         let elapsed = startedAt.duration(to: .now).milliseconds
         logger.notice("handshake transport=\("lan-certless", privacy: .public) duration_ms=\(elapsed, privacy: .public)")
 
+        guard let caCertificateDER = trustCapture.caCertificateDER else {
+            connection.cancel()
+            throw InnerTLSError.peerNotPinned
+        }
+
         let tls = InnerTLS(connection: connection)
         await tls.startReceiveLoop()
-        return tls
+        return (tls, caCertificateDER)
     }
 
     public static func connectViaTransport(transport: any ByteTransport, pairing: StoredPairing) async throws -> InnerTLS {
@@ -428,11 +454,16 @@ public actor InnerTLS {
         return parameters
     }
 
-    private static func makeCertlessTLSOptions(caFingerprintBytes: [UInt8], verifyFailure: TLSVerifyFailure) -> NWProtocolTLS.Options {
+    private static func makeCertlessTLSOptions(
+        caFingerprintBytes: [UInt8],
+        verifyFailure: TLSVerifyFailure,
+        trustCapture: PairingTrustCapture
+    ) -> NWProtocolTLS.Options {
         makePairingTLSOptions(
             caPin: PairingCAPin(kind: .certificateSHA256, prefixBytes: caFingerprintBytes),
             verifyFailure: verifyFailure,
-            mismatchReason: .caFingerprintMismatch
+            mismatchReason: .caFingerprintMismatch,
+            trustCapture: trustCapture
         )
     }
 
@@ -450,8 +481,9 @@ public actor InnerTLS {
         sec_protocol_options_set_verify_block(secOptions, { _, trust, complete in
             let secTrust = sec_trust_copy_ref(trust).takeRetainedValue()
             let chain = (SecTrustCopyCertificateChain(secTrust) as? [SecCertificate]) ?? []
-            if let caSPKIDER = pairingTrustAnchorSPKI(chain: chain, caPin: caPin) {
-                trustCapture?.set(caSPKIDER)
+            if let anchor = pairingTrustAnchorCertificate(chain: chain, caPin: caPin),
+               let caSPKIDER = try? CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: anchor) {
+                trustCapture?.set(caSPKIDER: caSPKIDER, certificateDER: SecCertificateCopyData(anchor) as Data)
                 complete(true)
             } else {
                 verifyFailure.set(mismatchReason)
@@ -473,13 +505,6 @@ public actor InnerTLS {
 
     static func pairingTrustAccepts(chain: [SecCertificate], caPin: PairingCAPin) -> Bool {
         pairingTrustAnchorCertificate(chain: chain, caPin: caPin) != nil
-    }
-
-    private static func pairingTrustAnchorSPKI(chain: [SecCertificate], caPin: PairingCAPin) -> [UInt8]? {
-        guard let anchor = pairingTrustAnchorCertificate(chain: chain, caPin: caPin) else {
-            return nil
-        }
-        return try? CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: anchor)
     }
 
     private static func pairingTrustAnchorCertificate(chain: [SecCertificate], caPin: PairingCAPin) -> SecCertificate? {
@@ -575,16 +600,20 @@ private final class TLSVerifyFailure: @unchecked Sendable {
 private final class PairingTrustCapture: @unchecked Sendable {
     // why: Security verify callbacks run on a dispatch queue while factories await NWConnection state.
     private let lock = NSLock()
-    private var value: [UInt8]?
+    private var value: (caSPKIDER: [UInt8], certificateDER: Data)?
 
     var caSPKIDER: [UInt8]? {
-        lock.withLock { value }
+        lock.withLock { value?.caSPKIDER }
     }
 
-    func set(_ caSPKIDER: [UInt8]) {
+    var caCertificateDER: Data? {
+        lock.withLock { value?.certificateDER }
+    }
+
+    func set(caSPKIDER: [UInt8], certificateDER: Data) {
         lock.withLock {
             if value == nil {
-                value = caSPKIDER
+                value = (caSPKIDER, certificateDER)
             }
         }
     }

@@ -20,7 +20,7 @@ test-ios ci-ios:
 		grep -E '✘|error:|Failing tests:|Test run with|\*\* TEST (FAILED|SUCCEEDED) \*\*' "$$log" | tail -60; \
 		echo "ci-ios: full log: $$log"; \
 	}; \
-	xcodebuild test -scheme spl-swift -destination '$(CI_IOS_DEST)' > "$$log" 2>&1; \
+	xcodebuild test -scheme spl-swift-Package -destination '$(CI_IOS_DEST)' > "$$log" 2>&1; \
 	xcode_status=$$?; \
 	if [ "$$xcode_status" -ne 0 ]; then \
 		report_ci_ios_failure "ci-ios: xcodebuild failed with status $$xcode_status"; \

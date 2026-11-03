@@ -207,6 +207,7 @@ public struct PairClient: Sendable {
                 requestCommitted = true
                 let response = try await prepared.send(requestBytes: requestBytes)
                 let lanResponse = try Self.decodePairResponse(status: response.status, body: response.body)
+                try Self.verifyDirectPairResponse(lanResponse, pinnedCACertificateDER: prepared.pinnedCACertificateDER)
                 await attempt?.close()
                 attempt = nil
                 pairLog.notice("paired direct host=\(candidate.address, privacy: .public) port=\(candidatePort, privacy: .public)")
@@ -544,6 +545,20 @@ public struct PairClient: Sendable {
         }
         guard response.instanceID == expected else {
             throw PairError.relayInstanceMismatch
+        }
+    }
+
+    /// A direct link pins whichever CA it names, so the id the peer answers with counts only if
+    /// it is the id of the certificate the pin accepted, and that same certificate heads the chain
+    /// the pairing stores. Runs before anything from the response is kept.
+    static func verifyDirectPairResponse(_ response: LANPairResponse, pinnedCACertificateDER: Data) throws {
+        guard let chainCA = (try? CertChain.certificates(fromPEM: joinPEMChain(response.caChain)))?.first,
+              SecCertificateCopyData(chainCA) as Data == pinnedCACertificateDER,
+              let caSPKIDER = try? CertChain.canonicalP256SubjectPublicKeyInfoDER(certificate: chainCA),
+              let expected = try? CertChain.jidFromSPKI(caSPKIDER),
+              response.instanceID == expected else {
+            pairLog.notice("direct pair refused reason=\("instance_not_pinned_ca", privacy: .public)")
+            throw PairError.directInstanceMismatch
         }
     }
 
@@ -904,6 +919,7 @@ public enum PairError: Error, Equatable, Sendable {
     case relayAccessInvalid
     case attestationRejected(status: Int)
     case directAddressNotLocal
+    case directInstanceMismatch
 
     var statusCode: Int? {
         switch self {
@@ -928,7 +944,8 @@ public enum PairError: Error, Equatable, Sendable {
              (.relayRequestFailed, .relayRequestFailed),
              (.relayInstanceMismatch, .relayInstanceMismatch),
              (.relayAccessInvalid, .relayAccessInvalid),
-             (.directAddressNotLocal, .directAddressNotLocal):
+             (.directAddressNotLocal, .directAddressNotLocal),
+             (.directInstanceMismatch, .directInstanceMismatch):
             return true
         case (.lanCandidatesExhausted(let lhsSawCA), .lanCandidatesExhausted(let rhsSawCA)):
             return lhsSawCA == rhsSawCA

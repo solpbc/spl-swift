@@ -213,7 +213,7 @@ struct PairingConformanceTests {
         let body = try #require(request.httpBody)
         let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
         #expect(Set(json.keys) == ["instance_id", "home_attestation", "protocol_version"])
-        #expect(json["instance_id"] as? String == "instance-1")
+        #expect(json["instance_id"] as? String == response.instanceID)
         #expect(json["home_attestation"] as? String == "attestation")
         #expect(json["protocol_version"] as? Int == 2)
     }
@@ -255,7 +255,7 @@ struct PairingConformanceTests {
             relayEndpoint: Self.relayEndpoint
         )
 
-        #expect(pairing.instanceID == "instance-1")
+        #expect(try pairing.instanceID == TestCA.journalID(of: fixture))
         #expect(pairing.homeLabel == "test home")
         #expect(!pairing.clientCertPEM.isEmpty)
         #expect(!pairing.caChainPEM.isEmpty)
@@ -315,7 +315,7 @@ struct PairingConformanceTests {
 
     private static func pairResponseData(bundle: TestCA.Bundle) throws -> Data {
         try JSONSerialization.data(withJSONObject: [
-            "instance_id": "instance-1",
+            "instance_id": try TestCA.journalID(of: bundle),
             "home_label": "test home",
             "client_cert": bundle.clientCertificatePEM,
             "ca_chain": [bundle.caCertificatePEM],
@@ -326,7 +326,7 @@ struct PairingConformanceTests {
 
     private static func pairResponseDataOmittingLocalEndpoints(bundle: TestCA.Bundle) throws -> Data {
         try JSONSerialization.data(withJSONObject: [
-            "instance_id": "instance-1",
+            "instance_id": try TestCA.journalID(of: bundle),
             "home_label": "test home",
             "client_cert": bundle.clientCertificatePEM,
             "ca_chain": [bundle.caCertificatePEM],

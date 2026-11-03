@@ -16,6 +16,10 @@ Alpha. This package is the shared successor to the tunnel implementations previo
 - macOS 15+ / iOS 26+
 - Only dependency: [swift-crypto](https://github.com/apple/swift-crypto)
 
+## Journal marks
+
+`SPLMark` is a separate product, so an app that doesn't draw a mark doesn't take it. `markFromJournalID(_:)` is byte-identical to `spl_core::mark::mark_from_jid`, proved on vectors `spl-core` generates (`scripts/mark-vectors`). It runs Argon2id with the locked 64 MiB, three-pass parameters, using the reference C implementation vendored in `Sources/CArgon2`, so call `deriveMark(fromJournalID:)` off the main thread, once, and keep the result. `CertChain.journalID(ofCAChainPEM:)` gives the id of a stored pairing's pinned CA, which is what a mark should come from: a direct pairing whose answer doesn't match the certificate its pin accepted throws `PairError.directInstanceMismatch` before anything is stored.
+
 ## Build and test
 
 ```sh

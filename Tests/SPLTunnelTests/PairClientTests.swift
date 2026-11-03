@@ -842,14 +842,15 @@ struct PairClientDirectTests {
         defer { HTTPStubProtocol.state.reset(host: pairClientRelayHost) }
         let fixture = try TestCA.make()
         let now = Date(timeIntervalSince1970: 1_800_000_000)
-        let jwt = Self.v2JWT(instanceID: "instance-1", exp: 1_800_003_600)
+        let instanceID = try TestCA.journalID(of: fixture)
+        let jwt = Self.v2JWT(instanceID: instanceID, exp: 1_800_003_600)
         let responseBody = try Self.pairResponseData(
             bundle: fixture,
             relayAccess: [
                 "protocol_version": 2,
                 "status": "ready",
                 "relay_origin": "https://\(pairClientRelayHost)",
-                "instance_id": "instance-1",
+                "instance_id": instanceID,
                 "device_token": jwt,
                 "expires_at": "2027-01-15T09:00:00Z",
             ]
@@ -974,11 +975,12 @@ struct PairClientDirectTests {
 
     fileprivate static func pairResponseData(
         bundle: TestCA.Bundle,
-        instanceID: String = "instance-1",
+        instanceID: String? = nil,
         caChain: [String]? = nil,
         localEndpoints: [LocalEndpoint] = [],
         relayAccess: [String: Any]? = nil
     ) throws -> Data {
+        let instanceID = try instanceID ?? TestCA.journalID(of: bundle)
         let endpoints = localEndpoints.map {
             [
                 "ip": $0.host,
