@@ -13,6 +13,36 @@ public enum LoopbackProxyError: Error, Sendable, Equatable {
     case listenerCancelled
 }
 
+/// The port a started proxy listens on, and why it is not the port the
+/// caller preferred when it is not.
+public struct LoopbackBinding: Sendable, Equatable {
+    public enum Fallback: Sendable, Equatable {
+        /// The preferred port stayed in use for the whole preferred attempt.
+        case preferredPortInUse
+        /// Binding the preferred port failed for another reason.
+        case preferredPortFailed(String)
+    }
+
+    public let port: UInt16
+    /// `nil` when the proxy listens on the preferred port, or none was asked for.
+    public let fallback: Fallback?
+
+    public init(port: UInt16, fallback: Fallback?) {
+        self.port = port
+        self.fallback = fallback
+    }
+}
+
+/// A listener that failed before it was ready, with the framework's error.
+struct LoopbackListenerFailure: Error, Sendable {
+    let error: NWError
+
+    var isAddressInUse: Bool {
+        if case .posix(.EADDRINUSE) = error { return true }
+        return false
+    }
+}
+
 /// Counts the tunnel-side failures a proxied loopback connection can hit.
 ///
 /// These were invisible before 2026-09-12: a refused stream closed the TCP
@@ -148,12 +178,25 @@ public actor LoopbackProxy {
     /// event stream is never mistaken for an idle keep-alive connection.
     public static let defaultIdleReclaim: Duration = .seconds(120)
 
+    /// How long `start(preferredPort:)` keeps retrying a preferred port that
+    /// is still in use before it falls back to any free port.
+    ///
+    /// A cancelled listener releases its port asynchronously, about 100 ms
+    /// later on an iPhone, so an immediate rebind can briefly find it in use.
+    public static let defaultPreferredPortAttempt: Duration = .seconds(2)
+
+    /// How long `stop()` waits for the listener to release its port.
+    static let releaseWait: Duration = .seconds(2)
+
     private let opener: any MuxStreamOpening
     private let idleReclaimAfter: Duration
     private let counters = LoopbackProxyCounters()
     private let onPeerStreamReset: PeerStreamResetObserver?
     private let capability: LoopbackCapability
+    private let preferredPortAttempt: Duration
     private var listener: NWListener?
+    private var listenerReleased: LoopbackListenerReleaseWaiter?
+    private var binding: LoopbackBinding?
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
 
     public init(
@@ -162,10 +205,27 @@ public actor LoopbackProxy {
         onPeerStreamReset: PeerStreamResetObserver? = nil,
         capability: LoopbackCapability = .process
     ) {
+        self.init(
+            opener: opener,
+            idleReclaimAfter: idleReclaimAfter,
+            onPeerStreamReset: onPeerStreamReset,
+            capability: capability,
+            preferredPortAttempt: Self.defaultPreferredPortAttempt
+        )
+    }
+
+    init(
+        opener: any MuxStreamOpening,
+        idleReclaimAfter: Duration = LoopbackProxy.defaultIdleReclaim,
+        onPeerStreamReset: PeerStreamResetObserver? = nil,
+        capability: LoopbackCapability = .process,
+        preferredPortAttempt: Duration
+    ) {
         self.opener = opener
         self.idleReclaimAfter = idleReclaimAfter
         self.onPeerStreamReset = onPeerStreamReset
         self.capability = capability
+        self.preferredPortAttempt = preferredPortAttempt
     }
 
     /// Tunnel-side failures seen since this proxy was created.
@@ -173,17 +233,95 @@ public actor LoopbackProxy {
         counters.snapshot()
     }
 
+    /// Starts the proxy on any free loopback port and returns it.
     public func start() async throws -> UInt16 {
-        if let port = listener?.port?.rawValue {
-            return port
+        try await start(preferredPort: nil).port
+    }
+
+    /// Starts the proxy on `127.0.0.1:preferredPort` when that port can be
+    /// bound, and otherwise on any free loopback port.
+    ///
+    /// A preferred port that is in use is retried for up to
+    /// `defaultPreferredPortAttempt`, which covers the brief window in which a
+    /// just-stopped listener still holds it. The returned binding carries the
+    /// port actually bound and, when it is not the preferred one, why. A
+    /// proxy that is already listening returns its current binding.
+    public func start(preferredPort: UInt16?) async throws -> LoopbackBinding {
+        if listener != nil, let binding {
+            return binding
+        }
+        guard let preferredPort, let preferred = NWEndpoint.Port(rawValue: preferredPort), preferredPort != 0 else {
+            return try await startOnAnyPort(fallback: nil)
+        }
+        let deadline = ContinuousClock.now + preferredPortAttempt
+        while true {
+            do {
+                let port = try await bind(preferred)
+                let binding = LoopbackBinding(port: port, fallback: nil)
+                self.binding = binding
+                return binding
+            } catch let failure as LoopbackListenerFailure where failure.isAddressInUse {
+                if ContinuousClock.now >= deadline {
+                    logger.notice("loopback: preferred port in use; listening on another port")
+                    return try await startOnAnyPort(fallback: .preferredPortInUse)
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            } catch let failure as LoopbackListenerFailure {
+                logger.notice("loopback: preferred port failed; listening on another port")
+                return try await startOnAnyPort(fallback: .preferredPortFailed(failure.error.localizedDescription))
+            }
+        }
+    }
+
+    /// Stops listening and closes every proxied connection. Returns once the
+    /// listener has released its port, or after `releaseWait` at most.
+    public func stop() async {
+        let listener = self.listener
+        let released = self.listenerReleased
+        self.listener = nil
+        self.listenerReleased = nil
+        self.binding = nil
+        listener?.cancel()
+
+        let tasks = connectionTasks.values
+        connectionTasks.removeAll()
+        for task in tasks {
+            task.cancel()
         }
 
+        if let released {
+            let timeout = Task {
+                try? await Task.sleep(for: Self.releaseWait)
+                released.complete()
+            }
+            await released.wait()
+            timeout.cancel()
+        }
+    }
+
+    private func startOnAnyPort(fallback: LoopbackBinding.Fallback?) async throws -> LoopbackBinding {
+        let port: UInt16
+        do {
+            port = try await bind(.any)
+        } catch let failure as LoopbackListenerFailure {
+            throw LoopbackProxyError.listenerFailed(failure.error.localizedDescription)
+        }
+        let binding = LoopbackBinding(port: port, fallback: fallback)
+        self.binding = binding
+        return binding
+    }
+
+    /// Binds one listener on `127.0.0.1:port` and waits until it is ready.
+    /// A listener that fails or is cancelled clears itself, but only if it is
+    /// still the proxy's current listener.
+    private func bind(_ port: NWEndpoint.Port) async throws -> UInt16 {
         let parameters = NWParameters.tcp
-        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: port)
         let listener = try NWListener(using: parameters)
         let waiter = LoopbackListenerReadyWaiter()
+        let released = LoopbackListenerReleaseWaiter()
 
-        listener.stateUpdateHandler = { state in
+        listener.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
                 if let port = listener.port?.rawValue {
@@ -192,9 +330,13 @@ public actor LoopbackProxy {
                     waiter.complete(.failure(LoopbackProxyError.listenerMissingPort))
                 }
             case .failed(let error):
-                waiter.complete(.failure(LoopbackProxyError.listenerFailed(error.localizedDescription)))
+                waiter.complete(.failure(LoopbackListenerFailure(error: error)))
+                listener.cancel()
+                Task { await self?.listenerEnded(listener) }
             case .cancelled:
                 waiter.complete(.failure(LoopbackProxyError.listenerCancelled))
+                released.complete()
+                Task { await self?.listenerEnded(listener) }
             case .setup, .waiting:
                 break
             @unknown default:
@@ -212,23 +354,26 @@ public actor LoopbackProxy {
         }
 
         self.listener = listener
+        self.listenerReleased = released
         listener.start(queue: .global(qos: .utility))
-        return try await withTaskCancellationHandler {
-            try await waiter.wait()
-        } onCancel: {
+        do {
+            return try await withTaskCancellationHandler {
+                try await waiter.wait()
+            } onCancel: {
+                listener.cancel()
+            }
+        } catch {
+            listenerEnded(listener)
             listener.cancel()
+            throw error
         }
     }
 
-    public func stop() async {
-        listener?.cancel()
+    private func listenerEnded(_ ended: NWListener) {
+        guard listener === ended else { return }
         listener = nil
-
-        let tasks = connectionTasks.values
-        connectionTasks.removeAll()
-        for task in tasks {
-            task.cancel()
-        }
+        listenerReleased = nil
+        binding = nil
     }
 
     // Diverges from the iOS origin: create and store in one actor turn so a
@@ -556,6 +701,38 @@ private func forbiddenResponse(_ refusal: LoopbackRefusal) -> Data {
 private struct LoopbackPumpStats: Sendable {
     var bytesIn: Int
     var bytesOut: Int
+}
+
+/// Resolves once a listener has released its port (its `.cancelled` state).
+final class LoopbackListenerReleaseWaiter: @unchecked Sendable {
+    // why: NWListener invokes state callbacks on a dispatch queue while stop() awaits; NSLock guards one-shot delivery.
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var done = false
+
+    func wait() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resumeNow: Bool = lock.withLock {
+                if done { return true }
+                self.continuation = continuation
+                return false
+            }
+            if resumeNow {
+                continuation.resume()
+            }
+        }
+    }
+
+    func complete() {
+        let continuation: CheckedContinuation<Void, Never>? = lock.withLock {
+            guard !done else { return nil }
+            done = true
+            let continuation = self.continuation
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.resume()
+    }
 }
 
 final class LoopbackListenerReadyWaiter: @unchecked Sendable {

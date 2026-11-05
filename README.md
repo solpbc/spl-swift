@@ -47,6 +47,12 @@ The library reports connection progress through `TunnelState` and `stateUpdates`
 
 The proxy speaks HTTP/1.1 and admits a local connection only when its first request carries the process's `LoopbackCapability` as a cookie. Any process on the machine can reach `127.0.0.1`, and what the proxy forwards reaches the journal as the paired device. Add `LoopbackCapability.process.cookieHeaderValue` to the `Cookie` header of URLSession requests to the proxy, with `httpShouldHandleCookies` off so the cookie store cannot replace it, and set `LoopbackCapability.process.httpCookie()` in a web view's cookie store before loading the journal. A connection without it gets a `403` carrying an `X-SPL-Loopback-Refused` header and never opens a tunnel stream.
 
+A web view's origin is `http://127.0.0.1:<port>`, so a new port means an empty HTTP cache and empty storage. An app that rebuilds its proxy on every reconnect can keep the origin with `start(preferredPort:)`: pass the port the last proxy had, and the proxy binds it if it can, retrying briefly while a just-stopped listener releases it, or else binds any free port. `stop()` returns once the listener has released its port, or after a short wait at most. The returned `LoopbackBinding` carries the port actually bound and, when it is not the preferred one, `fallback` says why. The caller's side of that contract:
+
+- Build the URL from the returned `port`, never from the port you asked for.
+- On a fallback, discard every page from the old origin. Cookies are scoped by host, not by port, so a page still open on the old port would keep sending the capability cookie to whatever process holds that port now.
+- Keep one web data store per pairing, so another pairing never inherits a cached page through a reused port, and clear it when the pairing is removed.
+
 ## Privacy
 
 This library contains no telemetry, analytics, or crash reporting, and never will. It talks only to the owner's own journal and the relay endpoint the owner's pairing names.
