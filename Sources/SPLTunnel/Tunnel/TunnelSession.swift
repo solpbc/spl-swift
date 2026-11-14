@@ -125,6 +125,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening, TunnelAttemptObs
     private var inboundPumpTask: Task<Void, Never>?
     private var inboundPumpID: UUID?
     private var keepaliveWatchTask: Task<Void, Never>?
+    private var keepaliveInterval: Duration
     private var innerTLS: (any TunnelTLSIO)?
     private var multiplexer: Multiplexer?
     private var activeEndpoint: TransportEndpoint?
@@ -185,6 +186,7 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening, TunnelAttemptObs
         )
         self.unknownJournalObserver = unknownJournalObserver
         self.policy = policy
+        self.keepaliveInterval = policy.keepalive.interval
         self.tlsConnector = tlsConnector
         self.makeMultiplexer = makeMultiplexer
         self.installWindowTestGate = installWindowTestGate
@@ -295,6 +297,18 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening, TunnelAttemptObs
             return 0
         }
         return await multiplexer.inboundActivitySnapshot()
+    }
+
+    /// Changes how often the keepalive pings, on the open connection or the one
+    /// `connect` opens next; the policy's interval is the starting value. A shorter
+    /// interval pings at once. The missed limit still counts pings, so a slower
+    /// cadence also takes longer to declare a dark path lost.
+    public func setKeepaliveInterval(_ interval: Duration) async {
+        guard interval != keepaliveInterval else {
+            return
+        }
+        keepaliveInterval = interval
+        await multiplexer?.setKeepaliveInterval(interval)
     }
 
     func connectedEndpoint() -> TransportEndpoint? {
@@ -442,11 +456,17 @@ public actor TunnelSession: TunnelSessioning, MuxStreamOpening, TunnelAttemptObs
                     await self.handleKeepaliveLost(id: pumpID, error: keepaliveError)
                 }
             }
+            let startingInterval = keepaliveInterval
             await mux.startKeepalive(
-                interval: policy.keepalive.interval,
+                interval: startingInterval,
                 missedLimit: policy.keepalive.missedLimit,
                 deferralLimit: policy.keepalive.deferralLimit
             )
+            // A change that arrived while the keepalive was starting may have reached
+            // the mux before it started.
+            if keepaliveInterval != startingInterval {
+                await mux.setKeepaliveInterval(keepaliveInterval)
+            }
         }
         // Let already-ended pump/loss tasks run and latch against this install epoch
         // before publishConnected can publish a durable connected state.

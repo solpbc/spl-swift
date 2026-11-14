@@ -308,6 +308,72 @@ actor KeepaliveTickGate {
     }
 }
 
+/// A keepalive sleeper that records every interval it is asked to sleep and wakes
+/// only when told to, or when the sleeping task is cancelled, as `Task.sleep` does.
+actor KeepaliveCadenceGate {
+    private(set) var intervals: [Duration] = []
+    private var sleepers: [(id: Int, continuation: CheckedContinuation<Void, Error>)] = []
+    private var cancelledBeforeParking: Set<Int> = []
+    private var nextID = 0
+
+    func sleep(_ interval: Duration) async throws {
+        intervals.append(interval)
+        nextID += 1
+        let id = nextID
+        try await withTaskCancellationHandler {
+            try await self.park(id)
+        } onCancel: {
+            Task { await self.cancel(id) }
+        }
+    }
+
+    private func park(_ id: Int) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            if cancelledBeforeParking.remove(id) != nil {
+                continuation.resume(throwing: CancellationError())
+            } else {
+                sleepers.append((id, continuation))
+            }
+        }
+    }
+
+    /// Waits until the keepalive has asked for `count` sleeps and exactly one is
+    /// parked, so a sleep a cadence change cancelled has finished leaving.
+    func waitForSleep(_ count: Int, within timeout: Duration = .seconds(2)) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while intervals.count < count || sleepers.count != 1 {
+            guard ContinuousClock.now < deadline else {
+                throw MuxTestError.timedOut("keepalive sleep \(count) never parked; asked for \(intervals)")
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    /// Ends the parked sleep: the keepalive's interval has elapsed.
+    func wake() {
+        guard !sleepers.isEmpty else {
+            return
+        }
+        sleepers.removeFirst().continuation.resume()
+    }
+
+    func cancelAll() {
+        let parked = sleepers
+        sleepers.removeAll()
+        for sleeper in parked {
+            sleeper.continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    private func cancel(_ id: Int) {
+        if let index = sleepers.firstIndex(where: { $0.id == id }) {
+            sleepers.remove(at: index).continuation.resume(throwing: CancellationError())
+        } else {
+            cancelledBeforeParking.insert(id)
+        }
+    }
+}
+
 actor AsyncResultBox<Value: Sendable> {
     private var value: Value?
 

@@ -101,6 +101,27 @@ struct TunnelSupervisorUpgradeTests {
         await supervisor.disconnect()
     }
 
+    @Test("A keepalive interval set while a better path dials reaches the carrier that takes over")
+    func aKeepaliveIntervalSetDuringAnUpgradeDialReachesTheNewCarrier() async throws {
+        let relay = relayEndpoint()
+        let dialGate = TestSignal()
+        let factory = FakeGenerationFactory(scripts: [.success(relay), .success(lanEndpoint, gate: dialGate)])
+        let upgradeGate = TestSignal()
+        let supervisor = fakeSupervisor(factory: factory, upgradeSleeper: gatedUpgradeSleeper(upgradeGate), policy: returningPolicy)
+
+        _ = try await supervisor.connect(endpoints: [lanEndpoint, relay])
+        await upgradeGate.signal()
+        try await waitFor { await factory.count() == 2 }
+        // The candidate is not the current carrier yet, so the change reaches only the relay.
+        await supervisor.setKeepaliveInterval(.seconds(30))
+        await dialGate.signal()
+        try await waitFor { await supervisor.connectionMode == .plDirect }
+
+        let lanGeneration = try await factory.generation(at: 1)
+        #expect(await lanGeneration.keepaliveIntervals.last == .seconds(30))
+        await supervisor.disconnect()
+    }
+
     @Test("A failed upgrade leaves the working carrier alone")
     func failedUpgradeKeepsTheCurrentCarrier() async throws {
         let relay = relayEndpoint()

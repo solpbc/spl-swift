@@ -29,6 +29,7 @@ protocol TunnelGeneration: TunnelSessioning {
     func connect(endpoints: [TransportEndpoint], preferredEndpoint: TransportEndpoint?) async throws -> ConnectedVia
     func connectedEndpoint() async -> TransportEndpoint?
     func isTransferring(quiet: Duration, pendingLimit: Duration) async -> Bool
+    func setKeepaliveInterval(_ interval: Duration) async
 }
 
 extension TunnelSession: TunnelGeneration {}
@@ -173,6 +174,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
     private var activeStabilityToken: UInt64?
     private var generationFailure: (token: UInt64, error: SessionError)?
     private var plannedEndpoints: [TransportEndpoint] = []
+    private var keepaliveInterval: Duration
     private var currentVia: ConnectedVia?
     private var currentEndpoint: TransportEndpoint?
     private var upgradeTask: Task<Void, Never>?
@@ -232,6 +234,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         self.pairing = pairing
         self.clientInfo = clientInfo
         self.policy = policy
+        self.keepaliveInterval = policy.keepalive.interval
         self.refusals = refusalLedger ?? HandshakeRefusalLedger(
             credential: pairing.refusalCredential,
             store: EphemeralRefusalStore()
@@ -409,6 +412,38 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
         return await session.inboundActivitySnapshot()
     }
 
+    /// Whether application traffic is still moving on the current carrier: the peer
+    /// spoke on a stream within `quiet`, or a stream is waiting on a reply it was sent
+    /// within `pendingLimit`. Idle keep-alive streams do not count.
+    public func isTransferring(quiet: Duration, pendingLimit: Duration) async -> Bool {
+        guard let session = generation?.session else {
+            return false
+        }
+        return await session.isTransferring(quiet: quiet, pendingLimit: pendingLimit)
+    }
+
+    /// Changes how often the keepalive pings, on the current carrier and every later
+    /// one; the policy's interval is the starting value. A shorter interval pings at
+    /// once. The missed limit still counts pings, so a slower cadence also takes
+    /// longer to declare a dark path lost.
+    public func setKeepaliveInterval(_ interval: Duration) async {
+        guard interval != keepaliveInterval else {
+            return
+        }
+        keepaliveInterval = interval
+        await generation?.session.setKeepaliveInterval(interval)
+    }
+
+    /// Brings a carrier that was made before the latest cadence change up to it.
+    /// Returns with no suspension left between the final check and the caller.
+    private func applyKeepaliveInterval(to session: any TunnelGeneration) async {
+        var applied: Duration?
+        while applied != keepaliveInterval {
+            applied = keepaliveInterval
+            await session.setKeepaliveInterval(keepaliveInterval)
+        }
+    }
+
     private func establish(
         reason: SessionError?,
         userInitiated: Bool,
@@ -541,6 +576,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             throw SessionError.notConnected
         }
         await installGeneration(session, token: token)
+        await applyKeepaliveInterval(to: session)
 
         let plan = planner.plan(candidates: plannedEndpoints, now: now())
         connectingToken = token
@@ -960,6 +996,7 @@ public actor TunnelSupervisor: TunnelSessioning, MuxStreamOpening {
             return
         }
         let upgradedEndpoint = await candidate.connectedEndpoint()
+        await applyKeepaliveInterval(to: candidate)
         guard isCurrentHealthyGeneration(token) else {
             await candidate.disconnect()
             return

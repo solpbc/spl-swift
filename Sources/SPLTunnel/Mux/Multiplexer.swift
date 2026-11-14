@@ -80,6 +80,9 @@ public actor Multiplexer {
     private var lastMatchedPongAt: ContinuousClock.Instant?
     private var lastStreamInboundAt: ContinuousClock.Instant?
     private var keepaliveStartedAt: ContinuousClock.Instant?
+    private var keepaliveInterval: Duration = .milliseconds(500)
+    private var keepaliveMissedLimit = 3
+    private var keepaliveDeferralLimit: Duration = .seconds(30)
 
     public init(sink: @escaping @Sendable (Data) async throws -> Void, role: Role = .dialer) {
         self.init(
@@ -166,8 +169,30 @@ public actor Multiplexer {
         streamInboundTick = nil
         lastMatchedPongAt = nil
         keepaliveStartedAt = now()
+        keepaliveInterval = interval
+        keepaliveMissedLimit = missedLimit
+        keepaliveDeferralLimit = deferralLimit
         keepaliveTask = Task {
-            await runKeepalive(interval: interval, missedLimit: missedLimit, deferralLimit: deferralLimit)
+            await runKeepalive(pingFirst: false)
+        }
+    }
+
+    /// Changes how often the running keepalive pings. Unanswered pings stay counted,
+    /// so the missed limit is reached across the change. A shorter interval pings at
+    /// once: a path that went dark while pings were sparse is then found at the new
+    /// pace, not one old interval later. Does nothing once the keepalive has stopped.
+    func setKeepaliveInterval(_ interval: Duration) {
+        guard interval != keepaliveInterval else {
+            return
+        }
+        let sooner = interval < keepaliveInterval
+        keepaliveInterval = interval
+        guard let running = keepaliveTask else {
+            return
+        }
+        running.cancel()
+        keepaliveTask = Task {
+            await runKeepalive(pingFirst: sooner)
         }
     }
 
@@ -431,15 +456,21 @@ public actor Multiplexer {
         streams.removeValue(forKey: id)
     }
 
-    private func runKeepalive(interval: Duration, missedLimit: Int, deferralLimit: Duration) async {
+    private func runKeepalive(pingFirst: Bool) async {
+        var sleepFirst = !pingFirst
         while !Task.isCancelled {
             do {
-                try await sleeper(interval)
+                if sleepFirst {
+                    try await sleeper(keepaliveInterval)
+                    // A cadence change replaces this loop while it sleeps.
+                    try Task.checkCancellation()
+                }
+                sleepFirst = true
                 let tick = keepaliveTickIndex
                 try await performKeepaliveTick(
                     currentTick: tick,
-                    missedLimit: missedLimit,
-                    deferralLimit: deferralLimit
+                    missedLimit: keepaliveMissedLimit,
+                    deferralLimit: keepaliveDeferralLimit
                 )
                 keepaliveTickIndex = tick &+ 1
             } catch {

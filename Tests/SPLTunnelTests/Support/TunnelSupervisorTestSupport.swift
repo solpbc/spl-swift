@@ -134,6 +134,8 @@ actor FakeGeneration: TunnelGeneration {
     private var successfulOpenStreamCount = 0
     private(set) var disconnectCount = 0
     private var transferring = false
+    /// Every keepalive interval the supervisor set on this carrier, in order.
+    private(set) var keepaliveIntervals: [Duration] = []
 
     init(script: FakeGenerationScript) {
         self.script = script
@@ -177,6 +179,10 @@ actor FakeGeneration: TunnelGeneration {
 
     func isTransferring(quiet _: Duration, pendingLimit _: Duration) async -> Bool {
         transferring
+    }
+
+    func setKeepaliveInterval(_ interval: Duration) async {
+        keepaliveIntervals.append(interval)
     }
 
     func disconnect() async {

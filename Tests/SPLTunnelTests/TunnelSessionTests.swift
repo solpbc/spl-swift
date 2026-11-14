@@ -196,6 +196,36 @@ struct TunnelSessionTests {
         await gate.cancelAll()
     }
 
+    @Test func aKeepaliveIntervalSetBeforeConnectOrWhileConnectedReachesTheConnection() async throws {
+        let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: 443, scope: "local")
+        let tls = PongingTunnelTLS()
+        let gate = KeepaliveCadenceGate()
+        let connector = ConnectorProbe { _, _, _ in tls }
+        let session = TunnelSession(
+            pairing: fakePairing(),
+            policy: SessionPolicy(keepalive: KeepalivePolicy(interval: .milliseconds(500))),
+            tlsConnector: connector.connector,
+            makeMultiplexer: { tls in
+                Multiplexer(
+                    sink: { data in try await tls.send(data) },
+                    sleeper: { duration in try await gate.sleep(duration) }
+                )
+            }
+        )
+
+        await session.setKeepaliveInterval(.seconds(30))
+        _ = try await session.connect(endpoints: [endpoint])
+        try await gate.waitForSleep(1)
+        #expect(await gate.intervals == [.seconds(30)])
+
+        await session.setKeepaliveInterval(.milliseconds(500))
+        try await gate.waitForSleep(2)
+        #expect(await gate.intervals == [.seconds(30), .milliseconds(500)])
+
+        await session.disconnect()
+        await gate.cancelAll()
+    }
+
     @Test func keepaliveLossDuringInstallThrowsAndTearsDownWithoutDurableConnected() async throws {
         let endpoint = TransportEndpoint.lan(host: "127.0.0.1", port: 443, scope: "local")
         let tls = FakeTunnelTLS()

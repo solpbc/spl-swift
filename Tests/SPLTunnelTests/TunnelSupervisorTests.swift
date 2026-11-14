@@ -131,6 +131,32 @@ struct TunnelSupervisorTests {
         await supervisor.disconnect()
     }
 
+    @Test func aKeepaliveIntervalReachesTheCurrentCarrierAndTheNextOne() async throws {
+        let direct = directEndpoint("10.0.0.5")
+        let factory = FakeGenerationFactory(scripts: [
+            .success(direct),
+            .success(direct),
+        ])
+        let supervisor = fakeSupervisor(factory: factory)
+
+        _ = try await supervisor.connect(endpoints: [direct])
+        await supervisor.setKeepaliveInterval(.seconds(30))
+        let first = try await factory.generation(at: 0)
+        #expect(await first.keepaliveIntervals.last == .seconds(30))
+
+        // A reconnect's carrier starts at the interval in effect, not the policy's.
+        await first.fail(.inboundClosed(fault: nil))
+        #expect(await waitUntil("replacement carrier") {
+            await factory.count() == 2
+        })
+        let second = try await factory.generation(at: 1)
+        #expect(await waitUntil("replacement carrier keepalive interval") {
+            await second.keepaliveIntervals.last == .seconds(30)
+        })
+
+        await supervisor.disconnect()
+    }
+
     @Test func keepaliveSendFailureRedrivesConnectedGeneration() async throws {
         let direct = directEndpoint("10.0.0.5")
         let factory = FakeGenerationFactory(scripts: [
@@ -1533,6 +1559,10 @@ private actor GatedOpenGeneration: TunnelGeneration {
 
     func isTransferring(quiet _: Duration, pendingLimit _: Duration) async -> Bool {
         false
+    }
+
+    func setKeepaliveInterval(_ interval: Duration) async {
+        await base.setKeepaliveInterval(interval)
     }
 
     func connectedEndpoint() async -> TransportEndpoint? {

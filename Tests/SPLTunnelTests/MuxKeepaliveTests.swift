@@ -698,6 +698,86 @@ struct MuxKeepaliveTests {
         }
     }
 
+    @Test func aSlowerIntervalReachesTheRunningKeepaliveWithoutAnExtraPing() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveCadenceGate()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) }
+        )
+
+        await mux.startKeepalive(interval: .milliseconds(500), missedLimit: 3)
+        try await gate.waitForSleep(1)
+        await mux.setKeepaliveInterval(.seconds(30))
+        try await gate.waitForSleep(2)
+        #expect(await gate.intervals == [.milliseconds(500), .seconds(30)])
+        #expect(try await pingFrames(in: recorder).isEmpty)
+
+        // The slow cadence holds from then on.
+        await gate.wake()
+        try await gate.waitForSleep(3)
+        #expect(await gate.intervals.last == .seconds(30))
+        #expect(try await pingFrames(in: recorder).count == 1)
+
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
+    @Test func aFasterIntervalPingsAtOnceThenKeepsItsCadence() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveCadenceGate()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) }
+        )
+
+        await mux.startKeepalive(interval: .seconds(30), missedLimit: 3)
+        try await gate.waitForSleep(1)
+        await mux.setKeepaliveInterval(.milliseconds(500))
+        try await gate.waitForSleep(2)
+        // No slow interval elapsed, yet the path has been asked.
+        #expect(try await pingFrames(in: recorder).count == 1)
+        #expect(await gate.intervals == [.seconds(30), .milliseconds(500)])
+
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
+    @Test func aPathThatWentDarkWhilePingsWereSparseIsLostAtTheFasterCadence() async throws {
+        let recorder = MuxFrameRecorder()
+        let gate = KeepaliveCadenceGate()
+        let mux = Multiplexer(
+            sink: { bytes in try await recorder.record(bytes) },
+            sleeper: { duration in try await gate.sleep(duration) }
+        )
+        let loss = Task { try await firstKeepaliveLoss(from: mux.keepaliveLost, timeout: .seconds(5)) }
+
+        // One slow ping goes unanswered: the path went dark in the background.
+        await mux.startKeepalive(interval: .seconds(30), missedLimit: 3)
+        try await gate.waitForSleep(1)
+        await gate.wake()
+        try await gate.waitForSleep(2)
+        #expect(try await pingFrames(in: recorder).count == 1)
+
+        // Back to the fast cadence. The unanswered slow ping still counts, and the
+        // change pings at once, so the loss lands two fast intervals later rather
+        // than three.
+        await mux.setKeepaliveInterval(.milliseconds(500))
+        try await gate.waitForSleep(3)
+        #expect(try await pingFrames(in: recorder).count == 2)
+        await gate.wake()
+        try await gate.waitForSleep(4)
+        #expect(try await pingFrames(in: recorder).count == 3)
+        await gate.wake()
+
+        let event = try await loss.value
+        #expect(event.reason == .missedPingLimit)
+        #expect(try await pingFrames(in: recorder).count == 3)
+        #expect(await gate.intervals == [.seconds(30), .seconds(30), .milliseconds(500), .milliseconds(500)])
+        await mux.tearDown(reason: .normalShutdown)
+        await gate.cancelAll()
+    }
+
     /// Wait for the keepalive to reach `count` observed ticks, failing instead of hanging if
     /// the keepalive stopped early: a loss cancels the task, and a test that expects no loss
     /// would otherwise wait forever for a tick that never comes.
