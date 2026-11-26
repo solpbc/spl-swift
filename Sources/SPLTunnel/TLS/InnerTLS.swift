@@ -970,7 +970,7 @@ private func sendRaw(_ data: Data, to connection: NWConnection) async throws {
 
 private func receiveRaw(from connection: NWConnection) async throws -> Data? {
     try await withCheckedThrowingContinuation { continuation in
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
             if let error {
                 continuation.resume(throwing: error)
                 return
